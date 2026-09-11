@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/nicbet/repodb/client"
-	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/repository"
 )
 
@@ -22,7 +21,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: repodb <init|status|snapshot|sql>")
+		return errors.New("usage: repodb <init|status|import-legacy|sql>")
 	}
 	switch args[0] {
 	case "init":
@@ -38,38 +37,41 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println("initialized RepoDB in", repo.Dir)
+		snapshot, err := repo.Current(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("initialized RepoDB at %s (%s)\n", repository.DataRef, snapshot.Commit)
 		return nil
 	case "status":
 		repo, err := repository.Open(ctx, ".")
 		if err != nil {
 			return err
 		}
-		status, err := (repodbgit.CLI{}).Status(ctx, repo.Root)
+		snapshot, err := repo.Current(ctx)
 		if err != nil {
 			return err
 		}
-		if status == "" {
-			fmt.Println("RepoDB state is clean")
-		} else {
-			fmt.Print(status)
-		}
+		fmt.Printf("RepoDB data head: %s\n", snapshot.Commit)
+		fmt.Printf("Format: %d, objects: %d, tables: %d\n", snapshot.Manifest.FormatVersion, len(snapshot.Manifest.Objects), len(snapshot.Manifest.Tables))
 		return nil
 	case "snapshot":
-		set := flag.NewFlagSet("snapshot", flag.ContinueOnError)
-		message := set.String("m", "", "Git commit message")
+		return errors.New("snapshot is obsolete; RepoDB transactions publish data commits automatically")
+	case "import-legacy":
+		set := flag.NewFlagSet("import-legacy", flag.ContinueOnError)
 		if err := set.Parse(args[1:]); err != nil {
 			return err
 		}
-		repo, err := repository.Open(ctx, ".")
+		path := "."
+		if set.NArg() > 0 {
+			path = set.Arg(0)
+		}
+		_, snapshot, err := repository.ImportLegacy(ctx, path)
 		if err != nil {
 			return err
 		}
-		git := repodbgit.CLI{}
-		if err := git.StageRepoDB(ctx, repo.Root); err != nil {
-			return err
-		}
-		return git.Commit(ctx, repo.Root, *message)
+		fmt.Printf("imported legacy .repodb state at %s (%s); legacy files were retained\n", repository.DataRef, snapshot.Commit)
+		return nil
 	case "sql":
 		return runSQL(ctx, args[1:])
 	default:

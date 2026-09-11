@@ -1,4 +1,4 @@
-.PHONY: build test fmt
+.PHONY: build test fmt m0
 
 build:
 	go build -o bin/repodb ./cmd/repodb
@@ -10,3 +10,5 @@ test:
 fmt:
 	gofmt -w client cmd common server
 
+m0:
+	go run ./experiments/gitstorage -root /tmp/repodb-m0

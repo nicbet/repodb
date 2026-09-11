@@ -11,6 +11,8 @@ wanted. Enabling repository integration will not start a server.
 
 See [plan.md](plan.md) for the agreed requirements, proposed architecture, and
 implementation milestones. The enable/start workflow is planned, not implemented.
+The M0 storage and ordinary-Git command contract is recorded in
+[docs/git-integration.md](docs/git-integration.md).
 
 The current prototype is written in Go and combines:
 
@@ -23,11 +25,12 @@ The current prototype is written in Go and combines:
 
 This repository contains the first executable vertical slice. The MySQL server
 accepts DDL and DML, the client speaks the MySQL protocol, and the common module
-can build and read deterministic Prolly trees persisted beneath `.repodb/`.
+can build and read deterministic Prolly trees. M1 adds durable catalog snapshots
+stored entirely in Git objects under `refs/repodb/data`.
 
 SQL tables currently use the `go-mysql-server` in-memory adapter. They are **not
-yet persisted** to Prolly roots. The current tracked `.repodb/` layout and manual
-snapshot commands predate the dedicated-ref design in the plan.
+yet persisted** to Prolly roots. The repository snapshot API is ready for that
+integration in M2.
 
 ## Layout
 
@@ -38,8 +41,8 @@ client/              reusable MySQL wire client
 server/              go-mysql-server host and storage adapters
 common/prolly/       deterministic content-defined tree construction
 common/storage/      content-addressed memory and filesystem stores
-common/repository/   .repodb format, manifests, and repository discovery
-common/git/          narrow Git CLI boundary
+common/repository/   durable Git snapshots, manifests, and legacy import
+common/git/          typed Git object/ref plumbing boundary
 common/query/        Vitess parser boundary
 ```
 
@@ -54,6 +57,7 @@ Go 1.27 or newer is expected by the current experiment.
 ```sh
 make test
 make build
+make m0 # repeat the Git integration experiment under /tmp/repodb-m0
 ./bin/repodb init .
 ./bin/repodb-server -repo .
 ```
@@ -65,34 +69,26 @@ In a second terminal, either use any MySQL client or the included one:
 mysql --host=127.0.0.1 --port=3306 --user=root repodb
 ```
 
-The prototype also exposes these commands for its tracked `.repodb/` files;
-they do not currently snapshot SQL tables:
+Repository state now lives outside the source branch:
 
 ```sh
 ./bin/repodb status
-./bin/repodb snapshot -m 'Update application data'
+./bin/repodb import-legacy # only for the superseded tracked .repodb layout
 ```
 
-RepoDB never commits unrelated worktree changes: snapshot commands restrict Git
-operations to `.repodb`.
+Snapshot publication never stages files or changes the source worktree, index,
+or branch. SQL transaction publication will be connected in M2.
 
-## Prototype on-disk model
+## Git snapshot model
 
 ```text
-.repodb/
-  config.json
-  manifest.json              # table name -> schema root and data root
-  objects/sha256/ab/cdef...  # immutable Prolly nodes addressed by SHA-256
+refs/repodb/data -> commit -> tree
+  manifest.json
+  objects/sha256/ab/cdef...  # immutable objects addressed by RepoDB SHA-256
 ```
 
-Rows are ordered by a canonical primary-key encoding. Content-defined chunk
-boundaries make roots deterministic and keep most chunks stable when nearby
-rows change. The manifest is the small mutable pointer Git compares between
-snapshots; object files are immutable and naturally deduplicate in Git packs.
-
-This layout will be replaced by reachable Git objects under dedicated RepoDB
-refs. See the plan for reachability, automatic transaction publication, and
-cache-rebuild requirements.
+See [docs/storage-format.md](docs/storage-format.md) for format, integrity,
+concurrency, cache, durability, and legacy migration details.
 
 ## Build sequence
 

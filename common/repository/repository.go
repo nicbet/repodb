@@ -1,4 +1,5 @@
-// Package repository defines the on-disk, Git-tracked RepoDB layout.
+// Package repository stores RepoDB snapshots in Git objects reachable from a
+// dedicated ref. Source worktrees, indexes, and branches are never involved.
 package repository
 
 import (
@@ -6,142 +7,443 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/storage"
+	"golang.org/x/sys/unix"
 )
 
-const FormatVersion = 1
+const (
+	FormatVersion = 1
+	DataRef       = "refs/repodb/data"
+)
 
-type Config struct {
-	FormatVersion int    `json:"format_version"`
-	DefaultDB     string `json:"default_database"`
-}
+var (
+	ErrNotInitialized = errors.New("RepoDB is not initialized")
+	ErrLegacyLayout   = errors.New("legacy tracked .repodb layout found")
+	ErrConflict       = errors.New("RepoDB data head changed")
+	ErrCorrupt        = errors.New("corrupt RepoDB snapshot")
+)
 
 type Table struct {
 	SchemaRoot storage.Hash `json:"schema_root,omitempty"`
 	DataRoot   storage.Hash `json:"data_root,omitempty"`
 }
 
+// Manifest is the authoritative catalog stored in every data commit. Objects is
+// a complete, sorted inventory of the RepoDB-addressed blobs in the same tree.
 type Manifest struct {
-	FormatVersion int              `json:"format_version"`
-	UpdatedAt     time.Time        `json:"updated_at"`
-	Tables        map[string]Table `json:"tables"`
+	FormatVersion   int              `json:"format_version"`
+	DefaultDatabase string           `json:"default_database"`
+	Tables          map[string]Table `json:"tables"`
+	Objects         []storage.Hash   `json:"objects"`
 }
 
 type Repository struct {
-	Root string
-	Dir  string
+	Root         string
+	Dir          string // Legacy tracked layout; retained only for explicit import.
+	CommonDir    string
+	ObjectFormat string
+	git          repodbgit.CLI
 }
 
+type Snapshot struct {
+	repo      *Repository
+	Commit    string
+	Manifest  Manifest
+	objectSet map[storage.Hash]struct{}
+}
+
+type Writer struct {
+	repo      *Repository
+	base      *Snapshot
+	expected  string
+	objects   map[storage.Hash][]byte
+	committed bool
+	mu        sync.RWMutex
+}
+
+// Init creates the initial empty catalog commit. It is idempotent when the data
+// ref already contains a valid snapshot and refuses to hide a legacy layout.
 func Init(ctx context.Context, start string) (*Repository, error) {
-	root, err := (repodbgit.CLI{}).TopLevel(ctx, start)
+	repo, err := discover(ctx, start)
 	if err != nil {
 		return nil, err
 	}
-	repo := &Repository{Root: root, Dir: filepath.Join(root, ".repodb")}
-	if err := os.MkdirAll(filepath.Join(repo.Dir, "objects", "sha256"), 0o755); err != nil {
+	if _, err := repo.git.ResolveRef(ctx, repo.Root, DataRef); err == nil {
+		if _, err := repo.Current(ctx); err != nil {
+			return nil, err
+		}
+		return repo, nil
+	} else if !errors.Is(err, repodbgit.ErrRefNotFound) {
 		return nil, err
 	}
-	if err := writeJSONIfMissing(filepath.Join(repo.Dir, "config.json"), Config{
-		FormatVersion: FormatVersion,
-		DefaultDB:     "repodb",
-	}); err != nil {
-		return nil, err
+	if legacyExists(repo.Dir) {
+		return nil, fmt.Errorf("%w; run repodb import-legacy or move it aside before initialization", ErrLegacyLayout)
 	}
-	if err := writeJSONIfMissing(filepath.Join(repo.Dir, "manifest.json"), Manifest{
-		FormatVersion: FormatVersion,
-		UpdatedAt:     time.Now().UTC(),
-		Tables:        map[string]Table{},
-	}); err != nil {
+	w := &Writer{repo: repo, objects: make(map[storage.Hash][]byte)}
+	if _, err := w.Commit(ctx, Manifest{DefaultDatabase: "repodb", Tables: map[string]Table{}}); err != nil {
+		if errors.Is(err, ErrConflict) {
+			if _, openErr := repo.Current(ctx); openErr == nil {
+				return repo, nil
+			}
+		}
 		return nil, err
 	}
 	return repo, nil
 }
 
 func Open(ctx context.Context, start string) (*Repository, error) {
-	root, err := (repodbgit.CLI{}).TopLevel(ctx, start)
+	repo, err := discover(ctx, start)
 	if err != nil {
 		return nil, err
 	}
-	repo := &Repository{Root: root, Dir: filepath.Join(root, ".repodb")}
-	var config Config
-	if err := readJSON(filepath.Join(repo.Dir, "config.json"), &config); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("RepoDB is not initialized; run repodb init")
+	if _, err := repo.git.ResolveRef(ctx, repo.Root, DataRef); err != nil {
+		if errors.Is(err, repodbgit.ErrRefNotFound) {
+			if legacyExists(repo.Dir) {
+				return nil, fmt.Errorf("%w; run repodb import-legacy", ErrLegacyLayout)
+			}
+			return nil, ErrNotInitialized
 		}
 		return nil, err
 	}
-	if config.FormatVersion != FormatVersion {
-		return nil, fmt.Errorf("unsupported RepoDB format %d", config.FormatVersion)
+	if _, err := repo.Current(ctx); err != nil {
+		return nil, err
 	}
 	return repo, nil
 }
 
-func (r *Repository) Store() storage.Store {
-	return storage.NewFilesystem(filepath.Join(r.Dir, "objects", "sha256"))
+func discover(ctx context.Context, start string) (*Repository, error) {
+	cli := repodbgit.CLI{}
+	info, err := cli.Discover(ctx, start)
+	if err != nil {
+		return nil, err
+	}
+	if info.ObjectFormat != "sha1" && info.ObjectFormat != "sha256" {
+		return nil, fmt.Errorf("unsupported Git object format %q", info.ObjectFormat)
+	}
+	return &Repository{
+		Root:         info.TopLevel,
+		Dir:          filepath.Join(info.TopLevel, ".repodb"),
+		CommonDir:    info.CommonDir,
+		ObjectFormat: info.ObjectFormat,
+		git:          cli,
+	}, nil
 }
 
-func (r *Repository) LoadManifest() (Manifest, error) {
-	var manifest Manifest
-	err := readJSON(filepath.Join(r.Dir, "manifest.json"), &manifest)
-	return manifest, err
+func (r *Repository) CacheDir() string {
+	return filepath.Join(r.CommonDir, "repodb", "cache", fmt.Sprintf("v%d", FormatVersion))
 }
 
-func (r *Repository) SaveManifest(manifest Manifest) error {
+func (r *Repository) Current(ctx context.Context) (*Snapshot, error) {
+	commit, err := r.git.ResolveRef(ctx, r.Root, DataRef)
+	if errors.Is(err, repodbgit.ErrRefNotFound) {
+		return nil, ErrNotInitialized
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.loadSnapshot(ctx, commit)
+}
+
+// Begin pins the current immutable snapshot. Reads through the writer see that
+// snapshot plus blobs added to the writer.
+func (r *Repository) Begin(ctx context.Context) (*Writer, error) {
+	base, err := r.Current(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Writer{
+		repo:     r,
+		base:     base,
+		expected: base.Commit,
+		objects:  make(map[storage.Hash][]byte),
+	}, nil
+}
+
+func (s *Snapshot) Store() storage.Store { return &snapshotStore{snapshot: s} }
+
+func (w *Writer) Put(_ context.Context, data []byte) (storage.Hash, error) {
+	hash := storage.Sum(data)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.committed {
+		return "", errors.New("snapshot writer is already committed")
+	}
+	if _, exists := w.objects[hash]; !exists {
+		w.objects[hash] = append([]byte(nil), data...)
+	}
+	return hash, nil
+}
+
+func (w *Writer) Get(ctx context.Context, hash storage.Hash) ([]byte, error) {
+	if !hash.Valid() {
+		return nil, fmt.Errorf("invalid object hash %q", hash)
+	}
+	w.mu.RLock()
+	data, exists := w.objects[hash]
+	w.mu.RUnlock()
+	if exists {
+		return append([]byte(nil), data...), nil
+	}
+	if w.base == nil {
+		return nil, storage.ErrNotFound
+	}
+	return w.base.Store().Get(ctx, hash)
+}
+
+// Commit writes a complete Git tree and commit before atomically advancing the
+// live data ref from the writer's expected head.
+func (w *Writer) Commit(ctx context.Context, manifest Manifest) (*Snapshot, error) {
+	w.mu.Lock()
+	if w.committed {
+		w.mu.Unlock()
+		return nil, errors.New("snapshot writer is already committed")
+	}
+	w.committed = true
+	newObjects := cloneObjects(w.objects)
+	w.mu.Unlock()
+
+	all := make(map[storage.Hash][]byte)
+	if w.base != nil {
+		for _, hash := range w.base.Manifest.Objects {
+			data, err := w.base.Store().Get(ctx, hash)
+			if err != nil {
+				return nil, err
+			}
+			all[hash] = data
+		}
+	}
+	for hash, data := range newObjects {
+		all[hash] = data
+	}
 	manifest.FormatVersion = FormatVersion
-	manifest.UpdatedAt = time.Now().UTC()
+	if manifest.DefaultDatabase == "" {
+		manifest.DefaultDatabase = "repodb"
+	}
 	if manifest.Tables == nil {
 		manifest.Tables = map[string]Table{}
 	}
-	return writeJSON(filepath.Join(r.Dir, "manifest.json"), manifest)
+	manifest.Objects = sortedHashes(all)
+	if err := validateManifest(manifest, all); err != nil {
+		return nil, err
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, err
+	}
+	manifestData = append(manifestData, '\n')
+
+	release, err := w.repo.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	entries := make([]repodbgit.TreeEntry, 0, len(all)+1)
+	manifestOID, err := w.repo.git.HashObject(ctx, w.repo.Root, manifestData)
+	if err != nil {
+		return nil, err
+	}
+	entries = append(entries, repodbgit.TreeEntry{Path: "manifest.json", ObjectID: manifestOID})
+	for _, hash := range manifest.Objects {
+		oid, err := w.repo.git.HashObject(ctx, w.repo.Root, all[hash])
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, repodbgit.TreeEntry{Path: objectPath(hash), ObjectID: oid})
+	}
+	tree, err := w.repo.git.WriteTree(ctx, w.repo.Root, w.repo.CommonDir, entries)
+	if err != nil {
+		return nil, err
+	}
+	commit, err := w.repo.git.CommitTree(ctx, w.repo.Root, tree, w.expected, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
+	if err != nil {
+		return nil, err
+	}
+	if err := w.repo.git.UpdateRef(ctx, w.repo.Root, DataRef, commit, w.expected); err != nil {
+		if errors.Is(err, repodbgit.ErrRefConflict) {
+			return nil, ErrConflict
+		}
+		return nil, err
+	}
+	return w.repo.loadSnapshot(ctx, commit)
 }
 
-func writeJSONIfMissing(path string, value any) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot, error) {
+	data, err := r.git.ReadTreeFile(ctx, r.Root, commit, "manifest.json")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
-	return writeJSON(path, value)
+	var manifest Manifest
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return nil, fmt.Errorf("%w: decode manifest: %v", ErrCorrupt, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: trailing manifest content", ErrCorrupt)
+	}
+	if manifest.FormatVersion != FormatVersion {
+		return nil, fmt.Errorf("unsupported RepoDB format %d (supported: %d)", manifest.FormatVersion, FormatVersion)
+	}
+	objectSet := make(map[storage.Hash]struct{}, len(manifest.Objects))
+	for i, hash := range manifest.Objects {
+		if !hash.Valid() {
+			return nil, fmt.Errorf("%w: invalid object hash %q", ErrCorrupt, hash)
+		}
+		if i > 0 && manifest.Objects[i-1] >= hash {
+			return nil, fmt.Errorf("%w: object inventory is not sorted and unique", ErrCorrupt)
+		}
+		objectSet[hash] = struct{}{}
+	}
+	snapshot := &Snapshot{repo: r, Commit: commit, Manifest: manifest, objectSet: objectSet}
+	if err := validateManifestInventory(manifest, objectSet); err != nil {
+		return nil, err
+	}
+	paths, err := r.git.ListTree(ctx, r.Root, commit)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	expectedPaths := make(map[string]struct{}, len(objectSet)+1)
+	expectedPaths["manifest.json"] = struct{}{}
+	for hash := range objectSet {
+		expectedPaths[objectPath(hash)] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := expectedPaths[path]; !ok {
+			return nil, fmt.Errorf("%w: unlisted tree entry %s", ErrCorrupt, path)
+		}
+		delete(expectedPaths, path)
+	}
+	if len(expectedPaths) != 0 {
+		return nil, fmt.Errorf("%w: snapshot is missing %d listed tree entries", ErrCorrupt, len(expectedPaths))
+	}
+	for hash := range objectSet {
+		if _, err := snapshot.Store().Get(ctx, hash); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
+	}
+	return snapshot, nil
 }
 
-func writeJSON(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
+type snapshotStore struct{ snapshot *Snapshot }
+
+func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, error) {
+	if !hash.Valid() {
+		return nil, fmt.Errorf("invalid object hash %q", hash)
+	}
+	if _, ok := s.snapshot.objectSet[hash]; !ok {
+		return nil, storage.ErrNotFound
+	}
+	data, err := s.snapshot.repo.git.ReadTreeFile(ctx, s.snapshot.repo.Root, s.snapshot.Commit, objectPath(hash))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	data = append(data, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".repodb-manifest-*")
-	if err != nil {
-		return err
+	if storage.Sum(data) != hash {
+		return nil, fmt.Errorf("object %s failed integrity check", hash)
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return data, nil
 }
 
-func readJSON(path string, value any) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
+func (*snapshotStore) Put(context.Context, []byte) (storage.Hash, error) {
+	return "", errors.New("snapshot store is read-only")
+}
+
+func validateManifest(manifest Manifest, objects map[storage.Hash][]byte) error {
+	set := make(map[storage.Hash]struct{}, len(objects))
+	for hash, data := range objects {
+		if !hash.Valid() || storage.Sum(data) != hash {
+			return fmt.Errorf("object %q failed integrity check", hash)
+		}
+		set[hash] = struct{}{}
 	}
-	if err := json.Unmarshal(data, value); err != nil {
-		return fmt.Errorf("decode %s: %w", path, err)
+	return validateManifestInventory(manifest, set)
+}
+
+func validateManifestInventory(manifest Manifest, objects map[storage.Hash]struct{}) error {
+	if manifest.DefaultDatabase == "" {
+		return fmt.Errorf("%w: default database is empty", ErrCorrupt)
+	}
+	if manifest.Tables == nil {
+		return fmt.Errorf("%w: tables map is absent", ErrCorrupt)
+	}
+	for name, table := range manifest.Tables {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%w: table name is empty", ErrCorrupt)
+		}
+		for kind, hash := range map[string]storage.Hash{"schema": table.SchemaRoot, "data": table.DataRoot} {
+			if hash == "" {
+				continue
+			}
+			if _, ok := objects[hash]; !ok {
+				return fmt.Errorf("%w: table %q %s root %s is not in the object inventory", ErrCorrupt, name, kind, hash)
+			}
+		}
 	}
 	return nil
+}
+
+func sortedHashes(objects map[storage.Hash][]byte) []storage.Hash {
+	hashes := make([]storage.Hash, 0, len(objects))
+	for hash := range objects {
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+	return hashes
+}
+
+func cloneObjects(objects map[storage.Hash][]byte) map[storage.Hash][]byte {
+	cloned := make(map[storage.Hash][]byte, len(objects))
+	for hash, data := range objects {
+		cloned[hash] = append([]byte(nil), data...)
+	}
+	return cloned
+}
+
+func objectPath(hash storage.Hash) string {
+	return "objects/sha256/" + string(hash[:2]) + "/" + string(hash[2:])
+}
+
+func (r *Repository) lock(ctx context.Context) (func(), error) {
+	lockDir := filepath.Join(r.CommonDir, "repodb", "locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(lockDir, "publish.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
+			return func() {
+				_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+				_ = file.Close()
+			}, nil
+		} else if !errors.Is(err, unix.EWOULDBLOCK) {
+			file.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			file.Close()
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func legacyExists(path string) bool {
+	_, configErr := os.Stat(filepath.Join(path, "config.json"))
+	_, manifestErr := os.Stat(filepath.Join(path, "manifest.json"))
+	return configErr == nil || manifestErr == nil
 }

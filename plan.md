@@ -138,6 +138,10 @@ for operations such as append-only events or independent field edits.
 
 ### M0 — Prove Git storage and integration constraints
 
+**Status: complete (2026-09-11).** The executable experiment is in
+`experiments/gitstorage`; the resulting ref, transport, synchronization, session,
+and hook decisions are documented in `docs/git-integration.md`.
+
 Build small integration experiments using a bare remote and two local clones.
 Use synthetic database manifests; do not wait for a complete SQL engine.
 
@@ -165,6 +169,11 @@ transparency needs a narrower command contract, make that product tradeoff expli
 before implementing the integration. Do not silently redefine ordinary Git behavior.
 
 ### M1 — Implement durable repository snapshots
+
+**Status: complete (2026-09-11).** The repository API, snapshot writer and reader,
+integrity validation, process lock and CAS publication, legacy import, and
+cross-clone reconstruction are implemented and documented in
+`docs/storage-format.md`.
 
 - Replace tracked `.repodb/` authority with versioned Git trees and dedicated refs.
 - Add complete snapshot read/write, integrity checks, atomic ref publication, and
