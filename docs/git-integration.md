@@ -40,7 +40,7 @@ objects have reached stable storage.
 
 ## Enable and transport contract
 
-`repodb enable` will select one remote and idempotently add this fetch refspec,
+`repodb enable --remote <remote>` selects one remote and idempotently adds this fetch refspec,
 while preserving all existing refspecs:
 
 ```text
@@ -48,7 +48,7 @@ while preserving all existing refspecs:
 ```
 
 Fetched state is stored separately from the writable local data head. A fetch
-must never replace local database work. `enable` will not add a push refspec.
+must never replace local database work. `enable` does not add a push refspec.
 Adding one either changes what a plain push means or still fails to cover an
 explicitly scoped push. RepoDB will not silently change branch publication
 semantics to approximate transparent database pushes.
@@ -65,10 +65,11 @@ The supported ordinary-command behavior is:
 | `git push <remote> <branch>` | Pushes the selected branch | Does not push data |
 | Offline Git operation | Behaves as Git reports | Local committed data remains readable |
 
-An explicit `repodb sync` is the guaranteed network operation. It will fetch the
-selected remote, reconcile its tracking data into the local data head, and push
-that data ref with race detection and bounded retry. Until three-way merge lands
-in M4, divergence will remain an actionable error that preserves both heads.
+An explicit `repodb sync --remote <remote>` is the guaranteed network operation.
+It fetches the selected remote, validates and fast-forwards its tracking data
+into the local data head when possible, and normally pushes an outgoing
+fast-forward. Until three-way merge lands in M4, divergence is an actionable
+error that preserves both heads.
 
 There is no atomicity claim between source and data histories. Even when a remote
 supports Git's atomic push capability, ordinary branch commands above do not
@@ -83,10 +84,9 @@ separately:
 
 ## Reconciliation and session boundary
 
-Engine open and the start of each new transaction will inspect already fetched
-tracking refs and fast-forward or reconcile them before pinning a snapshot. They
-will not implicitly perform network I/O. Autocommit statements each start at a
-new transaction boundary.
+`repodb sync` is the reconciliation boundary. Engine open and transaction start
+perform no network operation and pin the current writable local head. Autocommit
+statements each start at a new transaction boundary.
 
 An explicit transaction remains pinned to its initial immutable snapshot through
 commit or rollback, even if `git fetch` or `repodb sync` updates tracking state in
@@ -108,6 +108,6 @@ The experiment demonstrates that a dispatcher can preserve and invoke an
 existing `pre-push` hook alongside a RepoDB component, including idempotent
 installation. This is technically possible but competes with existing hook
 managers and `core.hooksPath`. The initial `enable` implementation therefore
-will not install or replace hooks. A later opt-in diagnostic hook may warn about
+does not install or replace hooks. A later opt-in diagnostic hook may warn about
 outgoing unsynchronized data, but it must call the same sync/status API and must
 not claim to transport or reconcile data itself.

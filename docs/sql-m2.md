@@ -80,6 +80,12 @@ Git update errors are classified as stale conflicts only after RepoDB reads the
 live ref and observes a different head. A generic Git “cannot lock ref” message
 is not itself considered a retryable conflict.
 
+Embedded SQL commits preserve `*repository.CommitError` fields. Across MySQL,
+the server emits a stable outcome and candidate marker; the Go wire client parses
+it as `*client.CommitError`. Wire callers can then call
+`Client.RecoverCommit`, backed by `repodb_recover_commit(candidate)`, to resolve
+the candidate without filesystem access or statement replay.
+
 ## Bounded initial workload and measurement
 
 The M2 implementation targets small tool databases: up to roughly 1,000 rows

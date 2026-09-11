@@ -1,6 +1,6 @@
 # RepoDB implementation plan
 
-Status: M0, M1, and M2 complete; M3 is next. Updated 2026-09-12 after implementation
+Status: M0 through M3 complete; M4 is next. Updated 2026-09-12 after implementation
 review and a passing `make test` run. Later milestones remain pending.
 
 ## Product goal
@@ -63,22 +63,21 @@ network I/O. See [the accepted command matrix](docs/git-integration.md).
 
 | Component | Current implementation | Required change |
 | --- | --- | --- |
-| `server/` | MySQL listener and `go-mysql-server` with memory tables | Extract reusable engine; replace memory catalog/storage |
+| `server/` | MySQL listener routed through the persistent shared engine | Broaden compatibility after merge correctness |
 | `client/` | MySQL driver wrapper | Retain as optional network client |
-| `common/prolly/` | Deterministic bulk tree build and point lookup | Add iteration, typed SQL encoding, mutation, and diff |
+| `common/prolly/` | Deterministic bulk tree build, point lookup, iteration, and graph validation | Add incremental mutation and diff |
 | `common/storage/` | SHA-256-addressed store interface and memory/filesystem implementations | Retain interface; repository snapshots and writers provide Git-backed stores |
-| `common/repository/` | Versioned Git snapshots, integrity validation, common-directory discovery, publication lock/CAS, legacy import | Clarify commit outcomes; bound snapshot cost; integrate SQL object-graph validation |
-| `common/git/` | Object/tree/commit operations, expected-head ref updates, fsync configuration | Refine publication error classification; add remote transport |
-| CLI | `init`, snapshot `status`, `import-legacy`, network `sql`; separate server binary; manual `snapshot` rejected | Introduce enable/start/sync lifecycle and transport status |
+| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, legacy import | Add merge candidate and conflict storage |
+| `common/git/` | Object/tree/commit operations, classified expected-head updates, fsync, and explicit remote transport | Support bounded merge/push retry diagnostics |
+| CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `start`, and network `sql` | Add merge inspection and resolution |
 
-Existing tests cover tree determinism/lookup, snapshot reopen and cross-clone
-reconstruction, GC/cache deletion, stale and concurrent writers, linked-worktree
-identity, Git SHA-1/SHA-256 formats, legacy import, invalid snapshots, the M0 Git
-integration experiment, and a basic in-memory SQL round trip over MySQL.
-`make test` passes. The writer concurrency test currently uses goroutines in one
-process; separate-process contention and publication fault injection remain to
-be tested. Persistent SQL, embedded access, SQL transaction semantics, merge
-correctness, and the product sync API are not implemented yet.
+Existing tests cover tree determinism and validation, persistent embedded and
+MySQL SQL, restart recovery, publication outcomes through both interfaces,
+separate-process and linked-worktree contention, injected failures, Git
+SHA-1/SHA-256 formats, legacy import, enable/sync idempotence, fast-forward
+transport, pinned transactions, and divergence preservation. `make test` passes.
+Three-way merge, conflict resolution, broader compatibility, and incremental
+tree mutation remain pending.
 
 The original tracked-directory/manual-snapshot design is superseded by this plan.
 Its reusable storage and SQL pieces are a starting point, not the target contract.
@@ -264,10 +263,14 @@ Separate-process tests demonstrate stale-writer rejection without lost writes.
 
 ### M3 — Enable and transport one history safely
 
+**Status: complete (2026-09-12).** Idempotent explicit-remote enable, validated
+tracking fetches, shared-lock fast-forward synchronization, divergence
+preservation, CLI diagnostics, and pinned-transaction behavior are implemented
+and documented in [docs/sync-m3.md](docs/sync-m3.md).
+
 - Implement idempotent `repodb enable` based on M0's proven integration, including
   existing-state discovery and an explicit empty-database initialization path.
-- Preserve user hooks/configuration and provide a way to remove only RepoDB-owned
-  integration. Install no hooks or push refspecs in the initial enable flow.
+- Preserve user hooks/configuration. Install no hooks or push refspecs in the enable flow.
   Select remotes deliberately; do not publish to every remote.
 - Implement a reusable sync API and a diagnostic `repodb sync` command. Consumers
   and Git integration call the same implementation.
@@ -325,20 +328,15 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Proceed to M2 on the existing M0/M1 foundation. First tighten publication outcome
-reporting and error classification, with separate-process and injected-failure
-tests. Then deliver a small persistent embedded SQL engine shared by the server:
-explicit primary keys, a documented small type set, schemas and rows, scans,
-autocommit, explicit commit/rollback, and restart recovery through both entry points.
+Proceed to M4 on the completed storage, SQL, and explicit synchronization
+foundation. Add deterministic three-way catalog and row merging from the common
+data ancestor, while retaining the M3 publication lock, expected-head checks,
+tracking refs, and normal non-force push behavior.
 
-Keep full MySQL compatibility, incremental tree optimization, and distributed merge
-outside this first SQL slice. Establish workload bounds while implementing it;
-do not extend the in-memory demo while leaving persistence unresolved.
-
-The single local data head, dedicated ref layout, independent data history, and
-explicit sync contract are the accepted M0/M1 baseline. M2 applies automatic data
-commits to SQL writes. Embedded API signatures and detailed SQL semantics remain
-to be specified in M2; merge policy is developed and validated in M4.
+Accept unchanged, one-sided, and disjoint row changes. Preserve and report both
+histories for competing edits, DDL conflicts, or constraint failures, with
+inspectable conflict details and explicit resolution. Remote advancement during
+merge must use bounded retries and must never discard either history.
 
 ## References
 

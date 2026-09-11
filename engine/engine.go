@@ -47,13 +47,29 @@ func New(repo *repository.Repository) (*Engine, error) {
 		return nil, err
 	}
 	db := &database{name: snapshot.Manifest.DefaultDatabase, repo: repo}
-	for name, table := range snapshot.Manifest.Tables {
-		if _, err := loadTable(context.Background(), snapshot.Store(), table); err != nil {
-			return nil, fmt.Errorf("validate SQL table %s: %w", name, err)
-		}
+	if err := ValidateSnapshot(context.Background(), snapshot); err != nil {
+		return nil, err
 	}
 	provider := &provider{db: db}
-	return &Engine{repo: repo, database: db, provider: provider, sql: sqle.NewDefault(provider)}, nil
+	sqlEngine := sqle.NewDefault(provider)
+	sqlEngine.Analyzer.Catalog.RegisterFunction(sql.NewEmptyContext(), sql.Function1{
+		Name: "repodb_recover_commit",
+		Fn: func(child sql.Expression) sql.Expression {
+			return &recoverCommitExpression{repo: repo, child: child}
+		},
+	})
+	return &Engine{repo: repo, database: db, provider: provider, sql: sqlEngine}, nil
+}
+
+// ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
+// and primary-key encoding before integration publishes a fetched snapshot.
+func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error {
+	for name, table := range snapshot.Manifest.Tables {
+		if _, err := loadTable(ctx, snapshot.Store(), table); err != nil {
+			return fmt.Errorf("validate SQL table %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func (e *Engine) Repository() *repository.Repository { return e.repo }

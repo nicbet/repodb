@@ -6,11 +6,11 @@ an optional MySQL-compatible server, automatic persistence under dedicated Git
 refs, and synchronization configured through `repodb enable`.
 
 Database history is independent of code history. Applications control the
-embedded engine's lifecycle; `repodb start` will offer a separate server when
+embedded engine's lifecycle; `repodb start` offers a separate server when
 wanted. Enabling repository integration will not start a server.
 
 See [plan.md](plan.md) for the agreed requirements, proposed architecture, and
-implementation milestones. The enable/start workflow is planned, not implemented.
+implementation milestones. The enable/sync/start workflow is implemented.
 The M0 storage and ordinary-Git command contract is recorded in
 [docs/git-integration.md](docs/git-integration.md).
 
@@ -30,6 +30,11 @@ commit under `refs/repodb/data`. See [the M2 SQL contract](docs/sql-m2.md) for
 the supported SQL scope, transaction behavior, outcome recovery, and measured
 initial workload.
 
+M3 adds explicit Git transport. `repodb enable --remote <name>` configures and
+fetches a separate tracking ref, and `repodb sync --remote <name>` performs only
+validated fast-forwards. Divergence preserves both histories for M4. See
+[the M3 synchronization contract](docs/sync-m3.md).
+
 ## Layout
 
 ```text
@@ -38,6 +43,7 @@ cmd/repodb-server/   MySQL-compatible server process
 client/              reusable MySQL wire client
 server/              go-mysql-server host and storage adapters
 engine/              embedded persistent SQL engine and table adapters
+integration/         enable and explicit fast-forward synchronization
 common/prolly/       deterministic content-defined tree construction
 common/storage/      content-addressed memory and filesystem stores
 common/repository/   durable Git snapshots, manifests, and legacy import
@@ -57,7 +63,8 @@ Go 1.27 or newer is expected by the current experiment.
 make test
 make build
 make m0 # repeat the Git integration experiment under /tmp/repodb-m0
-./bin/repodb init .
+./bin/repodb enable --remote origin
+./bin/repodb sync --remote origin
 ./bin/repodb start -repo .
 ```
 
@@ -93,5 +100,5 @@ concurrency, cache, durability, and legacy migration details.
 
 Follow the milestones and acceptance criteria in [plan.md](plan.md): prove Git
 storage/transport, implement durable snapshots, connect persistent embedded SQL
-and the server, then add enable/sync, distributed merge, and compatibility work.
+and the server, add enable/sync, then implement distributed merge and compatibility work.
 Ordinary writes will persist automatically without user-managed Git snapshots.

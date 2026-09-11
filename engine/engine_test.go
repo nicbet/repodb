@@ -170,6 +170,55 @@ func TestDDLUsesMySQLImplicitCommit(t *testing.T) {
 	}
 }
 
+func TestEmbeddedCommitOutcomeAndRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		point              repository.PublicationPoint
+		outcome, recovered repository.CommitOutcome
+	}{
+		{"committed", repository.AfterRefPublication, repository.OutcomeCommitted, repository.OutcomeCommitted},
+		{"unknown", repository.DuringRefPublication, repository.OutcomeUnknown, repository.OutcomeRejected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := gitRepository(t)
+			repo, err := repository.Init(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			eng, _ := engine.New(repo)
+			defer eng.Close()
+			session, _ := eng.NewSession()
+			if err := session.Exec(ctx, "CREATE TABLE outcomes (id BIGINT PRIMARY KEY)"); err != nil {
+				t.Fatal(err)
+			}
+			tx, _ := session.Begin(ctx)
+			if err := tx.Exec(ctx, "INSERT INTO outcomes VALUES (1)"); err != nil {
+				t.Fatal(err)
+			}
+			repo.SetPublicationFaultInjector(func(point repository.PublicationPoint) error {
+				if point == test.point {
+					return errors.New("injected SQL commit fault")
+				}
+				return nil
+			})
+			err = tx.Commit(ctx)
+			var commitErr *repository.CommitError
+			if !errors.As(err, &commitErr) || commitErr.Outcome != test.outcome || commitErr.Commit == "" {
+				t.Fatalf("commit error = %#v (%v)", commitErr, err)
+			}
+			repo.SetPublicationFaultInjector(nil)
+			recovered, err := repo.RecoverCommit(ctx, commitErr.Commit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered.Outcome != test.recovered {
+				t.Fatalf("recovered = %v, want %v", recovered.Outcome, test.recovered)
+			}
+		})
+	}
+}
+
 func gitRepository(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

@@ -41,6 +41,19 @@ const (
 	OutcomeUnknown
 )
 
+func (o CommitOutcome) String() string {
+	switch o {
+	case OutcomeRejected:
+		return "rejected"
+	case OutcomeCommitted:
+		return "committed"
+	case OutcomeUnknown:
+		return "unknown"
+	default:
+		return "invalid"
+	}
+}
+
 type CommitResult struct {
 	Outcome  CommitOutcome
 	Commit   string
@@ -53,7 +66,9 @@ type CommitError struct {
 	Err     error
 }
 
-func (e *CommitError) Error() string { return e.Err.Error() }
+func (e *CommitError) Error() string {
+	return fmt.Sprintf("[repodb-commit outcome=%s candidate=%s] %v", e.Outcome, e.Commit, e.Err)
+}
 func (e *CommitError) Unwrap() error { return e.Err }
 
 type Table struct {
@@ -163,6 +178,11 @@ func Open(ctx context.Context, start string) (*Repository, error) {
 	return repo, nil
 }
 
+// Discover locates repository-wide RepoDB state without requiring an initialized
+// data ref. Integration setup uses it before deciding whether to adopt remote
+// data or initialize an empty catalog.
+func Discover(ctx context.Context, start string) (*Repository, error) { return discover(ctx, start) }
+
 func discover(ctx context.Context, start string) (*Repository, error) {
 	cli := repodbgit.CLI{}
 	info, err := cli.Discover(ctx, start)
@@ -194,6 +214,80 @@ func (r *Repository) Current(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 	return r.loadSnapshot(ctx, commit)
+}
+
+// Head returns the live data commit, or an empty string when RepoDB has not yet
+// initialized a local data history.
+func (r *Repository) Head(ctx context.Context) (string, error) {
+	head, err := r.git.ResolveRef(ctx, r.Root, DataRef)
+	if errors.Is(err, repodbgit.ErrRefNotFound) {
+		return "", nil
+	}
+	return head, err
+}
+
+func (r *Repository) SnapshotAt(ctx context.Context, revision string) (*Snapshot, error) {
+	commit, err := r.git.ResolveRef(ctx, r.Root, revision)
+	if err != nil {
+		return nil, err
+	}
+	return r.loadSnapshot(ctx, commit)
+}
+
+type LockedPublication struct{ repo *Repository }
+
+// WithPublicationLock serializes integration reconciliation with SQL commits.
+func (r *Repository) WithPublicationLock(ctx context.Context, fn func(*LockedPublication) error) error {
+	release, err := r.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn(&LockedPublication{repo: r})
+}
+
+func (p *LockedPublication) Head(ctx context.Context) (string, error) {
+	head, err := p.repo.git.ResolveRef(ctx, p.repo.Root, DataRef)
+	if errors.Is(err, repodbgit.ErrRefNotFound) {
+		return "", nil
+	}
+	return head, err
+}
+
+// FastForward validates target and advances the live head from expected. The
+// LockedPublication value ensures callers already hold the shared writer lock.
+func (p *LockedPublication) FastForward(ctx context.Context, expected, target string) (*Snapshot, error) {
+	snapshot, err := p.repo.loadSnapshot(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	actual, err := p.Head(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if actual != expected {
+		return nil, ErrConflict
+	}
+	if actual == target {
+		return snapshot, nil
+	}
+	if actual != "" {
+		forward, err := p.repo.git.IsAncestor(ctx, p.repo.Root, actual, target)
+		if err != nil {
+			return nil, err
+		}
+		if !forward {
+			return nil, fmt.Errorf("target %s is not a fast-forward of local data head %s", target, actual)
+		}
+	}
+	if err := p.repo.git.UpdateRef(ctx, p.repo.Root, DataRef, target, actual); err != nil {
+		now, resolveErr := p.Head(context.Background())
+		if resolveErr == nil && now != actual {
+			return nil, ErrConflict
+		}
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 // Begin pins the current immutable snapshot. Reads through the writer see that

@@ -26,8 +26,9 @@ func ResetProcessCount()   { processCount.Store(0) }
 type CLI struct{}
 
 var (
-	ErrRefNotFound = errors.New("Git ref not found")
-	ErrRefConflict = errors.New("Git ref changed")
+	ErrRefNotFound       = errors.New("Git ref not found")
+	ErrRefConflict       = errors.New("Git ref changed")
+	ErrRemoteRefNotFound = errors.New("remote Git ref not found")
 )
 
 type RepositoryInfo struct {
@@ -84,6 +85,74 @@ func (CLI) IsAncestor(ctx context.Context, root, ancestor, descendant string) (b
 		return false, nil
 	}
 	return false, fmt.Errorf("check Git ancestry: %w", err)
+}
+
+func (CLI) RemoteURL(ctx context.Context, root, remote string) (string, error) {
+	out, err := run(ctx, root, nil, nil, "remote", "get-url", remote)
+	if err != nil {
+		return "", fmt.Errorf("resolve remote %q: %w", remote, err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (CLI) RemoteRef(ctx context.Context, root, remote, ref string) (string, error) {
+	out, err := run(ctx, root, nil, nil, "ls-remote", "--exit-code", remote, ref)
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 2 {
+			return "", ErrRemoteRefNotFound
+		}
+		return "", fmt.Errorf("inspect %s on remote %q: %w", ref, remote, err)
+	}
+	fields := strings.Fields(out)
+	if len(fields) < 2 || fields[1] != ref {
+		return "", ErrRemoteRefNotFound
+	}
+	return fields[0], nil
+}
+
+func (CLI) ConfigValues(ctx context.Context, root, key string) ([]string, error) {
+	out, err := run(ctx, root, nil, nil, "config", "--local", "--get-all", key)
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read Git config %s: %w", key, err)
+	}
+	return strings.Split(strings.TrimSuffix(out, "\n"), "\n"), nil
+}
+
+func (CLI) AddConfig(ctx context.Context, root, key, value string) error {
+	_, err := run(ctx, root, nil, nil, "config", "--local", "--add", key, value)
+	if err != nil {
+		return fmt.Errorf("add Git config %s: %w", key, err)
+	}
+	return nil
+}
+
+func (CLI) SetConfig(ctx context.Context, root, key, value string) error {
+	_, err := run(ctx, root, nil, nil, "config", "--local", key, value)
+	if err != nil {
+		return fmt.Errorf("set Git config %s: %w", key, err)
+	}
+	return nil
+}
+
+func (CLI) FetchRef(ctx context.Context, root, remote, source, destination string) error {
+	_, err := run(ctx, root, nil, nil, "fetch", "--no-tags", remote, "+"+source+":"+destination)
+	if err != nil {
+		return fmt.Errorf("fetch RepoDB data from %q: %w", remote, err)
+	}
+	return nil
+}
+
+func (CLI) PushRef(ctx context.Context, root, remote, source, destination string) error {
+	_, err := run(ctx, root, nil, nil, "push", remote, source+":"+destination)
+	if err != nil {
+		return fmt.Errorf("push RepoDB data to %q: %w", remote, err)
+	}
+	return nil
 }
 
 func (CLI) HashObject(ctx context.Context, root string, data []byte) (string, error) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/nicbet/repodb/client"
 	"github.com/nicbet/repodb/common/repository"
+	"github.com/nicbet/repodb/integration"
 	repodbserver "github.com/nicbet/repodb/server"
 )
 
@@ -26,7 +27,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: repodb <init|status|import-legacy|start|sql>")
+		return errors.New("usage: repodb <init|status|import-legacy|enable|sync|start|sql>")
 	}
 	switch args[0] {
 	case "init":
@@ -79,6 +80,39 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	case "sql":
 		return runSQL(ctx, args[1:])
+	case "enable":
+		set := flag.NewFlagSet("enable", flag.ContinueOnError)
+		remote := set.String("remote", "", "explicit Git remote name")
+		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		if err := set.Parse(args[1:]); err != nil {
+			return err
+		}
+		status, err := integration.Enable(ctx, *repoPath, *remote)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("RepoDB enabled for %s: %s\nlocal: %s\ntracking: %s", status.Remote, status.Action, status.LocalHead, status.TrackingRef)
+		if status.RemoteHead != "" {
+			fmt.Printf(" (%s)", status.RemoteHead)
+		}
+		fmt.Println()
+		return nil
+	case "sync":
+		set := flag.NewFlagSet("sync", flag.ContinueOnError)
+		remote := set.String("remote", "", "explicit Git remote name")
+		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		if err := set.Parse(args[1:]); err != nil {
+			return err
+		}
+		status, err := integration.Sync(ctx, *repoPath, *remote)
+		if err != nil {
+			if status.LocalHead != "" || status.RemoteHead != "" {
+				fmt.Fprintf(os.Stderr, "local: %s\nremote tracking: %s (%s)\n", status.LocalHead, status.TrackingRef, status.RemoteHead)
+			}
+			return err
+		}
+		fmt.Printf("RepoDB sync with %s: %s\nlocal: %s\nremote tracking: %s (%s)\n", status.Remote, status.Action, status.LocalHead, status.TrackingRef, status.RemoteHead)
+		return nil
 	case "start":
 		set := flag.NewFlagSet("start", flag.ContinueOnError)
 		address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")

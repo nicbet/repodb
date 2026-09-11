@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,5 +149,70 @@ func TestEmbeddedWriteIsReadableAfterServerRestart(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || result.Rows[0][0] == nil || *result.Rows[0][0] != "from embedded" {
 		t.Fatalf("rows = %#v", result.Rows)
+	}
+}
+
+func TestMySQLCommitOutcomeAndRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		point              repository.PublicationPoint
+		outcome, recovered repository.CommitOutcome
+	}{
+		{"committed", repository.AfterRefPublication, repository.OutcomeCommitted, repository.OutcomeCommitted},
+		{"unknown", repository.DuringRefPublication, repository.OutcomeUnknown, repository.OutcomeRejected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			root := t.TempDir()
+			git := exec.Command("git", "init", "--quiet", "-b", "main")
+			git.Dir = root
+			if output, err := git.CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v: %s", err, output)
+			}
+			repo, err := repository.Init(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv, err := server.New(server.Config{Address: "127.0.0.1:0", Repository: repo})
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() { _ = srv.Start() }()
+			defer srv.Close()
+			cli, err := client.Open(client.Config{Address: srv.Address(), Database: "repodb"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cli.Close()
+			if _, err := cli.Exec(ctx, "CREATE TABLE outcomes (id BIGINT PRIMARY KEY)"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cli.Exec(ctx, "START TRANSACTION"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cli.Exec(ctx, "INSERT INTO outcomes VALUES (1)"); err != nil {
+				t.Fatal(err)
+			}
+			repo.SetPublicationFaultInjector(func(point repository.PublicationPoint) error {
+				if point == test.point {
+					return errors.New("injected wire commit fault")
+				}
+				return nil
+			})
+			_, err = cli.Exec(ctx, "COMMIT")
+			var commitErr *client.CommitError
+			if !errors.As(err, &commitErr) || commitErr.Outcome != test.outcome || commitErr.Candidate == "" {
+				t.Fatalf("wire commit error = %#v (%v)", commitErr, err)
+			}
+			repo.SetPublicationFaultInjector(nil)
+			recovered, err := cli.RecoverCommit(ctx, commitErr.Candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered != test.recovered {
+				t.Fatalf("recovered = %v, want %v", recovered, test.recovered)
+			}
+		})
 	}
 }
