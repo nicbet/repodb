@@ -1,0 +1,275 @@
+# RepoDB implementation plan
+
+Status: agreed product direction, proposed implementation sequence. Updated
+2026-09-11. Milestones below are pending unless explicitly stated otherwise.
+
+## Product goal
+
+RepoDB is shared database infrastructure for tools whose state belongs to an
+existing Git repository. Git-native tooling like issue trackers, kanban boards, and agent trace tools could be significantly imporoved by using SQL instead of each implementing object storage, history, transport, and reconciliation themselves.
+
+Code and database share a repository and remote, with independent histories.
+
+## Agreed requirements
+
+- Provide MySQL-compatible SQL and transactions within a documented scope, plus
+  an optional MySQL wire-protocol server for existing drivers and tools.
+- Support direct, in-process use as a Go module. The embedded engine must not
+  require a server process, TCP connection, or automatic background service.
+- Keep authoritative schema and data in Git objects reachable from dedicated
+  RepoDB refs. Local caches and indexes may be rebuilt from repository state.
+- Persist successful SQL transactions automatically. Users need not stage files,
+  export tables, or manually create Git snapshots for ordinary persistence.
+- Keep database changes out of the source worktree, index, and code branch history.
+- Support multiple applications and independent clones, including offline writes
+  and synchronization without silent data loss.
+- Make repository integration an explicit, idempotent `repodb enable` operation.
+  A normal clone gets the code; enable discovers/fetches database refs and sets up
+  their future transport. Enable does not start a server.
+- Offer `repodb start` for users who want a standalone MySQL server. Embedded
+  applications own the lifecycle of their engine instances.
+
+Proposed user-facing workflow (these commands are not implemented yet):
+
+```sh
+# Regular git clone
+git clone <project-url>
+cd <project>
+
+# Fetch database refs, setup transports, hooks, ...
+repodb enable
+
+# An embedded application can now open the repository database.
+repodb start
+```
+
+Transparency means persistence and Git storage are handled by RepoDB. Genuine
+concurrent editing conflicts still need an application policy or user resolution.
+Local SQL success does not imply that an offline or failing remote has received it.
+
+## What exists today
+
+| Component | Current implementation | Required change |
+| --- | --- | --- |
+| `server/` | MySQL listener and `go-mysql-server` with memory tables | Extract reusable engine; replace memory catalog/storage |
+| `client/` | MySQL driver wrapper | Retain as optional network client |
+| `common/prolly/` | Deterministic bulk tree build and point lookup | Add iteration, typed SQL encoding, mutation, and diff |
+| `common/storage/` | SHA-256-addressed memory/filesystem blobs | Add Git-backed persistence with full reachability |
+| `common/repository/` | Tracked `.repodb/` files and manifest | Discover common Git directory; own database refs and format |
+| `common/git/` | Worktree discovery, stage, commit, status | Add object/ref operations and remote transport |
+| CLI | `init`, `status`, `snapshot`, network `sql`; separate server binary | Introduce enable/start/sync lifecycle and useful status |
+
+Existing tests cover tree determinism/lookup, filesystem layout initialization,
+and a basic SQL round trip over MySQL. They do not establish persistent SQL,
+transaction durability, embedded access, merge correctness, or synchronization.
+
+The original tracked-directory/manual-snapshot design is superseded by this plan.
+Its reusable storage and SQL pieces are a starting point, not the target contract.
+
+## Proposed architecture
+
+### One engine, two entry points
+
+Introduce an `engine` package responsible for repository-backed catalogs,
+sessions, queries, transactions, and lifecycle. Applications use this package
+directly; `server` adapts it to the MySQL wire protocol. Both paths must exercise
+the same persistence and transaction code.
+
+Keep repository storage, Git transport, and SQL concerns behind separate package
+boundaries in the existing Go module. Define a small typed embedded API for
+open/close, sessions, execution, result iteration, and transactions. Do not require
+callers to depend on internal `go-mysql-server` types. Exact signatures remain open.
+
+### Git representation and transaction publication
+
+Start with one versioned catalog containing application databases/namespaces and
+one local head, provisionally `refs/repodb/data`. Transactions across namespaces
+can therefore publish atomically. Namespaces provide organization, not access
+control between applications with filesystem access to the same repository.
+
+Each data commit points to a Git tree containing a versioned manifest and every
+blob needed to read that snapshot. Preserve the current content hashes initially
+by mapping them to Git tree entries; Git object IDs and RepoDB SHA-256 hashes are
+different identities and must not be conflated.
+
+**A hash inside a JSON blob is not a Git reachability edge.** Every schema/data
+chunk must also be reachable through actual Git trees, otherwise ordinary object
+transport and garbage collection cannot preserve the database. Avoid depending
+on loose object files or a warm local cache. Publish through Git plumbing without
+checking out the data tree or modifying the user's index.
+
+Proposed first durability model: each successful write transaction creates one
+internal data commit and atomically advances the data ref using its expected old
+value. Autocommit statements follow the same path. Explicit rollback publishes
+nothing. Unchanged transactions need not create new commits. This deliberately
+replaces the prototype's rule against automatic Git commits; these commits live
+in independent database history.
+
+Persist objects before publishing the ref and acknowledge success only after the
+required durability steps. An interrupted write leaves either the previous state
+or a complete new state. Record filesystem/fsync and Git-version assumptions;
+atomic ref replacement alone is not a complete power-loss durability guarantee.
+Benchmark this baseline before introducing batching or a write-ahead log, which
+would change the relationship between acknowledged writes and Git-owned state.
+
+### Local concurrency and remote concurrency
+
+Discover the common Git directory, including linked worktrees, instead of assuming
+`.git` is a directory. Repository-wide state and locking belong to that shared
+identity. Readers pin immutable snapshots; publication is serialized across
+processes and checked against the expected data head. A stale writer must receive
+a defined retryable conflict or pass explicit validation, never overwrite a newer
+head. Do not transparently replay arbitrary application transactions.
+
+Independent clones do not share locks. Fetch remote heads into a separate tracking
+namespace (provisionally `refs/repodb/remotes/<remote>/data`) rather than replacing
+the writable local head. Reconciliation uses a common ancestor and produces a
+validated merge commit before publishing. Remote races require bounded retries.
+Do not force-push to resolve divergence.
+
+The initial merge policy should accept unchanged/one-sided changes and disjoint
+row edits, and report competing edits to the same row conservatively. Conflicting
+DDL and constraint violations block publication. Persist or reproducibly derive
+conflict details without making an invalid merged catalog the live database.
+Provide inspection/resolution APIs before adding application-specific policies
+for operations such as append-only events or independent field edits.
+
+## Implementation sequence
+
+### M0 — Prove Git storage and integration constraints
+
+Build small integration experiments using a bare remote and two local clones.
+Use synthetic database manifests; do not wait for a complete SQL engine.
+
+- Prove a custom data ref can carry all required objects through push/fetch and
+  survive repacking, garbage collection, and cache deletion.
+- Exercise compare-and-swap publication and discovery from linked worktrees.
+- Prototype enable-time fetch/push configuration and hook composition. Test plain
+  push, explicit branch pushes, fetch, pull with merge/rebase, offline operation,
+  pre-existing refspecs/hooks, and no source changes pending.
+- Decide when fetched database state is reconciled: on engine open/transaction
+  boundaries, an explicit sync call, or a supported hook. Existing sessions must
+  retain their transaction snapshots and observe updates at a defined boundary.
+- Record the supported ordinary-Git command matrix and how partial code/data
+  synchronization is reported. Do not imply atomic publication of both histories
+  unless the selected transport actually provides it.
+
+Git refspecs configure transport, not database merging. Git has no general
+`post-fetch` hook; `post-merge` does not cover every fetch/pull path. A `pre-push`
+hook can inspect or reject a push, but cannot simply add refs to its parent's
+already selected update list. Explicit refspecs can override configured defaults.
+These constraints must shape the implementation, not be hidden by an enable flag.
+
+**Exit:** executable experiments plus a documented integration decision. If full
+transparency needs a narrower command contract, make that product tradeoff explicit
+before implementing the integration. Do not silently redefine ordinary Git behavior.
+
+### M1 — Implement durable repository snapshots
+
+- Replace tracked `.repodb/` authority with versioned Git trees and dedicated refs.
+- Add complete snapshot read/write, integrity checks, atomic ref publication, and
+  process-safe coordination. Use the existing narrow Git CLI boundary initially.
+- Define format versioning, commit metadata/identity, local cache locations, and
+  behavior for absent/corrupt/unsupported repositories.
+- Provide an explicit import path or documented reset path for the experimental
+  `.repodb/` layout; never silently delete it.
+
+**Exit:** publish a synthetic catalog, close/reopen, delete caches, transfer it to
+a second clone, and reconstruct it exactly. Failures during publication cannot
+expose partial state; source HEAD/index/worktree remain unchanged.
+
+### M2 — Deliver persistent embedded SQL and the shared server
+
+- Extract the engine and implement schema persistence and table adapters over
+  Prolly roots, including scans and deterministic typed row/key encoding.
+- Start with explicit primary keys, a documented small type set, basic DDL/DML,
+  queries, parameter binding, autocommit, explicit commit, and rollback. Report
+  unsupported behavior clearly; SQL parser acceptance is not compatibility.
+- Define isolation, statement failure behavior, and MySQL DDL transaction behavior.
+  Implement snapshot readers and stale-writer detection before claiming durability.
+- Route the existing server through the same engine and add explicit `repodb start`.
+  Expose embedded open/close/query operations without opening a network listener.
+- Use bulk rebuilds only as an explicitly bounded initial implementation. Add
+  incremental updates when measurements show the cost; retain deterministic roots.
+
+**Exit:** an embedded program creates an issue table, commits rows, exits, and a
+MySQL client reads the same rows after a server restart. Rollback and failed writes
+leave no partial publication. Multiple processes cannot lose each other's writes.
+
+### M3 — Enable and transport one history safely
+
+- Implement idempotent `repodb enable` based on M0's proven integration, including
+  existing-state discovery and an explicit empty-database initialization path.
+- Preserve user hooks/configuration and provide a way to remove only RepoDB-owned
+  integration. Select remotes deliberately; do not publish to every remote.
+- Implement a reusable sync API and a diagnostic `repodb sync` command. Consumers
+  and Git integration call the same implementation.
+- Support initial transfer and fast-forward synchronization. Until M4, divergent
+  histories produce an actionable error and preserve both sides.
+- Report local durability, incoming/outgoing state, and transport failure separately.
+
+**Exit:** clone, enable, write through either entry point, transport through the
+supported Git workflow, and read from another enabled clone without manual snapshots.
+Enabling twice neither duplicates configuration nor starts a process.
+
+### M4 — Reconcile independently edited clones
+
+- Add row/schema diffs, three-way merge, conflict inspection and resolution, and
+  validation of supported constraints before advancing the live data ref.
+- Cover insert/insert collisions, update/update, update/delete, schema changes,
+  and unique-key conflicts between otherwise distinct rows.
+- Document distributed row identity: a local auto-increment counter alone cannot
+  prevent independently generated IDs from colliding across clones.
+- Handle remote advancement during synchronization without force updates or
+  unbounded retries. Keep failed merges inspectable and repeatable after restart.
+
+**Exit:** two offline clones add different issues/comments and converge; competing
+edits surface as conflicts, survive restart, and converge after explicit resolution.
+Repeat synchronization is idempotent and preserves both histories.
+
+### M5 — Complete transparent integration and prove the tool-author experience
+
+- Connect M4 reconciliation to the Git integration established in M0/M3, with no
+  long-running RepoDB service required just to transport refs.
+- Build a small embedded issue-tracker example and a second namespace for agent
+  events, plus a MySQL client example against the same engine.
+- Validate worktree switching, concurrent embedded/server use, read-only clones,
+  missing executables, hook failures, network failures, and partial synchronization.
+- Document the enable/embedded/start workflows and supported Git command matrix.
+
+**Exit:** two users clone and enable a project, use different SQL-backed tools
+offline, then synchronize and see both users' changes. Neither tool implements
+Git object storage or merging; neither user manages database snapshots.
+
+### M6 — Broaden compatibility and scale from measured workloads
+
+- Expand types, collations, schema migrations, constraints, secondary indexes,
+  and MySQL driver/ORM compatibility with behavioral tests.
+- Measure append-heavy traces and mutable issue/board data: commit latency,
+  query latency, memory use, repository growth, and synchronization cost.
+- Optimize tree mutation, Git object access, and caches from those measurements.
+- Add fault injection, corruption handling, fuzzing, retention/compaction policy,
+  and a supported authentication/TLS model for standalone network use.
+
+**Exit:** publish compatibility and workload limits backed by repeatable tests.
+Full MySQL parity and unrestricted OLTP performance are not initial release claims.
+
+## Immediate next deliverable
+
+Start with M0's Git-only proof and an explicit ref/transport decision, then M1's
+durable snapshot API. The first useful SQL milestone is M2: an embedded application
+writes persistent data that the standalone MySQL server can subsequently read.
+Do not extend the existing in-memory SQL demo while leaving persistence unresolved.
+
+The single-head catalog, one-data-commit-per-write-transaction policy, ref names,
+embedded API shape, and conservative merge policy above are proposed defaults,
+not requirements the user has already fixed. Validate them through the milestones.
+
+## References
+
+- [Git clone behavior](https://git-scm.com/docs/git-clone)
+- [Git push and refspec selection](https://git-scm.com/docs/git-push)
+- [Git hooks and their execution points](https://git-scm.com/docs/githooks)
+- [Conditional ref updates](https://git-scm.com/docs/git-update-ref)
+- [Remote fetch/push configuration](https://git-scm.com/docs/git-config)
+- [Dolt's Git remote implementation direction](https://www.dolthub.com/blog/2026-02-13-announcing-git-remote-support-in-dolt/)

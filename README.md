@@ -1,7 +1,18 @@
 # RepoDB
 
-RepoDB is an experiment in putting a MySQL-compatible database inside an
-existing Git repository. It is written in Go and combines:
+RepoDB is an experiment in shared database infrastructure for tools whose state
+belongs to an existing Git repository. The target is an embedded Go engine with
+an optional MySQL-compatible server, automatic persistence under dedicated Git
+refs, and synchronization configured through `repodb enable`.
+
+Database history is independent of code history. Applications control the
+embedded engine's lifecycle; `repodb start` will offer a separate server when
+wanted. Enabling repository integration will not start a server.
+
+See [plan.md](plan.md) for the agreed requirements, proposed architecture, and
+implementation milestones. The enable/start workflow is planned, not implemented.
+
+The current prototype is written in Go and combines:
 
 - `go-mysql-server` for SQL analysis, planning, and execution;
 - DoltHub's Vitess fork for MySQL syntax and the wire protocol;
@@ -15,7 +26,8 @@ accepts DDL and DML, the client speaks the MySQL protocol, and the common module
 can build and read deterministic Prolly trees persisted beneath `.repodb/`.
 
 SQL tables currently use the `go-mysql-server` in-memory adapter. They are **not
-yet persisted** to Prolly roots. That adapter boundary is the next milestone.
+yet persisted** to Prolly roots. The current tracked `.repodb/` layout and manual
+snapshot commands predate the dedicated-ref design in the plan.
 
 ## Layout
 
@@ -53,8 +65,8 @@ In a second terminal, either use any MySQL client or the included one:
 mysql --host=127.0.0.1 --port=3306 --user=root repodb
 ```
 
-Once persistent table adapters land, database state will be staged and
-committed explicitly:
+The prototype also exposes these commands for its tracked `.repodb/` files;
+they do not currently snapshot SQL tables:
 
 ```sh
 ./bin/repodb status
@@ -64,7 +76,7 @@ committed explicitly:
 RepoDB never commits unrelated worktree changes: snapshot commands restrict Git
 operations to `.repodb`.
 
-## On-disk model
+## Prototype on-disk model
 
 ```text
 .repodb/
@@ -78,27 +90,13 @@ boundaries make roots deterministic and keep most chunks stable when nearby
 rows change. The manifest is the small mutable pointer Git compares between
 snapshots; object files are immutable and naturally deduplicate in Git packs.
 
-This intentionally starts with tracked files instead of custom Git refs or
-unreachable Git objects. It makes normal clone, branch, diff, and garbage
-collection behavior predictable. A pack-aware object backend can be added after
-the SQL/storage semantics are stable.
+This layout will be replaced by reachable Git objects under dedicated RepoDB
+refs. See the plan for reachability, automatic transaction publication, and
+cache-rebuild requirements.
 
 ## Build sequence
 
-1. **Persistent table adapter** — implement `sql.Table`, partitions, row
-   iterators, inserters, updaters, and deleters over Prolly roots. Persist schema
-   and primary-key metadata in the manifest.
-2. **Transactions** — give each SQL session a working manifest; commit with an
-   atomic compare-and-swap of the repository head. Readers retain immutable
-   roots, providing snapshot isolation.
-3. **Secondary indexes** — use one Prolly tree per index, keyed by encoded index
-   columns plus the primary key. Update table and index roots atomically.
-4. **Git-aware operations** — expose `REPO_COMMIT`, branch, log, diff, and merge
-   as CLI commands and system tables. Merge trees by key using the common
-   ancestor, surfacing row/schema conflicts explicitly.
-5. **Production hardening** — locking, crash recovery, object GC, bounded caches,
-   authentication/TLS, compatibility suites, fuzzing, and migration tooling.
-
-The key rule is that Git commits database snapshots; SQL transactions should
-not secretly create Git commits. This keeps high-frequency database writes
-cheap while leaving history creation explicit and understandable.
+Follow the milestones and acceptance criteria in [plan.md](plan.md): prove Git
+storage/transport, implement durable snapshots, connect persistent embedded SQL
+and the server, then add enable/sync, distributed merge, and compatibility work.
+Ordinary writes will persist automatically without user-managed Git snapshots.
