@@ -23,14 +23,12 @@ The current prototype is written in Go and combines:
 
 ## Status
 
-This repository contains the first executable vertical slice. The MySQL server
-accepts DDL and DML, the client speaks the MySQL protocol, and the common module
-can build and read deterministic Prolly trees. M1 adds durable catalog snapshots
-stored entirely in Git objects under `refs/repodb/data`.
-
-SQL tables currently use the `go-mysql-server` in-memory adapter. They are **not
-yet persisted** to Prolly roots. The repository snapshot API is ready for that
-integration in M2.
+M2 provides persistent SQL through an embedded Go engine and the MySQL server.
+Schemas and typed rows are stored in deterministic Prolly trees and every
+successful write transaction automatically publishes one independent Git data
+commit under `refs/repodb/data`. See [the M2 SQL contract](docs/sql-m2.md) for
+the supported SQL scope, transaction behavior, outcome recovery, and measured
+initial workload.
 
 ## Layout
 
@@ -39,6 +37,7 @@ cmd/repodb/          CLI: initialize, inspect, snapshot, and query
 cmd/repodb-server/   MySQL-compatible server process
 client/              reusable MySQL wire client
 server/              go-mysql-server host and storage adapters
+engine/              embedded persistent SQL engine and table adapters
 common/prolly/       deterministic content-defined tree construction
 common/storage/      content-addressed memory and filesystem stores
 common/repository/   durable Git snapshots, manifests, and legacy import
@@ -59,7 +58,7 @@ make test
 make build
 make m0 # repeat the Git integration experiment under /tmp/repodb-m0
 ./bin/repodb init .
-./bin/repodb-server -repo .
+./bin/repodb start -repo .
 ```
 
 In a second terminal, either use any MySQL client or the included one:
@@ -77,7 +76,7 @@ Repository state now lives outside the source branch:
 ```
 
 Snapshot publication never stages files or changes the source worktree, index,
-or branch. SQL transaction publication will be connected in M2.
+or branch. SQL transactions publish this separate history automatically.
 
 ## Git snapshot model
 

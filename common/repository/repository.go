@@ -30,7 +30,31 @@ var (
 	ErrLegacyLayout   = errors.New("legacy tracked .repodb layout found")
 	ErrConflict       = errors.New("RepoDB data head changed")
 	ErrCorrupt        = errors.New("corrupt RepoDB snapshot")
+	ErrCommitUnknown  = errors.New("RepoDB commit outcome is unknown")
 )
+
+type CommitOutcome uint8
+
+const (
+	OutcomeRejected CommitOutcome = iota
+	OutcomeCommitted
+	OutcomeUnknown
+)
+
+type CommitResult struct {
+	Outcome  CommitOutcome
+	Commit   string
+	Snapshot *Snapshot
+}
+
+type CommitError struct {
+	Outcome CommitOutcome
+	Commit  string
+	Err     error
+}
+
+func (e *CommitError) Error() string { return e.Err.Error() }
+func (e *CommitError) Unwrap() error { return e.Err }
 
 type Table struct {
 	SchemaRoot storage.Hash `json:"schema_root,omitempty"`
@@ -52,13 +76,31 @@ type Repository struct {
 	CommonDir    string
 	ObjectFormat string
 	git          repodbgit.CLI
+	fault        func(PublicationPoint) error
+}
+
+type PublicationPoint string
+
+const (
+	BeforeRefPublication PublicationPoint = "before-ref-publication"
+	DuringRefPublication PublicationPoint = "during-ref-publication"
+	AfterRefPublication  PublicationPoint = "after-ref-publication"
+)
+
+// SetPublicationFaultInjector installs a deterministic fault hook for tests.
+// Passing nil disables it.
+func (r *Repository) SetPublicationFaultInjector(inject func(PublicationPoint) error) {
+	r.fault = inject
 }
 
 type Snapshot struct {
-	repo      *Repository
-	Commit    string
-	Manifest  Manifest
-	objectSet map[storage.Hash]struct{}
+	repo       *Repository
+	Commit     string
+	Manifest   Manifest
+	objectSet  map[storage.Hash]struct{}
+	objectOIDs map[storage.Hash]string
+	objectData map[storage.Hash][]byte
+	mu         sync.RWMutex
 }
 
 type Writer struct {
@@ -66,6 +108,7 @@ type Writer struct {
 	base      *Snapshot
 	expected  string
 	objects   map[storage.Hash][]byte
+	retained  map[storage.Hash]struct{}
 	committed bool
 	mu        sync.RWMutex
 }
@@ -170,6 +213,8 @@ func (r *Repository) Begin(ctx context.Context) (*Writer, error) {
 
 func (s *Snapshot) Store() storage.Store { return &snapshotStore{snapshot: s} }
 
+func (w *Writer) BaseSnapshot() *Snapshot { return w.base }
+
 func (w *Writer) Put(_ context.Context, data []byte) (storage.Hash, error) {
 	hash := storage.Sum(data)
 	w.mu.Lock()
@@ -199,30 +244,68 @@ func (w *Writer) Get(ctx context.Context, hash storage.Hash) ([]byte, error) {
 	return w.base.Store().Get(ctx, hash)
 }
 
+// RetainOnly bounds the next snapshot inventory to the supplied object graph.
+// Callers must include schema roots, data roots, and every descendant.
+func (w *Writer) RetainOnly(hashes []storage.Hash) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.committed {
+		return errors.New("snapshot writer is already committed")
+	}
+	w.retained = make(map[storage.Hash]struct{}, len(hashes))
+	for _, hash := range hashes {
+		if !hash.Valid() {
+			return fmt.Errorf("invalid retained object hash %q", hash)
+		}
+		w.retained[hash] = struct{}{}
+	}
+	return nil
+}
+
 // Commit writes a complete Git tree and commit before atomically advancing the
 // live data ref from the writer's expected head.
 func (w *Writer) Commit(ctx context.Context, manifest Manifest) (*Snapshot, error) {
+	result, err := w.CommitWithOutcome(ctx, manifest)
+	return result.Snapshot, err
+}
+
+func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (CommitResult, error) {
+	result := CommitResult{Outcome: OutcomeRejected}
 	w.mu.Lock()
 	if w.committed {
 		w.mu.Unlock()
-		return nil, errors.New("snapshot writer is already committed")
+		return result, errors.New("snapshot writer is already committed")
 	}
 	w.committed = true
 	newObjects := cloneObjects(w.objects)
+	retained := w.retained
 	w.mu.Unlock()
 
 	all := make(map[storage.Hash][]byte)
 	if w.base != nil {
 		for _, hash := range w.base.Manifest.Objects {
+			if retained != nil {
+				if _, ok := retained[hash]; !ok {
+					continue
+				}
+			}
 			data, err := w.base.Store().Get(ctx, hash)
 			if err != nil {
-				return nil, err
+				return result, err
 			}
 			all[hash] = data
 		}
 	}
 	for hash, data := range newObjects {
+		if retained != nil {
+			if _, ok := retained[hash]; !ok {
+				continue
+			}
+		}
 		all[hash] = data
+	}
+	if retained != nil && len(all) != len(retained) {
+		return result, fmt.Errorf("retained object graph contains %d unavailable objects", len(retained)-len(all))
 	}
 	manifest.FormatVersion = FormatVersion
 	if manifest.DefaultDatabase == "" {
@@ -233,48 +316,115 @@ func (w *Writer) Commit(ctx context.Context, manifest Manifest) (*Snapshot, erro
 	}
 	manifest.Objects = sortedHashes(all)
 	if err := validateManifest(manifest, all); err != nil {
-		return nil, err
+		return result, err
 	}
 	manifestData, err := json.Marshal(manifest)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	manifestData = append(manifestData, '\n')
 
 	release, err := w.repo.lock(ctx)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	defer release()
 
 	entries := make([]repodbgit.TreeEntry, 0, len(all)+1)
 	manifestOID, err := w.repo.git.HashObject(ctx, w.repo.Root, manifestData)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	entries = append(entries, repodbgit.TreeEntry{Path: "manifest.json", ObjectID: manifestOID})
 	for _, hash := range manifest.Objects {
-		oid, err := w.repo.git.HashObject(ctx, w.repo.Root, all[hash])
-		if err != nil {
-			return nil, err
+		oid := ""
+		if w.base != nil {
+			oid = w.base.objectOIDs[hash]
+		}
+		if oid == "" {
+			oid, err = w.repo.git.HashObject(ctx, w.repo.Root, all[hash])
+			if err != nil {
+				return result, err
+			}
 		}
 		entries = append(entries, repodbgit.TreeEntry{Path: objectPath(hash), ObjectID: oid})
 	}
 	tree, err := w.repo.git.WriteTree(ctx, w.repo.Root, w.repo.CommonDir, entries)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	commit, err := w.repo.git.CommitTree(ctx, w.repo.Root, tree, w.expected, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
 	if err != nil {
-		return nil, err
+		return result, err
+	}
+	result.Commit = commit
+	if w.repo.fault != nil {
+		if err := w.repo.fault(BeforeRefPublication); err != nil {
+			return result, err
+		}
+		if err := w.repo.fault(DuringRefPublication); err != nil {
+			result.Outcome = OutcomeUnknown
+			return result, &CommitError{Outcome: OutcomeUnknown, Commit: commit, Err: fmt.Errorf("%w: candidate %s: %v", ErrCommitUnknown, commit, err)}
+		}
 	}
 	if err := w.repo.git.UpdateRef(ctx, w.repo.Root, DataRef, commit, w.expected); err != nil {
-		if errors.Is(err, repodbgit.ErrRefConflict) {
-			return nil, ErrConflict
+		result = w.repo.resolvePublication(commit, w.expected)
+		if result.Outcome == OutcomeRejected {
+			actual, resolveErr := w.repo.git.ResolveRef(context.Background(), w.repo.Root, DataRef)
+			if resolveErr == nil && actual != w.expected {
+				return result, ErrConflict
+			}
+			return result, err
 		}
-		return nil, err
+		if result.Outcome == OutcomeUnknown {
+			return result, &CommitError{Outcome: OutcomeUnknown, Commit: commit, Err: fmt.Errorf("%w: candidate %s: %v", ErrCommitUnknown, commit, err)}
+		}
 	}
-	return w.repo.loadSnapshot(ctx, commit)
+	result = CommitResult{Outcome: OutcomeCommitted, Commit: commit}
+	if w.repo.fault != nil {
+		if err := w.repo.fault(AfterRefPublication); err != nil {
+			return result, &CommitError{Outcome: OutcomeCommitted, Commit: commit, Err: err}
+		}
+	}
+	snapshot, err := w.repo.loadSnapshot(context.WithoutCancel(ctx), commit)
+	result.Snapshot = snapshot
+	if err != nil {
+		return result, &CommitError{Outcome: OutcomeCommitted, Commit: commit, Err: fmt.Errorf("published %s but verification failed: %w", commit, err)}
+	}
+	return result, nil
+}
+
+func (r *Repository) resolvePublication(candidate, expected string) CommitResult {
+	actual, err := r.git.ResolveRef(context.Background(), r.Root, DataRef)
+	if err != nil {
+		return CommitResult{Outcome: OutcomeUnknown, Commit: candidate}
+	}
+	if actual == candidate {
+		return CommitResult{Outcome: OutcomeCommitted, Commit: candidate}
+	}
+	if actual != expected {
+		return CommitResult{Outcome: OutcomeRejected, Commit: candidate}
+	}
+	return CommitResult{Outcome: OutcomeRejected, Commit: candidate}
+}
+
+// RecoverCommit resolves a candidate returned with an uncertain outcome.
+func (r *Repository) RecoverCommit(ctx context.Context, candidate string) (CommitResult, error) {
+	actual, err := r.git.ResolveRef(ctx, r.Root, DataRef)
+	if err != nil {
+		return CommitResult{Outcome: OutcomeUnknown, Commit: candidate}, err
+	}
+	if actual != candidate {
+		published, ancestorErr := r.git.IsAncestor(ctx, r.Root, candidate, actual)
+		if ancestorErr != nil {
+			return CommitResult{Outcome: OutcomeUnknown, Commit: candidate}, ancestorErr
+		}
+		if !published {
+			return CommitResult{Outcome: OutcomeRejected, Commit: candidate}, nil
+		}
+	}
+	snapshot, err := r.loadSnapshot(ctx, candidate)
+	return CommitResult{Outcome: OutcomeCommitted, Commit: candidate, Snapshot: snapshot}, err
 }
 
 func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot, error) {
@@ -304,11 +454,11 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 		}
 		objectSet[hash] = struct{}{}
 	}
-	snapshot := &Snapshot{repo: r, Commit: commit, Manifest: manifest, objectSet: objectSet}
+	snapshot := &Snapshot{repo: r, Commit: commit, Manifest: manifest, objectSet: objectSet, objectOIDs: make(map[storage.Hash]string), objectData: make(map[storage.Hash][]byte)}
 	if err := validateManifestInventory(manifest, objectSet); err != nil {
 		return nil, err
 	}
-	paths, err := r.git.ListTree(ctx, r.Root, commit)
+	objects, err := r.git.ListTreeObjects(ctx, r.Root, commit)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
@@ -317,19 +467,35 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 	for hash := range objectSet {
 		expectedPaths[objectPath(hash)] = struct{}{}
 	}
-	for _, path := range paths {
+	for path, oid := range objects {
 		if _, ok := expectedPaths[path]; !ok {
 			return nil, fmt.Errorf("%w: unlisted tree entry %s", ErrCorrupt, path)
+		}
+		if strings.HasPrefix(path, "objects/sha256/") {
+			hash := storage.Hash(strings.ReplaceAll(strings.TrimPrefix(path, "objects/sha256/"), "/", ""))
+			if hash.Valid() {
+				snapshot.objectOIDs[hash] = oid
+			}
 		}
 		delete(expectedPaths, path)
 	}
 	if len(expectedPaths) != 0 {
 		return nil, fmt.Errorf("%w: snapshot is missing %d listed tree entries", ErrCorrupt, len(expectedPaths))
 	}
+	oids := make([]string, 0, len(snapshot.objectOIDs))
+	for _, oid := range snapshot.objectOIDs {
+		oids = append(oids, oid)
+	}
+	objectData, err := r.git.ReadObjects(ctx, r.Root, oids)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
 	for hash := range objectSet {
-		if _, err := snapshot.Store().Get(ctx, hash); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		data, ok := objectData[snapshot.objectOIDs[hash]]
+		if !ok || storage.Sum(data) != hash {
+			return nil, fmt.Errorf("%w: object %s failed integrity check", ErrCorrupt, hash)
 		}
+		snapshot.objectData[hash] = data
 	}
 	return snapshot, nil
 }
@@ -343,6 +509,12 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 	if _, ok := s.snapshot.objectSet[hash]; !ok {
 		return nil, storage.ErrNotFound
 	}
+	s.snapshot.mu.RLock()
+	cached, ok := s.snapshot.objectData[hash]
+	s.snapshot.mu.RUnlock()
+	if ok {
+		return append([]byte(nil), cached...), nil
+	}
 	data, err := s.snapshot.repo.git.ReadTreeFile(ctx, s.snapshot.repo.Root, s.snapshot.Commit, objectPath(hash))
 	if err != nil {
 		return nil, err
@@ -350,6 +522,9 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 	if storage.Sum(data) != hash {
 		return nil, fmt.Errorf("object %s failed integrity check", hash)
 	}
+	s.snapshot.mu.Lock()
+	s.snapshot.objectData[hash] = append([]byte(nil), data...)
+	s.snapshot.mu.Unlock()
 	return data, nil
 }
 

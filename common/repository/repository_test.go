@@ -1,6 +1,7 @@
 package repository_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,11 +12,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
+	"golang.org/x/sys/unix"
 )
 
 func TestSnapshotRoundTripTransferAndCleanSourceState(t *testing.T) {
@@ -206,6 +209,267 @@ func TestConcurrentWritersPublishExactlyOneSnapshot(t *testing.T) {
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("successes = %d, conflicts = %d", successes, conflicts)
 	}
+}
+
+func TestPublicationOutcomeAndRecovery(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name    string
+		point   repository.PublicationPoint
+		outcome repository.CommitOutcome
+		liveNew bool
+	}{
+		{"before", repository.BeforeRefPublication, repository.OutcomeRejected, false},
+		{"during", repository.DuringRefPublication, repository.OutcomeUnknown, false},
+		{"after", repository.AfterRefPublication, repository.OutcomeCommitted, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := initRepository(t)
+			repo, err := repository.Init(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old, _ := repo.Current(ctx)
+			writer, _ := repo.Begin(ctx)
+			rootHash, _ := writer.Put(ctx, []byte("candidate"))
+			repo.SetPublicationFaultInjector(func(point repository.PublicationPoint) error {
+				if point == test.point {
+					return errors.New("injected failure")
+				}
+				return nil
+			})
+			result, err := writer.CommitWithOutcome(ctx, repository.Manifest{Tables: map[string]repository.Table{"t": {DataRoot: rootHash}}})
+			if err == nil || result.Outcome != test.outcome {
+				t.Fatalf("result = %#v, error = %v", result, err)
+			}
+			repo.SetPublicationFaultInjector(nil)
+			current, err := repo.Current(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (current.Commit == result.Commit) != test.liveNew {
+				t.Fatalf("candidate live = %v, want %v", current.Commit == result.Commit, test.liveNew)
+			}
+			if !test.liveNew && current.Commit != old.Commit {
+				t.Fatal("failed publication changed live state")
+			}
+			if result.Commit != "" {
+				if test.liveNew {
+					successor, _ := repo.Begin(ctx)
+					nextHash, _ := successor.Put(ctx, []byte("successor"))
+					if _, err := successor.Commit(ctx, repository.Manifest{Tables: map[string]repository.Table{"t": {DataRoot: nextHash}}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				recovered, err := repo.RecoverCommit(ctx, result.Commit)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := repository.OutcomeRejected
+				if test.liveNew {
+					want = repository.OutcomeCommitted
+				}
+				if recovered.Outcome != want {
+					t.Fatalf("recovery outcome = %v, want %v", recovered.Outcome, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLockCancellationIsDefiniteRejection(t *testing.T) {
+	ctx := context.Background()
+	root := initRepository(t)
+	repo, err := repository.Init(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, _ := repo.Current(ctx)
+	lockPath := filepath.Join(repo.CommonDir, "repodb", "locks", "publish.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	writer, _ := repo.Begin(ctx)
+	hash, _ := writer.Put(ctx, []byte("blocked"))
+	canceled, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	result, err := writer.CommitWithOutcome(canceled, repository.Manifest{Tables: map[string]repository.Table{"t": {DataRoot: hash}}})
+	if !errors.Is(err, context.DeadlineExceeded) || result.Outcome != repository.OutcomeRejected {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	current, _ := repo.Current(ctx)
+	if current.Commit != old.Commit {
+		t.Fatal("canceled lock wait changed live state")
+	}
+}
+
+func TestSeparateProcessWritersAcrossLinkedWorktrees(t *testing.T) {
+	if os.Getenv("REPODB_WRITER_HELPER") != "" {
+		t.Skip("parent only")
+	}
+	root := initRepository(t)
+	if _, err := repository.Init(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	git(t, root, "worktree", "add", "-b", "writer-linked", linked)
+	barrier := t.TempDir()
+	commands := make([]*exec.Cmd, 2)
+	outputs := make([]bytes.Buffer, 2)
+	for i, dir := range []string{root, linked} {
+		commands[i] = exec.Command(os.Args[0], "-test.run=^TestPublicationProcessHelper$")
+		commands[i].Env = append(os.Environ(), "REPODB_WRITER_HELPER=1", "REPODB_WRITER_ROOT="+dir, fmt.Sprintf("REPODB_WRITER_ID=%d", i), "REPODB_WRITER_BARRIER="+barrier)
+		commands[i].Stdout, commands[i].Stderr = &outputs[i], &outputs[i]
+		if err := commands[i].Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for i := range commands {
+		for {
+			if _, err := os.Stat(filepath.Join(barrier, fmt.Sprintf("ready-%d", i))); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("writer %d did not become ready: %s", i, outputs[i].String())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(barrier, "go"), []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	successes, conflicts := 0, 0
+	for i, cmd := range commands {
+		err := cmd.Wait()
+		if err == nil {
+			successes++
+			continue
+		}
+		if strings.Contains(outputs[i].String(), repository.ErrConflict.Error()) {
+			conflicts++
+			continue
+		}
+		t.Fatalf("writer %d failed unexpectedly: %v\n%s", i, err, outputs[i].String())
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+	}
+}
+
+func TestPublicationProcessHelper(t *testing.T) {
+	if os.Getenv("REPODB_WRITER_HELPER") == "" {
+		t.Skip("helper process")
+	}
+	ctx := context.Background()
+	repo, err := repository.Open(ctx, os.Getenv("REPODB_WRITER_ROOT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := repo.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootHash, err := writer.Put(ctx, []byte("writer-"+os.Getenv("REPODB_WRITER_ID")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := os.Getenv("REPODB_WRITER_BARRIER")
+	if err := os.WriteFile(filepath.Join(barrier, "ready-"+os.Getenv("REPODB_WRITER_ID")), []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(barrier, "go")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("barrier timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, err = writer.Commit(ctx, repository.Manifest{Tables: map[string]repository.Table{"t": {DataRoot: rootHash}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKilledWriterLeavesOldSnapshotAndReleasesLock(t *testing.T) {
+	if os.Getenv("REPODB_WRITER_HELPER") != "" {
+		t.Skip("parent only")
+	}
+	root := initRepository(t)
+	repo, err := repository.Init(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, _ := repo.Current(context.Background())
+	ready := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestKilledWriterHelper$")
+	cmd.Env = append(os.Environ(), "REPODB_KILL_HELPER=1", "REPODB_WRITER_ROOT="+root, "REPODB_KILL_READY="+ready)
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatalf("helper timeout: %s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	current, err := repo.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Commit != old.Commit {
+		t.Fatal("terminated pre-publication writer changed live state")
+	}
+	writer, err := repo.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := writer.Put(context.Background(), []byte("recovered"))
+	if _, err := writer.Commit(context.Background(), repository.Manifest{Tables: map[string]repository.Table{"t": {DataRoot: hash}}}); err != nil {
+		t.Fatalf("write after terminated lock holder: %v", err)
+	}
+}
+
+func TestKilledWriterHelper(t *testing.T) {
+	if os.Getenv("REPODB_KILL_HELPER") == "" {
+		t.Skip("helper process")
+	}
+	repo, err := repository.Open(context.Background(), os.Getenv("REPODB_WRITER_ROOT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, _ := repo.Begin(context.Background())
+	hash, _ := writer.Put(context.Background(), []byte("never published"))
+	repo.SetPublicationFaultInjector(func(point repository.PublicationPoint) error {
+		if point == repository.BeforeRefPublication {
+			if err := os.WriteFile(os.Getenv("REPODB_KILL_READY"), []byte("ready"), 0o600); err != nil {
+				return err
+			}
+			select {}
+		}
+		return nil
+	})
+	_, _ = writer.Commit(context.Background(), repository.Manifest{Tables: map[string]repository.Table{"t": {DataRoot: hash}}})
 }
 
 func TestLinkedWorktreeSharesRepositoryIdentity(t *testing.T) {

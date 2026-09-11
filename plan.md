@@ -1,12 +1,14 @@
 # RepoDB implementation plan
 
-Status: agreed product direction, proposed implementation sequence. Updated
-2026-09-11. Milestones below are pending unless explicitly stated otherwise.
+Status: M0, M1, and M2 complete; M3 is next. Updated 2026-09-12 after implementation
+review and a passing `make test` run. Later milestones remain pending.
 
 ## Product goal
 
 RepoDB is shared database infrastructure for tools whose state belongs to an
-existing Git repository. Git-native tooling like issue trackers, kanban boards, and agent trace tools could be significantly imporoved by using SQL instead of each implementing object storage, history, transport, and reconciliation themselves.
+existing Git repository. Issue trackers, kanban boards, and agent trace tools
+can use SQL instead of each implementing object storage, history, transport,
+and reconciliation themselves.
 
 Code and database share a repository and remote, with independent histories.
 
@@ -36,16 +38,26 @@ Proposed user-facing workflow (these commands are not implemented yet):
 git clone <project-url>
 cd <project>
 
-# Fetch database refs, setup transports, hooks, ...
+# Fetch database refs and configure future fetches; no hooks or service required
 repodb enable
 
-# An embedded application can now open the repository database.
+# Optional: start the MySQL server; embedded applications open the engine directly
 repodb start
+
+# Explicitly synchronize database changes with the selected remote
+repodb sync
 ```
 
 Transparency means persistence and Git storage are handled by RepoDB. Genuine
 concurrent editing conflicts still need an application policy or user resolution.
 Local SQL success does not imply that an offline or failing remote has received it.
+
+M0 established an explicit transport contract: enable adds a fetch refspec into
+`refs/repodb/remotes/<remote>/data`, preserves existing configuration, and installs
+neither push refspecs nor hooks. Ordinary `git push` does not publish database
+changes; `repodb sync` is the guaranteed database network operation. Engine open
+and new transaction boundaries inspect already fetched state without implicit
+network I/O. See [the accepted command matrix](docs/git-integration.md).
 
 ## What exists today
 
@@ -54,19 +66,24 @@ Local SQL success does not imply that an offline or failing remote has received 
 | `server/` | MySQL listener and `go-mysql-server` with memory tables | Extract reusable engine; replace memory catalog/storage |
 | `client/` | MySQL driver wrapper | Retain as optional network client |
 | `common/prolly/` | Deterministic bulk tree build and point lookup | Add iteration, typed SQL encoding, mutation, and diff |
-| `common/storage/` | SHA-256-addressed memory/filesystem blobs | Add Git-backed persistence with full reachability |
-| `common/repository/` | Tracked `.repodb/` files and manifest | Discover common Git directory; own database refs and format |
-| `common/git/` | Worktree discovery, stage, commit, status | Add object/ref operations and remote transport |
-| CLI | `init`, `status`, `snapshot`, network `sql`; separate server binary | Introduce enable/start/sync lifecycle and useful status |
+| `common/storage/` | SHA-256-addressed store interface and memory/filesystem implementations | Retain interface; repository snapshots and writers provide Git-backed stores |
+| `common/repository/` | Versioned Git snapshots, integrity validation, common-directory discovery, publication lock/CAS, legacy import | Clarify commit outcomes; bound snapshot cost; integrate SQL object-graph validation |
+| `common/git/` | Object/tree/commit operations, expected-head ref updates, fsync configuration | Refine publication error classification; add remote transport |
+| CLI | `init`, snapshot `status`, `import-legacy`, network `sql`; separate server binary; manual `snapshot` rejected | Introduce enable/start/sync lifecycle and transport status |
 
-Existing tests cover tree determinism/lookup, filesystem layout initialization,
-and a basic SQL round trip over MySQL. They do not establish persistent SQL,
-transaction durability, embedded access, merge correctness, or synchronization.
+Existing tests cover tree determinism/lookup, snapshot reopen and cross-clone
+reconstruction, GC/cache deletion, stale and concurrent writers, linked-worktree
+identity, Git SHA-1/SHA-256 formats, legacy import, invalid snapshots, the M0 Git
+integration experiment, and a basic in-memory SQL round trip over MySQL.
+`make test` passes. The writer concurrency test currently uses goroutines in one
+process; separate-process contention and publication fault injection remain to
+be tested. Persistent SQL, embedded access, SQL transaction semantics, merge
+correctness, and the product sync API are not implemented yet.
 
 The original tracked-directory/manual-snapshot design is superseded by this plan.
 Its reusable storage and SQL pieces are a starting point, not the target contract.
 
-## Proposed architecture
+## Architecture and remaining design work
 
 ### One engine, two entry points
 
@@ -83,7 +100,7 @@ callers to depend on internal `go-mysql-server` types. Exact signatures remain o
 ### Git representation and transaction publication
 
 Start with one versioned catalog containing application databases/namespaces and
-one local head, provisionally `refs/repodb/data`. Transactions across namespaces
+one local head, `refs/repodb/data`, as established by M0/M1. Transactions across namespaces
 can therefore publish atomically. Namespaces provide organization, not access
 control between applications with filesystem access to the same repository.
 
@@ -98,7 +115,7 @@ transport and garbage collection cannot preserve the database. Avoid depending
 on loose object files or a warm local cache. Publish through Git plumbing without
 checking out the data tree or modifying the user's index.
 
-Proposed first durability model: each successful write transaction creates one
+Accepted baseline for M2: each successful write transaction creates one
 internal data commit and atomically advances the data ref using its expected old
 value. Autocommit statements follow the same path. Explicit rollback publishes
 nothing. Unchanged transactions need not create new commits. This deliberately
@@ -112,6 +129,20 @@ atomic ref replacement alone is not a complete power-loss durability guarantee.
 Benchmark this baseline before introducing batching or a write-ahead log, which
 would change the relationship between acknowledged writes and Git-owned state.
 
+Distinguish definite rejection, successful publication, and an unknown commit
+outcome. M1 currently performs a fallible verification read after advancing the
+ref, so an error can be returned after publication succeeded. Cancellation or
+process failure during ref publication can also leave the caller uncertain.
+Define outcome reporting and recovery before exposing SQL commit semantics;
+an arbitrary commit error must not imply rollback or authorize automatic replay.
+
+M1 retains every base-snapshot object and rereads the inventory during publication
+and validation, with individual Git processes for object access. This is a proof
+baseline, not the intended scaling behavior. M2 must define and measure a bounded
+initial workload. Build inventories from objects reachable from current catalog
+roots when SQL graph traversal exists; historical commits retain older snapshots.
+Reuse existing Git object IDs and batch object access as measurements warrant.
+
 ### Local concurrency and remote concurrency
 
 Discover the common Git directory, including linked worktrees, instead of assuming
@@ -122,7 +153,7 @@ a defined retryable conflict or pass explicit validation, never overwrite a newe
 head. Do not transparently replay arbitrary application transactions.
 
 Independent clones do not share locks. Fetch remote heads into a separate tracking
-namespace (provisionally `refs/repodb/remotes/<remote>/data`) rather than replacing
+namespace (`refs/repodb/remotes/<remote>/data`, established by M0) rather than replacing
 the writable local head. Reconciliation uses a common ancestor and produces a
 validated merge commit before publishing. Remote races require bounded retries.
 Do not force-push to resolve divergence.
@@ -189,8 +220,29 @@ expose partial state; source HEAD/index/worktree remain unchanged.
 
 ### M2 — Deliver persistent embedded SQL and the shared server
 
+**Status: complete (2026-09-12).** The persistent embedded engine, shared MySQL
+server path, transaction outcome recovery, process/fault tests, and bounded
+benchmark are implemented and documented in [docs/sql-m2.md](docs/sql-m2.md).
+The implemented SQL scope is deliberately narrow; the completed contract and
+failure checks are listed below.
+
+- Define definite failure, committed, and unknown-outcome behavior for repository
+  publication and its embedded/MySQL callers. Avoid reporting post-publication
+  verification failures as definite rollback; provide a way to inspect/recover
+  uncertain outcomes without blindly replaying application transactions.
+- Distinguish stale-head conflicts from lock contention, permission failures,
+  filesystem errors, and cancellation. Do not map every Git "cannot lock ref"
+  message to a retryable stale-writer conflict.
+- Add separate-process writer contention tests, including linked worktrees, and
+  fault injection before, during, and after ref publication. Verify complete
+  old/new state, outcome reporting, and recovery after writer termination. These
+  tests supplement the documented fsync assumptions; they do not prove power-loss
+  behavior on every filesystem.
 - Extract the engine and implement schema persistence and table adapters over
   Prolly roots, including scans and deterministic typed row/key encoding.
+- Validate schema and Prolly object graphs, including descendant availability,
+  before publication. Derive the current snapshot's object inventory from catalog
+  roots so obsolete chunks need not remain in every subsequent snapshot.
 - Start with explicit primary keys, a documented small type set, basic DDL/DML,
   queries, parameter binding, autocommit, explicit commit, and rollback. Report
   unsupported behavior clearly; SQL parser acceptance is not compatibility.
@@ -200,17 +252,23 @@ expose partial state; source HEAD/index/worktree remain unchanged.
   Expose embedded open/close/query operations without opening a network listener.
 - Use bulk rebuilds only as an explicitly bounded initial implementation. Add
   incremental updates when measurements show the cost; retain deterministic roots.
+- Measure open/begin/commit latency, memory, object count, and Git subprocess count
+  for repeated updates as well as inserts. Document the supported initial workload;
+  prioritize object-ID reuse and batched reads if they dominate that workload.
 
 **Exit:** an embedded program creates an issue table, commits rows, exits, and a
-MySQL client reads the same rows after a server restart. Rollback and failed writes
-leave no partial publication. Multiple processes cannot lose each other's writes.
+MySQL client reads the same rows after a server restart. Rollback and definitely
+rejected writes leave the live state unchanged; uncertain commit outcomes are
+reported explicitly and recoverably. No failure exposes a partial snapshot.
+Separate-process tests demonstrate stale-writer rejection without lost writes.
 
 ### M3 — Enable and transport one history safely
 
 - Implement idempotent `repodb enable` based on M0's proven integration, including
   existing-state discovery and an explicit empty-database initialization path.
 - Preserve user hooks/configuration and provide a way to remove only RepoDB-owned
-  integration. Select remotes deliberately; do not publish to every remote.
+  integration. Install no hooks or push refspecs in the initial enable flow.
+  Select remotes deliberately; do not publish to every remote.
 - Implement a reusable sync API and a diagnostic `repodb sync` command. Consumers
   and Git integration call the same implementation.
 - Support initial transfer and fast-forward synchronization. Until M4, divergent
@@ -236,7 +294,7 @@ Enabling twice neither duplicates configuration nor starts a process.
 edits surface as conflicts, survive restart, and converge after explicit resolution.
 Repeat synchronization is idempotent and preserves both histories.
 
-### M5 — Complete transparent integration and prove the tool-author experience
+### M5 — Complete the accepted integration and prove the tool-author experience
 
 - Connect M4 reconciliation to the Git integration established in M0/M3, with no
   long-running RepoDB service required just to transport refs.
@@ -245,6 +303,8 @@ Repeat synchronization is idempotent and preserves both histories.
 - Validate worktree switching, concurrent embedded/server use, read-only clones,
   missing executables, hook failures, network failures, and partial synchronization.
 - Document the enable/embedded/start workflows and supported Git command matrix.
+  Keep explicit `repodb sync` visible in examples; ordinary source pushes do not
+  publish database changes under the accepted contract.
 
 **Exit:** two users clone and enable a project, use different SQL-backed tools
 offline, then synchronize and see both users' changes. Neither tool implements
@@ -265,14 +325,20 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Start with M0's Git-only proof and an explicit ref/transport decision, then M1's
-durable snapshot API. The first useful SQL milestone is M2: an embedded application
-writes persistent data that the standalone MySQL server can subsequently read.
-Do not extend the existing in-memory SQL demo while leaving persistence unresolved.
+Proceed to M2 on the existing M0/M1 foundation. First tighten publication outcome
+reporting and error classification, with separate-process and injected-failure
+tests. Then deliver a small persistent embedded SQL engine shared by the server:
+explicit primary keys, a documented small type set, schemas and rows, scans,
+autocommit, explicit commit/rollback, and restart recovery through both entry points.
 
-The single-head catalog, one-data-commit-per-write-transaction policy, ref names,
-embedded API shape, and conservative merge policy above are proposed defaults,
-not requirements the user has already fixed. Validate them through the milestones.
+Keep full MySQL compatibility, incremental tree optimization, and distributed merge
+outside this first SQL slice. Establish workload bounds while implementing it;
+do not extend the in-memory demo while leaving persistence unresolved.
+
+The single local data head, dedicated ref layout, independent data history, and
+explicit sync contract are the accepted M0/M1 baseline. M2 applies automatic data
+commits to SQL writes. Embedded API signatures and detailed SQL semantics remain
+to be specified in M2; merge policy is developed and validated in M4.
 
 ## References
 

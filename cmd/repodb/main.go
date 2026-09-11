@@ -6,14 +6,19 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/nicbet/repodb/client"
 	"github.com/nicbet/repodb/common/repository"
+	repodbserver "github.com/nicbet/repodb/server"
 )
 
 func main() {
-	if err := run(context.Background(), os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "repodb:", err)
 		os.Exit(1)
 	}
@@ -21,7 +26,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: repodb <init|status|import-legacy|sql>")
+		return errors.New("usage: repodb <init|status|import-legacy|start|sql>")
 	}
 	switch args[0] {
 	case "init":
@@ -74,6 +79,23 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	case "sql":
 		return runSQL(ctx, args[1:])
+	case "start":
+		set := flag.NewFlagSet("start", flag.ContinueOnError)
+		address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")
+		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		if err := set.Parse(args[1:]); err != nil {
+			return err
+		}
+		repo, err := repository.Open(ctx, *repoPath)
+		if err != nil {
+			return err
+		}
+		srv, err := repodbserver.New(repodbserver.Config{Address: *address, Repository: repo})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("RepoDB listening on %s (repository %s)\n", srv.Address(), repo.Root)
+		return srv.Serve(ctx)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

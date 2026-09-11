@@ -1,4 +1,4 @@
-.PHONY: build test fmt m0
+.PHONY: build test fmt m0 m2-bench
 
 build:
 	go build -o bin/repodb ./cmd/repodb
@@ -12,3 +12,6 @@ fmt:
 
 m0:
 	go run ./experiments/gitstorage -root /tmp/repodb-m0
+
+m2-bench:
+	go run ./experiments/m2bench -root /tmp/repodb-m2

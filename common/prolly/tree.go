@@ -109,6 +109,72 @@ func Build(ctx context.Context, store storage.Store, entries []Entry, options Op
 
 func (t *Tree) Root() storage.Hash { return t.root }
 
+// Entries returns every entry in key order.
+func (t *Tree) Entries(ctx context.Context) ([]Entry, error) {
+	var entries []Entry
+	if err := walk(ctx, t.store, t.root, nil, func(n node) {
+		if n.Level == 0 {
+			entries = append(entries, cloneEntries(n.Entries)...)
+		}
+	}); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// Reachable validates the tree and returns every reachable object hash.
+func Reachable(ctx context.Context, store storage.Store, root storage.Hash) ([]storage.Hash, error) {
+	seen := make(map[storage.Hash]struct{})
+	if err := walk(ctx, store, root, seen, nil); err != nil {
+		return nil, err
+	}
+	hashes := make([]storage.Hash, 0, len(seen))
+	for hash := range seen {
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+	return hashes, nil
+}
+
+func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[storage.Hash]struct{}, visit func(node)) error {
+	if seen != nil {
+		if _, ok := seen[hash]; ok {
+			return nil
+		}
+		seen[hash] = struct{}{}
+	}
+	n, err := readNode(ctx, store, hash)
+	if err != nil {
+		return fmt.Errorf("read Prolly node %s: %w", hash, err)
+	}
+	if n.Level == 0 {
+		if len(n.Children) != 0 {
+			return fmt.Errorf("leaf Prolly node %s has children", hash)
+		}
+		for i := 1; i < len(n.Entries); i++ {
+			if bytes.Compare(n.Entries[i-1].Key, n.Entries[i].Key) >= 0 {
+				return fmt.Errorf("Prolly node %s entries are not strictly ordered", hash)
+			}
+		}
+	} else {
+		if len(n.Entries) != 0 || len(n.Children) == 0 {
+			return fmt.Errorf("invalid internal Prolly node %s", hash)
+		}
+		for i, child := range n.Children {
+			if !child.Hash.Valid() || (i > 0 && bytes.Compare(n.Children[i-1].MaxKey, child.MaxKey) >= 0) {
+				return fmt.Errorf("invalid child link in Prolly node %s", hash)
+			}
+			if err := walk(ctx, store, child.Hash, seen, visit); err != nil {
+				return err
+			}
+		}
+	}
+	if visit != nil {
+		visit(n)
+	}
+	return nil
+}
+
 func (t *Tree) Get(ctx context.Context, key []byte) ([]byte, error) {
 	hash := t.root
 	for {

@@ -1,4 +1,4 @@
-# Git snapshot format and durability (M1)
+# Git snapshot format and durability (M1/M2)
 
 Status: format version 1 baseline, implemented 2026-09-11.
 
@@ -23,9 +23,9 @@ Schema and data roots named by a table must occur in the inventory.
 
 On open, RepoDB checks the format, manifest shape, inventory ordering, exact tree
 membership, and SHA-256 content of every object. A snapshot is rejected as
-corrupt before it becomes available to a caller. SQL-specific validation of the
-object graph and schema belongs to M2 because the M1 repository layer treats
-object contents as opaque bytes.
+corrupt before it becomes available to a caller. The M2 SQL engine additionally
+validates the Prolly object graph and schema; the repository layer treats object
+contents as opaque bytes.
 
 The Git commit has the previous data head as its sole parent. Initial snapshots
 have no parent. Commits use `RepoDB <repodb@localhost>` as author and committer
@@ -65,9 +65,11 @@ Object, tree, commit, and ref writes invoke Git with:
 -c core.fsync=committed -c core.fsyncMethod=fsync
 ```
 
-RepoDB acknowledges publication only after the compare-and-swap `update-ref`
-process exits and the resulting snapshot passes integrity checks. This baseline
-was exercised with Git 2.55.0 on a local macOS filesystem. The current M1
+RepoDB reports a normal successful publication only after the compare-and-swap
+`update-ref` process exits and the resulting snapshot passes integrity checks.
+If the ref advanced but a later check fails, the commit error explicitly carries
+a committed outcome and candidate ID. This baseline was exercised with Git
+2.55.0 on a local macOS filesystem. The current
 implementation requires POSIX `flock`. Automated round trips cover both Git's
 SHA-1 and SHA-256 repository object formats; RepoDB content identities remain
 SHA-256 in either case.

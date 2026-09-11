@@ -3,16 +3,25 @@
 package git
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 )
+
+var processCount atomic.Uint64
+
+func ProcessCount() uint64 { return processCount.Load() }
+func ResetProcessCount()   { processCount.Store(0) }
 
 type CLI struct{}
 
@@ -63,6 +72,18 @@ func (CLI) ResolveRef(ctx context.Context, root, ref string) (string, error) {
 		return "", fmt.Errorf("resolve %s: %w", ref, err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+func (CLI) IsAncestor(ctx context.Context, root, ancestor, descendant string) (bool, error) {
+	_, err := run(ctx, root, nil, nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("check Git ancestry: %w", err)
 }
 
 func (CLI) HashObject(ctx context.Context, root string, data []byte) (string, error) {
@@ -133,9 +154,6 @@ func (CLI) CommitTree(ctx context.Context, root, tree, parent, message string) (
 func (CLI) UpdateRef(ctx context.Context, root, ref, newValue, oldValue string) error {
 	_, err := run(ctx, root, nil, nil, durableArgs("update-ref", ref, newValue, oldValue)...)
 	if err != nil {
-		if strings.Contains(err.Error(), "cannot lock ref") || strings.Contains(err.Error(), "reference already exists") {
-			return fmt.Errorf("%w: %s", ErrRefConflict, ref)
-		}
 		return fmt.Errorf("update %s: %w", ref, err)
 	}
 	return nil
@@ -160,11 +178,73 @@ func (CLI) ListTree(ctx context.Context, root, commit string) ([]string, error) 
 	return strings.Split(strings.TrimSuffix(out, "\x00"), "\x00"), nil
 }
 
+// ListTreeObjects returns every blob path and object ID using one Git process.
+func (CLI) ListTreeObjects(ctx context.Context, root, commit string) (map[string]string, error) {
+	out, err := run(ctx, root, nil, nil, "ls-tree", "-r", "-z", commit)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot %s: %w", commit, err)
+	}
+	objects := make(map[string]string)
+	for _, record := range strings.Split(strings.TrimSuffix(out, "\x00"), "\x00") {
+		if record == "" {
+			continue
+		}
+		header, path, ok := strings.Cut(record, "\t")
+		if !ok {
+			return nil, fmt.Errorf("invalid ls-tree record %q", record)
+		}
+		fields := strings.Fields(header)
+		if len(fields) != 3 || fields[1] != "blob" {
+			return nil, fmt.Errorf("invalid RepoDB tree entry %q", record)
+		}
+		objects[path] = fields[2]
+	}
+	return objects, nil
+}
+
+// ReadObjects reads a set of blobs through one cat-file batch process.
+func (CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (map[string][]byte, error) {
+	if len(objectIDs) == 0 {
+		return map[string][]byte{}, nil
+	}
+	input := strings.Join(objectIDs, "\n") + "\n"
+	out, err := run(ctx, root, []byte(input), nil, "cat-file", "--batch")
+	if err != nil {
+		return nil, fmt.Errorf("batch read Git objects: %w", err)
+	}
+	reader := bufio.NewReader(strings.NewReader(out))
+	objects := make(map[string][]byte, len(objectIDs))
+	for range objectIDs {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read cat-file header: %w", err)
+		}
+		fields := strings.Fields(header)
+		if len(fields) != 3 || fields[1] != "blob" {
+			return nil, fmt.Errorf("invalid cat-file header %q", strings.TrimSpace(header))
+		}
+		size, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return nil, err
+		}
+		data := make([]byte, size)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return nil, err
+		}
+		if delimiter, err := reader.ReadByte(); err != nil || delimiter != '\n' {
+			return nil, errors.New("invalid cat-file object delimiter")
+		}
+		objects[fields[0]] = data
+	}
+	return objects, nil
+}
+
 func durableArgs(args ...string) []string {
 	return append([]string{"-c", "core.fsync=committed", "-c", "core.fsyncMethod=fsync"}, args...)
 }
 
 func run(ctx context.Context, dir string, stdin []byte, env []string, args ...string) (string, error) {
+	processCount.Add(1)
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), env...)
