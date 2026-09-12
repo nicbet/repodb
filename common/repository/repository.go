@@ -114,8 +114,12 @@ type Snapshot struct {
 	Manifest   Manifest
 	objectSet  map[storage.Hash]struct{}
 	objectOIDs map[storage.Hash]string
-	objectData map[storage.Hash][]byte
-	mu         sync.RWMutex
+	cache      *snapshotObjectCache
+}
+
+type snapshotObjectCache struct {
+	mu   sync.RWMutex
+	data map[storage.Hash][]byte
 }
 
 type Writer struct {
@@ -397,6 +401,11 @@ func (w *Writer) Put(_ context.Context, data []byte) (storage.Hash, error) {
 	if w.committed {
 		return "", errors.New("snapshot writer is already committed")
 	}
+	if w.base != nil {
+		if _, exists := w.base.objectSet[hash]; exists {
+			return hash, nil
+		}
+	}
 	if _, exists := w.objects[hash]; !exists {
 		w.objects[hash] = append([]byte(nil), data...)
 	}
@@ -481,13 +490,15 @@ func (w *Writer) Commit(ctx context.Context, manifest Manifest) (*Snapshot, erro
 
 func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (CommitResult, error) {
 	result := CommitResult{Outcome: OutcomeRejected}
+	inventoryStarted := time.Now()
 	w.mu.Lock()
 	if w.committed {
 		w.mu.Unlock()
 		return result, errors.New("snapshot writer is already committed")
 	}
 	w.committed = true
-	newObjects := cloneObjects(w.objects)
+	newObjects := w.objects
+	w.objects = nil
 	newObjectOIDs := make(map[storage.Hash]string, len(w.objectOIDs))
 	for hash, oid := range w.objectOIDs {
 		newObjectOIDs[hash] = oid
@@ -495,31 +506,30 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 	retained := w.retained
 	w.mu.Unlock()
 
-	all := make(map[storage.Hash][]byte)
-	if w.base != nil {
-		for _, hash := range w.base.Manifest.Objects {
-			if retained != nil {
-				if _, ok := retained[hash]; !ok {
-					continue
-				}
-			}
-			data, err := w.base.Store().Get(ctx, hash)
-			if err != nil {
-				return result, err
-			}
-			all[hash] = data
+	available := make(map[storage.Hash]struct{})
+	if retained != nil {
+		for hash := range retained {
+			available[hash] = struct{}{}
 		}
-	}
-	for hash, data := range newObjects {
-		if retained != nil {
-			if _, ok := retained[hash]; !ok {
-				continue
+	} else {
+		if w.base != nil {
+			for _, hash := range w.base.Manifest.Objects {
+				available[hash] = struct{}{}
 			}
 		}
-		all[hash] = data
+		for hash := range newObjects {
+			available[hash] = struct{}{}
+		}
 	}
-	if retained != nil && len(all) != len(retained) {
-		return result, fmt.Errorf("retained object graph contains %d unavailable objects", len(retained)-len(all))
+	for hash := range available {
+		_, inBase := w.baseObjectOID(hash)
+		data, isNew := newObjects[hash]
+		if !inBase && !isNew {
+			return result, fmt.Errorf("retained object %s is unavailable", hash)
+		}
+		if isNew && storage.Sum(data) != hash {
+			return result, fmt.Errorf("object %q failed integrity check", hash)
+		}
 	}
 	manifest.FormatVersion = FormatVersion
 	if manifest.DefaultDatabase == "" {
@@ -528,8 +538,8 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 	if manifest.Tables == nil {
 		manifest.Tables = map[string]Table{}
 	}
-	manifest.Objects = sortedHashes(all)
-	if err := validateManifest(manifest, all); err != nil {
+	manifest.Objects = sortedHashSet(available)
+	if err := validateManifestInventory(manifest, available); err != nil {
 		return result, err
 	}
 	manifestData, err := json.Marshal(manifest)
@@ -537,14 +547,21 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 		return result, err
 	}
 	manifestData = append(manifestData, '\n')
+	publicationMetrics.inventory.Add(uint64(time.Since(inventoryStarted)))
 
+	lockStarted := time.Now()
 	release, err := w.repo.lock(ctx)
 	if err != nil {
 		return result, err
 	}
-	defer release()
+	publicationMetrics.lockWait.Add(uint64(time.Since(lockStarted)))
+	lockAcquired := time.Now()
+	defer func() {
+		release()
+		publicationMetrics.lockHold.Add(uint64(time.Since(lockAcquired)))
+	}()
 
-	entries := make([]repodbgit.TreeEntry, 0, len(all)+1)
+	entries := make([]repodbgit.TreeEntry, 0, len(available)+1)
 	missing := make([]storage.Hash, 0, len(manifest.Objects))
 	writeData := make([][]byte, 0, len(manifest.Objects)+1)
 	writeData = append(writeData, manifestData)
@@ -558,10 +575,12 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 		}
 		if oid == "" {
 			missing = append(missing, hash)
-			writeData = append(writeData, all[hash])
+			writeData = append(writeData, newObjects[hash])
 		}
 	}
+	phaseStarted := time.Now()
 	oids, err := w.repo.git.HashObjects(ctx, w.repo.Root, filepath.Join(w.repo.CommonDir, "repodb", "tmp"), writeData)
+	publicationMetrics.objectWrite.Add(uint64(time.Since(phaseStarted)))
 	if err != nil {
 		return result, err
 	}
@@ -584,7 +603,25 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 		}
 		entries = append(entries, repodbgit.TreeEntry{Path: objectPath(hash), ObjectID: oid})
 	}
-	tree, err := w.repo.git.WriteTree(ctx, w.repo.Root, w.repo.CommonDir, entries)
+	phaseStarted = time.Now()
+	tree := ""
+	if w.base != nil {
+		updates := []repodbgit.TreeEntry{entries[0]}
+		for hash := range newObjects {
+			if _, kept := available[hash]; kept {
+				updates = append(updates, repodbgit.TreeEntry{Path: objectPath(hash), ObjectID: snapshotOID(entries, hash)})
+			}
+		}
+		var deleted []string
+		for _, hash := range w.base.Manifest.Objects {
+			if _, kept := available[hash]; !kept {
+				deleted = append(deleted, objectPath(hash))
+			}
+		}
+		tree, err = w.repo.git.UpdateTree(ctx, w.repo.Root, w.repo.CommonDir, w.base.Commit, updates, deleted)
+	} else {
+		tree, err = w.repo.git.WriteTree(ctx, w.repo.Root, w.repo.CommonDir, entries)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -593,6 +630,7 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 		parents = []string{w.expected}
 	}
 	commit, err := w.repo.git.CommitTreeParents(ctx, w.repo.Root, tree, parents, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
+	publicationMetrics.treeCommit.Add(uint64(time.Since(phaseStarted)))
 	if err != nil {
 		return result, err
 	}
@@ -606,7 +644,9 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 			return result, &CommitError{Outcome: OutcomeUnknown, Commit: commit, Err: fmt.Errorf("%w: candidate %s: %v", ErrCommitUnknown, commit, err)}
 		}
 	}
+	phaseStarted = time.Now()
 	if err := w.repo.git.UpdateRef(ctx, w.repo.Root, DataRef, commit, w.expected); err != nil {
+		publicationMetrics.refUpdate.Add(uint64(time.Since(phaseStarted)))
 		result = w.repo.resolvePublication(commit, w.expected)
 		if result.Outcome == OutcomeRejected {
 			actual, resolveErr := w.repo.git.ResolveRef(context.Background(), w.repo.Root, DataRef)
@@ -619,18 +659,75 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 			return result, &CommitError{Outcome: OutcomeUnknown, Commit: commit, Err: fmt.Errorf("%w: candidate %s: %v", ErrCommitUnknown, commit, err)}
 		}
 	}
+	publicationMetrics.refUpdate.Add(uint64(time.Since(phaseStarted)))
 	result = CommitResult{Outcome: OutcomeCommitted, Commit: commit}
 	if w.repo.fault != nil {
 		if err := w.repo.fault(AfterRefPublication); err != nil {
 			return result, &CommitError{Outcome: OutcomeCommitted, Commit: commit, Err: err}
 		}
 	}
-	snapshot, err := w.repo.loadSnapshot(context.WithoutCancel(ctx), commit)
+	cache := &snapshotObjectCache{data: make(map[storage.Hash][]byte)}
+	if w.base != nil && w.base.cache != nil {
+		cache = w.base.cache
+	}
+	snapshot := &Snapshot{
+		repo: w.repo, Commit: commit, Manifest: manifest,
+		objectSet: available, objectOIDs: make(map[storage.Hash]string, len(available)),
+		cache: cache,
+	}
+	for _, entry := range entries[1:] {
+		hash := storage.Hash(strings.ReplaceAll(strings.TrimPrefix(entry.Path, "objects/sha256/"), "/", ""))
+		snapshot.objectOIDs[hash] = entry.ObjectID
+	}
+	cache.mu.Lock()
+	for hash, data := range newObjects {
+		if _, kept := available[hash]; kept {
+			cache.data[hash] = data
+		}
+	}
+	cache.mu.Unlock()
+	phaseStarted = time.Now()
+	err = w.repo.verifySnapshotTree(context.WithoutCancel(ctx), snapshot, manifestOID)
+	publicationMetrics.verification.Add(uint64(time.Since(phaseStarted)))
 	result.Snapshot = snapshot
 	if err != nil {
 		return result, &CommitError{Outcome: OutcomeCommitted, Commit: commit, Err: fmt.Errorf("published %s but verification failed: %w", commit, err)}
 	}
 	return result, nil
+}
+
+func (w *Writer) baseObjectOID(hash storage.Hash) (string, bool) {
+	if w.base == nil {
+		return "", false
+	}
+	oid, ok := w.base.objectOIDs[hash]
+	return oid, ok
+}
+
+func snapshotOID(entries []repodbgit.TreeEntry, hash storage.Hash) string {
+	path := objectPath(hash)
+	for _, entry := range entries {
+		if entry.Path == path {
+			return entry.ObjectID
+		}
+	}
+	return ""
+}
+
+func (r *Repository) verifySnapshotTree(ctx context.Context, snapshot *Snapshot, manifestOID string) error {
+	objects, err := r.git.ListTreeObjects(ctx, r.Root, snapshot.Commit)
+	if err != nil {
+		return err
+	}
+	if objects["manifest.json"] != manifestOID || len(objects) != len(snapshot.Manifest.Objects)+1 {
+		return fmt.Errorf("%w: published snapshot tree inventory differs", ErrCorrupt)
+	}
+	for hash, oid := range snapshot.objectOIDs {
+		if objects[objectPath(hash)] != oid {
+			return fmt.Errorf("%w: published object %s differs", ErrCorrupt, hash)
+		}
+	}
+	return nil
 }
 
 func (r *Repository) resolvePublication(candidate, expected string) CommitResult {
@@ -693,7 +790,7 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 		}
 		objectSet[hash] = struct{}{}
 	}
-	snapshot := &Snapshot{repo: r, Commit: commit, Manifest: manifest, objectSet: objectSet, objectOIDs: make(map[storage.Hash]string), objectData: make(map[storage.Hash][]byte)}
+	snapshot := &Snapshot{repo: r, Commit: commit, Manifest: manifest, objectSet: objectSet, objectOIDs: make(map[storage.Hash]string), cache: &snapshotObjectCache{data: make(map[storage.Hash][]byte)}}
 	if err := validateManifestInventory(manifest, objectSet); err != nil {
 		return nil, err
 	}
@@ -734,7 +831,7 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 		if !ok || storage.Sum(data) != hash {
 			return nil, fmt.Errorf("%w: object %s failed integrity check", ErrCorrupt, hash)
 		}
-		snapshot.objectData[hash] = data
+		snapshot.cache.data[hash] = data
 	}
 	return snapshot, nil
 }
@@ -748,9 +845,9 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 	if _, ok := s.snapshot.objectSet[hash]; !ok {
 		return nil, storage.ErrNotFound
 	}
-	s.snapshot.mu.RLock()
-	cached, ok := s.snapshot.objectData[hash]
-	s.snapshot.mu.RUnlock()
+	s.snapshot.cache.mu.RLock()
+	cached, ok := s.snapshot.cache.data[hash]
+	s.snapshot.cache.mu.RUnlock()
 	if ok {
 		return append([]byte(nil), cached...), nil
 	}
@@ -761,9 +858,9 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 	if storage.Sum(data) != hash {
 		return nil, fmt.Errorf("object %s failed integrity check", hash)
 	}
-	s.snapshot.mu.Lock()
-	s.snapshot.objectData[hash] = append([]byte(nil), data...)
-	s.snapshot.mu.Unlock()
+	s.snapshot.cache.mu.Lock()
+	s.snapshot.cache.data[hash] = append([]byte(nil), data...)
+	s.snapshot.cache.mu.Unlock()
 	return data, nil
 }
 
@@ -806,6 +903,15 @@ func validateManifestInventory(manifest Manifest, objects map[storage.Hash]struc
 }
 
 func sortedHashes(objects map[storage.Hash][]byte) []storage.Hash {
+	hashes := make([]storage.Hash, 0, len(objects))
+	for hash := range objects {
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+	return hashes
+}
+
+func sortedHashSet(objects map[storage.Hash]struct{}) []storage.Hash {
 	hashes := make([]storage.Hash, 0, len(objects))
 	for hash := range objects {
 		hashes = append(hashes, hash)

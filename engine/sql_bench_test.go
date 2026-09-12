@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
 )
@@ -88,6 +89,42 @@ func BenchmarkSQLWriteBatches(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+		})
+	}
+}
+
+func BenchmarkSQLExactKeyUpdate(b *testing.B) {
+	for _, rows := range []int{1_000, 10_000, 50_000} {
+		b.Run(fmt.Sprintf("rows=%d", rows), func(b *testing.B) {
+			eng := sqlBenchmarkEngine(b, rows, 32, 1)
+			defer eng.Close()
+			session, _ := eng.NewSession()
+			defer session.Close()
+			ctx := context.Background()
+			engine.ResetPerformanceCounters()
+			repository.ResetPublicationMetrics()
+			repodbgit.ResetObjectWriteCount()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := range b.N {
+				if err := session.Exec(ctx, "UPDATE bench SET value = ? WHERE id = ?", fmt.Sprintf("exact-%08d", i), rows/2); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			engineMetrics := engine.ReadPerformanceCounters()
+			publication := repository.ReadPublicationMetrics()
+			perOp := float64(b.N)
+			b.ReportMetric(float64(engineMetrics.RowsDecoded)/perOp, "rows-decoded/op")
+			b.ReportMetric(float64(engineMetrics.PointKeysVisited)/perOp, "point-keys/op")
+			b.ReportMetric(float64(engineMetrics.TreeMutationNanos)/perOp, "tree-ns/op")
+			b.ReportMetric(float64(engineMetrics.ReachabilityNanos)/perOp, "inventory-walk-ns/op")
+			b.ReportMetric(float64(publication.InventoryNanos)/perOp, "publication-inventory-ns/op")
+			b.ReportMetric(float64(publication.ObjectWriteNanos)/perOp, "object-write-ns/op")
+			b.ReportMetric(float64(publication.TreeCommitNanos)/perOp, "tree-commit-ns/op")
+			b.ReportMetric(float64(publication.RefUpdateNanos)/perOp, "ref-update-ns/op")
+			b.ReportMetric(float64(publication.VerificationNanos)/perOp, "verification-ns/op")
+			b.ReportMetric(float64(repodbgit.ObjectWriteCount())/perOp, "object-writes/op")
 		})
 	}
 }

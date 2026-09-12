@@ -115,3 +115,94 @@ func TestSortedBuilderRejectsUnorderedEntries(t *testing.T) {
 		t.Fatal("expected unordered-entry error")
 	}
 }
+
+func TestApplyMatchesCanonicalBuild(t *testing.T) {
+	ctx := context.Background()
+	for _, count := range []int{0, 1, 127, 128, 1_000, 10_000} {
+		t.Run(fmt.Sprintf("entries=%d", count), func(t *testing.T) {
+			store := storage.NewMemory()
+			entries := make([]prolly.Entry, count)
+			for i := range entries {
+				entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%08d", i*2)), Value: []byte(fmt.Sprintf("value-%08d", i))}
+			}
+			base, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			edits := []prolly.Edit{
+				{Key: []byte("key-00000001"), Value: []byte("inserted")},
+				{Key: []byte("key-00000004"), Value: []byte("updated")},
+				{Key: []byte("key-00000006"), Delete: true},
+			}
+			if count < 4 {
+				edits = edits[:1]
+			}
+			got, err := prolly.Apply(ctx, store, base, edits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			values := make(map[string][]byte, len(entries)+1)
+			for _, entry := range entries {
+				values[string(entry.Key)] = entry.Value
+			}
+			for _, edit := range edits {
+				if edit.Delete {
+					delete(values, string(edit.Key))
+				} else {
+					values[string(edit.Key)] = edit.Value
+				}
+			}
+			wantEntries := make([]prolly.Entry, 0, len(values))
+			for key, value := range values {
+				wantEntries = append(wantEntries, prolly.Entry{Key: []byte(key), Value: value})
+			}
+			want, err := prolly.Build(ctx, store, wantEntries, prolly.DefaultOptions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Root() != want.Root() {
+				t.Fatalf("roots differ: got %s want %s", got.Root(), want.Root())
+			}
+		})
+	}
+}
+
+func TestApplyDistantEditsMatchesCanonicalBuild(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := make([]prolly.Entry, 10_000)
+	for i := range entries {
+		entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%08d", i*2)), Value: []byte(fmt.Sprintf("value-%08d", i))}
+	}
+	base, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edits := []prolly.Edit{
+		{Key: []byte("key-00000002"), Value: []byte("first")},
+		{Key: []byte("key-00010000"), Delete: true},
+		{Key: []byte("key-00019998"), Value: []byte("last")},
+		{Key: []byte("key-00020001"), Value: []byte("after")},
+	}
+	got, err := prolly.Apply(ctx, store, base, edits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries[1].Value = []byte("first")
+	entries[5_000].Key = nil
+	entries[9_999].Value = []byte("last")
+	wantEntries := make([]prolly.Entry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Key != nil {
+			wantEntries = append(wantEntries, entry)
+		}
+	}
+	wantEntries = append(wantEntries, prolly.Entry{Key: []byte("key-00020001"), Value: []byte("after")})
+	want, err := prolly.Build(ctx, store, wantEntries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Root() != want.Root() {
+		t.Fatalf("roots differ: got %s want %s", got.Root(), want.Root())
+	}
+}

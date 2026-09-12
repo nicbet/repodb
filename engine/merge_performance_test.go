@@ -162,7 +162,7 @@ func TestPointLookupAndDirtyTableWorkAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	counters = engine.ReadPerformanceCounters()
-	if counters.TablesRebuilt != 1 || counters.TablesReused != 1 || counters.UndoRowsCaptured != 1 {
+	if counters.TablesRebuilt != 1 || counters.TablesReused != 1 || counters.UndoRowsCaptured != 1 || counters.RowsDecoded != 0 {
 		t.Fatalf("bounded update counters = %#v", counters)
 	}
 	if after.Manifest.Tables["stable"] != before.Manifest.Tables["stable"] {

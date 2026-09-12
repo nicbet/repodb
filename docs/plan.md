@@ -400,6 +400,15 @@ Complete the remaining matrix below before M5. Produce a bounded
 round of improvements before M5. This does not require every workload to become
 fast or authorize a general storage rewrite.
 
+The focused exact-key experiment is complete: transaction overlays and canonical
+incremental Prolly mutation eliminate unrelated row decoding, and publication
+reuses verified blobs and updates the parent Git tree. Median one-row writes were
+166 ms, 864 ms, and 968 ms at 1,000, 10,000, and 50,000 rows respectively on the
+recorded M4.2 machine. The 10,000-to-50,000 increase is no longer proportional to
+row count; Git object/tree durability dominates after chunk-boundary propagation.
+This supports continuing the architecture while retaining its current write-
+latency and small-database limits.
+
 **Evidence and limits:** M4.1 reports 160 ms and 120 MB allocated for a sparse
 50,000-row merge, versus 6.09 s and 371 MB for full local-remote sync. An up-to-date
 1,000-row sync takes 160 ms with 17 Git invocations; sparse sync uses 42 invocations

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
@@ -189,6 +190,43 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 			continue
 		}
 		performanceCounters.tablesRebuilt.Add(1)
+		if state.manifest.DataRoot.Valid() {
+			edits := make([]prolly.Edit, 0, len(state.edits))
+			for key, edit := range state.edits {
+				item := prolly.Edit{Key: []byte(key), Delete: edit.delete}
+				if !edit.delete {
+					value, err := encodeRow(state.schema.Schema, edit.row)
+					if err != nil {
+						return fmt.Errorf("encode table %s row: %w", name, err)
+					}
+					item.Value = value
+				}
+				edits = append(edits, item)
+			}
+			sort.Slice(edits, func(i, j int) bool { return bytes.Compare(edits[i].Key, edits[j].Key) < 0 })
+			baseTree, err := prolly.Open(tx.writer.BaseSnapshot().Store(), state.manifest.DataRoot)
+			if err != nil {
+				return err
+			}
+			phaseStarted := time.Now()
+			tree, err := prolly.Apply(ctx, tx.writer, baseTree, edits)
+			performanceCounters.treeMutationNanos.Add(uint64(time.Since(phaseStarted)))
+			if err != nil {
+				return err
+			}
+			phaseStarted = time.Now()
+			hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
+			performanceCounters.reachabilityNanos.Add(uint64(time.Since(phaseStarted)))
+			if err != nil {
+				return err
+			}
+			for _, hash := range hashes {
+				reachable[hash] = struct{}{}
+			}
+			reachable[state.manifest.SchemaRoot] = struct{}{}
+			manifest.Tables[name] = repository.Table{SchemaRoot: state.manifest.SchemaRoot, DataRoot: tree.Root()}
+			continue
+		}
 		schemaData, err := encodeSchema(state.schema)
 		if err != nil {
 			return err
@@ -268,7 +306,13 @@ type tableState struct {
 	rows     map[string]sql.Row
 	manifest repository.Table
 	store    storage.Store
+	edits    map[string]rowEdit
 	dirty    bool
+}
+
+type rowEdit struct {
+	row    sql.Row
+	delete bool
 }
 
 func (s *tableState) ensureRows(ctx context.Context) error {
@@ -296,7 +340,54 @@ func (s *tableState) ensureRows(ctx context.Context) error {
 		}
 		s.rows[string(entry.Key)] = row
 	}
+	for key, edit := range s.edits {
+		if edit.delete {
+			delete(s.rows, key)
+		} else {
+			s.rows[key] = cloneRow(edit.row)
+		}
+	}
 	return nil
+}
+
+func (s *tableState) lookupRow(ctx context.Context, key string) (sql.Row, bool, error) {
+	if s.rows != nil {
+		row, ok := s.rows[key]
+		return cloneRow(row), ok, nil
+	}
+	if edit, ok := s.edits[key]; ok {
+		return cloneRow(edit.row), !edit.delete, nil
+	}
+	if !s.manifest.DataRoot.Valid() {
+		return nil, false, nil
+	}
+	tree, err := prolly.Open(s.store, s.manifest.DataRoot)
+	if err != nil {
+		return nil, false, err
+	}
+	value, err := tree.Get(ctx, []byte(key))
+	if errors.Is(err, prolly.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	row, err := decodeRow(s.schema.Schema, value)
+	return row, err == nil, err
+}
+
+func (s *tableState) setEdit(key string, edit rowEdit) {
+	if s.edits == nil {
+		s.edits = make(map[string]rowEdit)
+	}
+	s.edits[key] = rowEdit{row: cloneRow(edit.row), delete: edit.delete}
+	if s.rows != nil {
+		if edit.delete {
+			delete(s.rows, key)
+		} else {
+			s.rows[key] = cloneRow(edit.row)
+		}
+	}
 }
 
 type table struct {
@@ -369,25 +460,12 @@ func (t *table) partitionRows(ctx context.Context, partition sql.Partition) (sql
 		performanceCounters.pointKeysVisited.Add(uint64(len(point.keys)))
 		rows := make([]sql.Row, 0, len(point.keys))
 		for _, key := range point.keys {
-			if t.state.rows == nil && !t.state.dirty {
-				tree, err := prolly.Open(t.state.store, t.state.manifest.DataRoot)
-				if err != nil {
-					return nil, err
-				}
-				value, err := tree.Get(ctx, []byte(key))
-				if errors.Is(err, prolly.ErrNotFound) {
-					continue
-				}
-				if err != nil {
-					return nil, err
-				}
-				row, err := decodeRow(t.state.schema.Schema, value)
-				if err != nil {
-					return nil, err
-				}
+			row, exists, err := t.state.lookupRow(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
 				rows = append(rows, row)
-			} else if row, exists := t.state.rows[key]; exists {
-				rows = append(rows, cloneRow(row))
 			}
 		}
 		return sql.RowsToRowIter(rows...), nil
@@ -478,8 +556,10 @@ type editor struct {
 }
 
 type beforeRow struct {
-	row     sql.Row
-	present bool
+	row         sql.Row
+	present     bool
+	edit        rowEdit
+	editPresent bool
 }
 
 func (e *editor) StatementBegin(*sql.Context) { e.before = make(map[string]beforeRow) }
@@ -489,6 +569,14 @@ func (e *editor) StatementComplete(*sql.Context) error {
 }
 func (e *editor) DiscardChanges(*sql.Context, error) error {
 	for key, before := range e.before {
+		if before.editPresent {
+			e.table.state.edits[key] = before.edit
+		} else {
+			delete(e.table.state.edits, key)
+		}
+		if e.table.state.rows == nil {
+			continue
+		}
 		if before.present {
 			e.table.state.rows[key] = before.row
 		} else {
@@ -500,45 +588,44 @@ func (e *editor) DiscardChanges(*sql.Context, error) error {
 }
 func (e *editor) Close(*sql.Context) error { return nil }
 func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
-	if err := e.table.state.ensureRows(ctx); err != nil {
-		return err
-	}
 	key, err := encodeKey(e.table.state.schema, row)
 	if err != nil {
 		return err
 	}
-	if existing, ok := e.table.state.rows[string(key)]; ok {
+	existing, ok, err := e.table.state.lookupRow(ctx, string(key))
+	if err != nil {
+		return err
+	}
+	if ok {
 		return sql.NewUniqueKeyErr(base64.RawStdEncoding.EncodeToString(key), true, existing)
 	}
-	e.remember(string(key))
-	e.table.state.rows[string(key)] = cloneRow(row)
+	e.remember(string(key), nil, false)
+	e.table.state.setEdit(string(key), rowEdit{row: row})
 	tx, _ := transactionFrom(ctx)
 	tx.dirty = true
 	e.table.state.dirty = true
 	return nil
 }
 func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
-	if err := e.table.state.ensureRows(ctx); err != nil {
-		return err
-	}
 	key, err := encodeKey(e.table.state.schema, row)
 	if err != nil {
 		return err
 	}
-	if _, ok := e.table.state.rows[string(key)]; !ok {
+	existing, ok, err := e.table.state.lookupRow(ctx, string(key))
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return sql.ErrDeleteRowNotFound.New()
 	}
-	e.remember(string(key))
-	delete(e.table.state.rows, string(key))
+	e.remember(string(key), existing, true)
+	e.table.state.setEdit(string(key), rowEdit{delete: true})
 	tx, _ := transactionFrom(ctx)
 	tx.dirty = true
 	e.table.state.dirty = true
 	return nil
 }
 func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
-	if err := e.table.state.ensureRows(ctx); err != nil {
-		return err
-	}
 	oldKey, err := encodeKey(e.table.state.schema, oldRow)
 	if err != nil {
 		return err
@@ -550,30 +637,41 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 	if bytes.Equal(oldKey, newKey) && reflect.DeepEqual(oldRow, newRow) {
 		return nil
 	}
-	e.remember(string(oldKey))
-	if !bytes.Equal(oldKey, newKey) {
-		if existing, ok := e.table.state.rows[string(newKey)]; ok {
-			return sql.NewUniqueKeyErr(base64.RawStdEncoding.EncodeToString(newKey), true, existing)
-		}
-		e.remember(string(newKey))
-		delete(e.table.state.rows, string(oldKey))
+	existing, ok, err := e.table.state.lookupRow(ctx, string(oldKey))
+	if err != nil {
+		return err
 	}
-	e.table.state.rows[string(newKey)] = cloneRow(newRow)
+	if !ok {
+		return sql.ErrDeleteRowNotFound.New()
+	}
+	e.remember(string(oldKey), existing, true)
+	if !bytes.Equal(oldKey, newKey) {
+		newExisting, ok, err := e.table.state.lookupRow(ctx, string(newKey))
+		if err != nil {
+			return err
+		}
+		if ok {
+			return sql.NewUniqueKeyErr(base64.RawStdEncoding.EncodeToString(newKey), true, newExisting)
+		}
+		e.remember(string(newKey), nil, false)
+		e.table.state.setEdit(string(oldKey), rowEdit{delete: true})
+	}
+	e.table.state.setEdit(string(newKey), rowEdit{row: newRow})
 	tx, _ := transactionFrom(ctx)
 	tx.dirty = true
 	e.table.state.dirty = true
 	return nil
 }
 
-func (e *editor) remember(key string) {
+func (e *editor) remember(key string, row sql.Row, present bool) {
 	if e.before == nil {
 		return
 	}
 	if _, ok := e.before[key]; ok {
 		return
 	}
-	row, present := e.table.state.rows[key]
-	e.before[key] = beforeRow{row: cloneRow(row), present: present}
+	edit, editPresent := e.table.state.edits[key]
+	e.before[key] = beforeRow{row: cloneRow(row), present: present, edit: edit, editPresent: editPresent}
 	performanceCounters.undoRowsCaptured.Add(1)
 }
 

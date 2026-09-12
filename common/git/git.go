@@ -226,6 +226,16 @@ func (CLI) HashObjects(ctx context.Context, root, tempRoot string, objects [][]b
 }
 
 func (CLI) WriteTree(ctx context.Context, root, commonDir string, entries []TreeEntry) (string, error) {
+	return writeTree(ctx, root, commonDir, "", entries, nil)
+}
+
+// UpdateTree creates a tree by applying path updates and deletions to an
+// immutable base commit through a temporary index.
+func (CLI) UpdateTree(ctx context.Context, root, commonDir, baseCommit string, updates []TreeEntry, deletes []string) (string, error) {
+	return writeTree(ctx, root, commonDir, baseCommit, updates, deletes)
+}
+
+func writeTree(ctx context.Context, root, commonDir, baseCommit string, entries []TreeEntry, deletes []string) (string, error) {
 	tmpDir := filepath.Join(commonDir, "repodb", "tmp")
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return "", err
@@ -243,16 +253,30 @@ func (CLI) WriteTree(ctx context.Context, root, commonDir string, entries []Tree
 	}
 	defer os.Remove(indexPath)
 	env := []string{"GIT_INDEX_FILE=" + indexPath}
-	if _, err := run(ctx, root, nil, env, "read-tree", "--empty"); err != nil {
+	readArgs := []string{"read-tree", "--empty"}
+	if baseCommit != "" {
+		readArgs = []string{"read-tree", baseCommit + "^{tree}"}
+	}
+	if _, err := run(ctx, root, nil, env, readArgs...); err != nil {
 		return "", fmt.Errorf("initialize temporary Git tree: %w", err)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	var input strings.Builder
+	oidLength := 40
+	if len(entries) != 0 && len(entries[0].ObjectID) != 0 {
+		oidLength = len(entries[0].ObjectID)
+	}
 	for _, entry := range entries {
 		if entry.Path == "" || strings.HasPrefix(entry.Path, "/") || strings.Contains(entry.Path, "..") || strings.ContainsRune(entry.Path, '\x00') {
 			return "", fmt.Errorf("invalid Git tree path %q", entry.Path)
 		}
 		fmt.Fprintf(&input, "100644 %s\t%s\n", entry.ObjectID, entry.Path)
+	}
+	for _, path := range deletes {
+		if path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "..") || strings.ContainsRune(path, '\x00') {
+			return "", fmt.Errorf("invalid Git tree path %q", path)
+		}
+		fmt.Fprintf(&input, "0 %s\t%s\n", strings.Repeat("0", oidLength), path)
 	}
 	if _, err := run(ctx, root, []byte(input.String()), env, "update-index", "--index-info"); err != nil {
 		return "", fmt.Errorf("populate temporary Git tree: %w", err)

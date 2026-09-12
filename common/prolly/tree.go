@@ -22,6 +22,14 @@ type Entry struct {
 	Value []byte `json:"value"`
 }
 
+// Edit replaces or deletes one key. Apply requires edits in strictly increasing
+// key order. A non-delete edit inserts the key when it is absent.
+type Edit struct {
+	Key    []byte
+	Value  []byte
+	Delete bool
+}
+
 type link struct {
 	MaxKey []byte       `json:"max_key"`
 	Hash   storage.Hash `json:"hash"`
@@ -125,6 +133,171 @@ func Build(ctx context.Context, store storage.Store, entries []Entry, options Op
 		return &Tree{store: store, root: links[0].Hash, options: options}, nil
 	}
 
+	level := uint8(1)
+	for len(links) > 1 {
+		groups := chunkLinks(links, options)
+		next := make([]link, 0, len(groups))
+		for _, group := range groups {
+			hash, err := writeNode(ctx, store, node{Level: level, Children: group})
+			if err != nil {
+				return nil, err
+			}
+			next = append(next, link{MaxKey: clone(group[len(group)-1].MaxKey), Hash: hash})
+		}
+		links = next
+		level++
+	}
+	return &Tree{store: store, root: links[0].Hash, options: options}, nil
+}
+
+// Apply incrementally applies sorted edits while preserving Build's canonical
+// chunking. It reuses untouched leaf blobs before and after the affected range,
+// and rebuilds internal nodes from leaf links without decoding unrelated rows.
+func Apply(ctx context.Context, store storage.Store, tree *Tree, edits []Edit) (*Tree, error) {
+	if store == nil || tree == nil {
+		return nil, errors.New("store and tree are required")
+	}
+	if len(edits) == 0 {
+		return &Tree{store: store, root: tree.root, options: tree.options}, nil
+	}
+	for i, edit := range edits {
+		if len(edit.Key) == 0 {
+			return nil, errors.New("edit key is required")
+		}
+		if i > 0 && bytes.Compare(edits[i-1].Key, edit.Key) >= 0 {
+			return nil, errors.New("edits are not strictly ordered")
+		}
+	}
+	leaves, err := leafLinks(ctx, tree.store, tree.root)
+	if err != nil {
+		return nil, err
+	}
+	start := sort.Search(len(leaves), func(i int) bool { return bytes.Compare(leaves[i].MaxKey, edits[0].Key) >= 0 })
+	if start == len(leaves) {
+		start = len(leaves) - 1
+	}
+	result := append([]link(nil), leaves[:start]...)
+	chunker := &leafChunker{ctx: ctx, store: store, options: tree.options, links: &result}
+	editIndex := 0
+	for leafIndex := start; leafIndex < len(leaves); leafIndex++ {
+		n, err := readNode(ctx, tree.store, leaves[leafIndex].Hash)
+		if err != nil {
+			return nil, err
+		}
+		if n.Level != 0 {
+			return nil, errors.New("invalid leaf link")
+		}
+		for _, entry := range n.Entries {
+			for editIndex < len(edits) && bytes.Compare(edits[editIndex].Key, entry.Key) < 0 {
+				if !edits[editIndex].Delete {
+					if err := chunker.add(Entry{Key: edits[editIndex].Key, Value: edits[editIndex].Value}); err != nil {
+						return nil, err
+					}
+				}
+				editIndex++
+			}
+			if editIndex < len(edits) && bytes.Equal(edits[editIndex].Key, entry.Key) {
+				if !edits[editIndex].Delete {
+					if err := chunker.add(Entry{Key: edits[editIndex].Key, Value: edits[editIndex].Value}); err != nil {
+						return nil, err
+					}
+				}
+				editIndex++
+			} else if err := chunker.add(entry); err != nil {
+				return nil, err
+			}
+		}
+		if editIndex == len(edits) && len(chunker.entries) == 0 {
+			result = append(result, leaves[leafIndex+1:]...)
+			return buildFromLeafLinks(ctx, store, result, tree.options)
+		}
+	}
+	for editIndex < len(edits) {
+		if !edits[editIndex].Delete {
+			if err := chunker.add(Entry{Key: edits[editIndex].Key, Value: edits[editIndex].Value}); err != nil {
+				return nil, err
+			}
+		}
+		editIndex++
+	}
+	if err := chunker.flush(); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		hash, err := writeNode(ctx, store, node{Level: 0, Entries: []Entry{}})
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, link{Hash: hash})
+	}
+	return buildFromLeafLinks(ctx, store, result, tree.options)
+}
+
+type leafChunker struct {
+	ctx     context.Context
+	store   storage.Store
+	options Options
+	entries []Entry
+	rolling uint64
+	links   *[]link
+}
+
+func (c *leafChunker) add(entry Entry) error {
+	item := Entry{Key: clone(entry.Key), Value: clone(entry.Value)}
+	c.entries = append(c.entries, item)
+	c.rolling = bits.RotateLeft64(c.rolling, 1) ^ entryFingerprint(item)
+	if shouldCut(len(c.entries), c.rolling, c.options) {
+		return c.flush()
+	}
+	return nil
+}
+
+func (c *leafChunker) flush() error {
+	if len(c.entries) == 0 {
+		return nil
+	}
+	group := c.entries
+	c.entries = nil
+	c.rolling = 0
+	hash, err := writeNode(c.ctx, c.store, node{Level: 0, Entries: group})
+	if err != nil {
+		return err
+	}
+	*c.links = append(*c.links, link{MaxKey: clone(group[len(group)-1].Key), Hash: hash})
+	return nil
+}
+
+func leafLinks(ctx context.Context, store storage.Store, root storage.Hash) ([]link, error) {
+	n, err := readNode(ctx, store, root)
+	if err != nil {
+		return nil, err
+	}
+	if n.Level == 0 {
+		var max []byte
+		if len(n.Entries) != 0 {
+			max = clone(n.Entries[len(n.Entries)-1].Key)
+		}
+		return []link{{MaxKey: max, Hash: root}}, nil
+	}
+	if n.Level == 1 {
+		return append([]link(nil), n.Children...), nil
+	}
+	var leaves []link
+	for _, child := range n.Children {
+		items, err := leafLinks(ctx, store, child.Hash)
+		if err != nil {
+			return nil, err
+		}
+		leaves = append(leaves, items...)
+	}
+	return leaves, nil
+}
+
+func buildFromLeafLinks(ctx context.Context, store storage.Store, leaves []link, options Options) (*Tree, error) {
+	if len(leaves) == 1 {
+		return &Tree{store: store, root: leaves[0].Hash, options: options}, nil
+	}
+	links := leaves
 	level := uint8(1)
 	for len(links) > 1 {
 		groups := chunkLinks(links, options)
