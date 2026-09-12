@@ -3,6 +3,8 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 
@@ -10,6 +12,11 @@ import (
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
 )
+
+type durabilitySample struct {
+	metrics    repodbgit.DurabilityMetrics
+	blobInputs uint64
+}
 
 func BenchmarkSQLTransactionBeginRollback(b *testing.B) {
 	for _, rows := range []int{1_000, 10_000, 50_000} {
@@ -129,7 +136,203 @@ func BenchmarkSQLExactKeyUpdate(b *testing.B) {
 	}
 }
 
+func BenchmarkGitDurabilityStrategies(b *testing.B) {
+	type mutation struct {
+		name string
+		run  func(context.Context, *engine.Session, int) (int64, *string, error)
+	}
+	update := func(key int64, value func(int) string) func(context.Context, *engine.Session, int) (int64, *string, error) {
+		return func(ctx context.Context, session *engine.Session, iteration int) (int64, *string, error) {
+			expected := value(iteration)
+			return key, &expected, session.Exec(ctx, "UPDATE bench SET value = ? WHERE id = ?", expected, key)
+		}
+	}
+	mutations := []mutation{
+		{"update-first-short", update(1, func(i int) string { return fmt.Sprintf("a%d", i) })},
+		{"update-quarter-same", update(12_500, func(i int) string { return fmt.Sprintf("%032d", i) })},
+		{"update-middle-long", update(25_000, func(i int) string { return strings.Repeat("m", 4_096) + fmt.Sprint(i) })},
+		{"update-three-quarter-same", update(37_500, func(i int) string { return fmt.Sprintf("q%031d", i) })},
+		{"update-last-short", update(50_000, func(i int) string { return fmt.Sprintf("z%d", i) })},
+		{"insert-short", func(ctx context.Context, session *engine.Session, i int) (int64, *string, error) {
+			key, expected := int64(1_000_000+i), fmt.Sprintf("i%d", i)
+			return key, &expected, session.Exec(ctx, "INSERT INTO bench VALUES (?, ?)", key, expected)
+		}},
+		{"insert-long", func(ctx context.Context, session *engine.Session, i int) (int64, *string, error) {
+			key, expected := int64(2_000_000+i), strings.Repeat("i", 4_096)+fmt.Sprint(i)
+			return key, &expected, session.Exec(ctx, "INSERT INTO bench VALUES (?, ?)", key, expected)
+		}},
+		{"delete-early", func(ctx context.Context, session *engine.Session, i int) (int64, *string, error) {
+			key := int64(5_000 + i)
+			return key, nil, session.Exec(ctx, "DELETE FROM bench WHERE id = ?", key)
+		}},
+		{"delete-middle", func(ctx context.Context, session *engine.Session, i int) (int64, *string, error) {
+			key := int64(25_001 + i)
+			return key, nil, session.Exec(ctx, "DELETE FROM bench WHERE id = ?", key)
+		}},
+		{"delete-late", func(ctx context.Context, session *engine.Session, i int) (int64, *string, error) {
+			key := int64(45_000 + i)
+			return key, nil, session.Exec(ctx, "DELETE FROM bench WHERE id = ?", key)
+		}},
+	}
+	seedEngine, seedRepo := sqlBenchmarkEngineWithRepository(b, 50_000, 32, 1)
+	seedHead, err := seedRepo.Head(context.Background())
+	if err != nil {
+		b.Fatal(err)
+	}
+	seedRoot := seedRepo.Root
+	seedEngine.Close()
+	for _, method := range []repodbgit.FsyncMethod{repodbgit.FsyncMethodFsync, repodbgit.FsyncMethodBatch} {
+		b.Run(string(method), func(b *testing.B) {
+			root := b.TempDir()
+			cmd := exec.Command("cp", "-R", seedRoot+"/.", root)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				b.Fatalf("copy benchmark seed: %v: %s", err, output)
+			}
+			repo, err := repository.Open(context.Background(), root)
+			if err != nil {
+				b.Fatal(err)
+			}
+			clonedHead, err := repo.Head(context.Background())
+			if err != nil || clonedHead != seedHead {
+				b.Fatalf("cloned head = %q, want %q: %v", clonedHead, seedHead, err)
+			}
+			eng, err := engine.New(repo)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer eng.Close()
+			session, _ := eng.NewSession()
+			defer session.Close()
+			for _, change := range mutations {
+				nextIteration := 0
+				b.Run(change.name, func(b *testing.B) {
+					ctx, audit, err := repodbgit.WithDurabilityAudit(context.Background(), repo.CommonDir, method)
+					if err != nil {
+						b.Fatal(err)
+					}
+					repodbgit.ResetObjectWriteCount()
+					repodbgit.ResetObjectWriteBytes()
+					b.ReportAllocs()
+					samples := make([]durabilitySample, 0, b.N)
+					b.ResetTimer()
+					for i := range b.N {
+						b.StopTimer()
+						before, err := repo.Head(ctx)
+						if err != nil {
+							b.Fatal(err)
+						}
+						beforeAudit := audit.Metrics()
+						beforeInputs := repodbgit.ObjectWriteCount()
+						b.StartTimer()
+						key, expected, err := change.run(ctx, session, nextIteration+i)
+						b.StopTimer()
+						samples = append(samples, durabilitySample{
+							metrics:    subtractDurabilityMetrics(audit.Metrics(), beforeAudit),
+							blobInputs: repodbgit.ObjectWriteCount() - beforeInputs,
+						})
+						if err != nil {
+							b.Fatal(err)
+						}
+						after, err := repo.Head(ctx)
+						if err != nil || after == before {
+							b.Fatalf("data head did not advance: before=%q after=%q err=%v", before, after, err)
+						}
+						result, err := session.Query(context.Background(), "SELECT value FROM bench WHERE id = ?", key)
+						if err != nil {
+							b.Fatal(err)
+						}
+						if expected == nil {
+							if len(result.Rows) != 0 {
+								b.Fatalf("deleted key %d remains: %#v", key, result.Rows)
+							}
+						} else if len(result.Rows) != 1 || result.Rows[0][0] != *expected {
+							b.Fatalf("key %d value = %#v, want %q", key, result.Rows, *expected)
+						}
+					}
+					nextIteration += b.N
+					b.StopTimer()
+					perOp := float64(b.N)
+					metrics := audit.Metrics()
+					reportDurabilityCommand(b, "hash", metrics.HashObject, perOp)
+					reportDurabilityCommand(b, "tree", metrics.WriteTree, perOp)
+					reportDurabilityCommand(b, "commit", metrics.CommitTree, perOp)
+					reportDurabilityCommand(b, "ref", metrics.UpdateRef, perOp)
+					b.ReportMetric(float64(repodbgit.ObjectWriteCount())/perOp, "blob-inputs/op")
+					b.ReportMetric(float64(repodbgit.ObjectWriteBytes())/perOp, "blob-input-bytes/op")
+					reportDurabilityDistributions(b, samples)
+				})
+			}
+		})
+	}
+}
+
+func subtractDurabilityMetrics(after, before repodbgit.DurabilityMetrics) repodbgit.DurabilityMetrics {
+	return repodbgit.DurabilityMetrics{
+		HashObject: subtractDurabilityCommand(after.HashObject, before.HashObject),
+		WriteTree:  subtractDurabilityCommand(after.WriteTree, before.WriteTree),
+		CommitTree: subtractDurabilityCommand(after.CommitTree, before.CommitTree),
+		UpdateRef:  subtractDurabilityCommand(after.UpdateRef, before.UpdateRef),
+	}
+}
+
+func subtractDurabilityCommand(after, before repodbgit.DurabilityCommandMetrics) repodbgit.DurabilityCommandMetrics {
+	return repodbgit.DurabilityCommandMetrics{
+		Invocations: after.Invocations - before.Invocations, LatencyNanos: after.LatencyNanos - before.LatencyNanos,
+		ObjectsCreated: after.ObjectsCreated - before.ObjectsCreated, ObjectBytes: after.ObjectBytes - before.ObjectBytes,
+		HardwareFlushes: after.HardwareFlushes - before.HardwareFlushes, WriteoutRequests: after.WriteoutRequests - before.WriteoutRequests,
+	}
+}
+
+func reportDurabilityDistributions(b *testing.B, samples []durabilitySample) {
+	b.Helper()
+	values := func(selectValue func(repodbgit.DurabilityMetrics, uint64) float64) []float64 {
+		result := make([]float64, len(samples))
+		for i, sample := range samples {
+			result[i] = selectValue(sample.metrics, sample.blobInputs)
+		}
+		sort.Float64s(result)
+		return result
+	}
+	report := func(name string, distribution []float64) {
+		if len(distribution) == 0 {
+			return
+		}
+		b.ReportMetric(distribution[0], name+"-min/op")
+		b.ReportMetric(distribution[len(distribution)/2], name+"-p50/op")
+		b.ReportMetric(distribution[len(distribution)-1], name+"-max/op")
+	}
+	report("blobs", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 { return float64(m.HashObject.ObjectsCreated) }))
+	report("trees", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 { return float64(m.WriteTree.ObjectsCreated) }))
+	report("reused", values(func(m repodbgit.DurabilityMetrics, inputs uint64) float64 {
+		return float64(inputs - m.HashObject.ObjectsCreated)
+	}))
+	report("full-flushes", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 {
+		return float64(m.HashObject.HardwareFlushes + m.WriteTree.HardwareFlushes + m.CommitTree.HardwareFlushes + m.UpdateRef.HardwareFlushes)
+	}))
+	report("writeouts", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 {
+		return float64(m.HashObject.WriteoutRequests + m.WriteTree.WriteoutRequests + m.CommitTree.WriteoutRequests + m.UpdateRef.WriteoutRequests)
+	}))
+	report("hash-ms", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 { return float64(m.HashObject.LatencyNanos) / 1e6 }))
+	report("tree-ms", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 { return float64(m.WriteTree.LatencyNanos) / 1e6 }))
+	report("commit-ms", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 { return float64(m.CommitTree.LatencyNanos) / 1e6 }))
+	report("ref-ms", values(func(m repodbgit.DurabilityMetrics, _ uint64) float64 { return float64(m.UpdateRef.LatencyNanos) / 1e6 }))
+}
+
+func reportDurabilityCommand(b *testing.B, name string, metric repodbgit.DurabilityCommandMetrics, perOp float64) {
+	b.Helper()
+	b.ReportMetric(float64(metric.LatencyNanos)/perOp, name+"-ns/op")
+	b.ReportMetric(float64(metric.ObjectsCreated)/perOp, name+"-objects/op")
+	b.ReportMetric(float64(metric.ObjectBytes)/perOp, name+"-disk-bytes/op")
+	b.ReportMetric(float64(metric.HardwareFlushes)/perOp, name+"-full-flushes/op")
+	b.ReportMetric(float64(metric.WriteoutRequests)/perOp, name+"-writeouts/op")
+}
+
 func sqlBenchmarkEngine(b *testing.B, rows, payloadBytes, tables int) *engine.Engine {
+	eng, _ := sqlBenchmarkEngineWithRepository(b, rows, payloadBytes, tables)
+	return eng
+}
+
+func sqlBenchmarkEngineWithRepository(b *testing.B, rows, payloadBytes, tables int) (*engine.Engine, *repository.Repository) {
 	b.Helper()
 	ctx := context.Background()
 	root := gitRepository(b)
@@ -175,5 +378,5 @@ func sqlBenchmarkEngine(b *testing.B, rows, payloadBytes, tables int) *engine.En
 			b.Fatal(err)
 		}
 	}
-	return eng
+	return eng, repo
 }

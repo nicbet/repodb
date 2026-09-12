@@ -362,6 +362,13 @@ Implement and measure in this order:
    or deletion must permit full reconstruction and validation from Git. Batched
    writes must preserve object verification, required fsync ordering, and explicit
    publication outcomes; this does not introduce delayed durability or a WAL.
+   The focused APFS/Trace2 comparison found that the current `hash-object
+   --stdin-paths` strategy does not batch loose-blob hardening, while `write-tree`
+   changes from one full flush per new tree to one full flush plus writeout-only
+   requests under `core.fsyncMethod=batch`. Keep `committed,reference` identical
+   between variants. Treat tree batching, a genuinely batch-capable blob path,
+   and reduced chunk/prefix-tree amplification as separate follow-up experiments;
+   Trace2 counters do not replace power-loss qualification.
 
 **Acceptance and validation:**
 

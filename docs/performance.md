@@ -22,7 +22,7 @@ The first controlled run used commit
 `81d947289fe4d83cc77d66d2b61710b8ef0895a5` plus the working-tree changes under
 measurement, Go 1.27.1, Git 2.55.0, macOS 15.7.7, and an Apple M1 Max. The Git
 repository was on the local APFS workspace volume. RepoDB invokes object writes,
-tree creation, commits, and ref updates with `core.fsync=committed` and
+tree creation, commits, and ref updates with `core.fsync=committed,reference` and
 `core.fsyncMethod=fsync`; no repository override weakened those settings.
 Filesystem caches were warm. These are local-development characterization
 results, not cross-machine latency targets.
@@ -102,10 +102,90 @@ lookup/edit and canonical mutation do not. This is the requested decision point:
 the architecture has a viable proportionality path because a small write no
 longer processes table rows and stops growing strongly after the affected chunk
 sequence converges. It also exposes a real durability tradeoff: one Git commit
-per SQL transaction currently has a roughly 0.15-second floor in the smallest
+per SQL transaction currently has a roughly 0.15-second minimum under this
+implementation and configuration in the smallest
 fixture and approaches one second when a boundary change produces around 60 new
-objects. Changing that policy or persistence model requires a separate decision,
-not an inference from the former bulk-rebuild benchmark.
+objects. This is not evidence of a general Git latency floor.
+
+## Git hardening strategy experiment
+
+A second controlled experiment distinguishes Git's capabilities from RepoDB's
+current command strategy. Both variants use the explicit component set
+`core.fsync=committed,reference`; only `core.fsyncMethod` changes between
+`fsync` and `batch`. The benchmark copies one 50,000-row seed repository so both
+variants start at the identical data commit and receive the identical sequence.
+Every measured operation must advance the data ref and a query must confirm the
+new value or deletion. Seed creation, repository copies, head checks, and result
+checks are outside the Git command timers and counters.
+
+Run five real mutations of each case with:
+
+```sh
+go test ./engine -run '^$' -bench '^BenchmarkGitDurabilityStrategies$' \
+  -benchtime=5x -count=1
+```
+
+[Git Trace2](https://git-scm.com/docs/api-trace2) supplies full-flush and
+writeout-only counters. Loose-object inventory
+before and after each command supplies actual newly created object counts and
+compressed on-disk bytes. `Blob inputs reused` counts submitted blob hashes that
+were already present in Git; it is deliberately separate from new blobs.
+Figures below are the median with the observed minimum--maximum in parentheses;
+byte columns are five-operation means.
+
+| Mutation | New blobs B | Blob KiB | Blob inputs reused | New trees T | Tree KiB | T/B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Update first, short value | 55 (26--80) | 78.4 | 35 (0--97) | 69 (28--80) | 19.1 | 1.25 |
+| Update quarter, 32 bytes | 9 (8--11) | 47.8 | 0 (0--2) | 12 (10--13) | 7.7 | 1.33 |
+| Update middle, 4 KiB | 36 (8--58) | 59.1 | 0 (0--50) | 41 (12--81) | 15.1 | 1.14 |
+| Update three-quarter, 32 bytes | 24 (14--65) | 54.1 | 64 (0--80) | 36 (19--70) | 15.7 | 1.50 |
+| Update last, short value | 4 (4--4) | 26.1 | 0 (0--0) | 6 (6--6) | 6.3 | 1.50 |
+| Insert short | 4 (4--4) | 26.1 | 0 (0--0) | 6 (6--6) | 6.2 | 1.50 |
+| Insert 4 KiB | 4 (4--4) | 26.5 | 0 (0--0) | 6 (6--6) | 6.3 | 1.50 |
+| Delete early | 16 (12--99) | 64.9 | 5 (0--85) | 22 (20--122) | 17.1 | 1.38 |
+| Delete middle | 23 (12--77) | 56.1 | 1 (0--65) | 35 (23--85) | 15.4 | 1.52 |
+| Delete late | 27 (9--64) | 45.1 | 40 (0--60) | 28 (11--63) | 13.5 | 1.04 |
+
+Mutation location and successive value matter greatly: medians range from 4 to
+55 new blobs and individual samples from 4 to 99. The hash-prefix object layout
+adds another 6 to 69 median tree objects (6 to 122 individually). This confirms
+that Prolly boundary propagation and Git directory updates amplify one another,
+while showing that the former midpoint result near 60 blobs was not a universal
+point-update cost.
+
+Paired command medians in milliseconds and durability operations are:
+
+| Mutation | fsync hash/tree/commit/ref | batch hash/tree/commit/ref | fsync full flushes | batch full flushes/writeouts |
+| --- | ---: | ---: | ---: | ---: |
+| Update first | 347/408/28/26 | 347/111/28/23 | 134 (56--162) | 58/69 (29--83 / 28--80) |
+| Update quarter | 75/95/29/28 | 77/46/26/26 | 23 (20--26) | 12/12 (11--14 / 10--13) |
+| Update middle | 230/263/31/30 | 232/83/33/29 | 79 (22--141) | 39/41 (11--61 / 12--81) |
+| Update three-quarter | 180/259/36/34 | 179/87/36/32 | 62 (35--135) | 27/36 (17--68 / 19--70) |
+| Update last | 55/71/36/36 | 53/47/34/34 | 12 (12--12) | 7/6 (7--7 / 6--6) |
+| Insert short | 55/71/37/36 | 53/47/35/35 | 12 (12--12) | 7/6 (7--7 / 6--6) |
+| Insert 4 KiB | 54/70/36/35 | 53/47/35/34 | 12 (12--12) | 7/6 (7--7 / 6--6) |
+| Delete early | 133/167/38/38 | 137/75/39/36 | 41 (38--223) | 19/22 (15--102 / 20--122) |
+| Delete middle | 173/246/40/41 | 176/87/43/39 | 55 (41--164) | 26/35 (15--80 / 23--85) |
+| Delete late | 195/210/44/45 | 197/85/44/43 | 57 (22--129) | 30/28 (12--67 / 11--63) |
+
+The counters exactly fit the observed model: `fsync` uses `B + T + 2` full
+flushes, while `batch` uses `B + 3` full flushes and `T` writeout requests. The
+two final full flushes are the separately invoked commit and explicitly hardened
+reference; `write-tree` adds the third. Batching materially reduces tree time,
+especially when prefix-directory amplification is large. Hash time is unchanged:
+the current `hash-object --stdin-paths` invocation does not establish Git's
+batch-capable object-database transaction, so every newly created blob still
+receives a full flush. Separate commands also preserve separate flush boundaries.
+
+This result makes the next experiments independent: use tree batching on
+qualified filesystems, find a blob-writing path that genuinely batches hardening,
+and reduce chunk/directory amplification where its distribution justifies it.
+Trace2 establishes which operations Git requested; it does not prove power-loss
+safety. [Git documents `batch`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefsyncMethod)
+as expected to be as safe as `fsync` on macOS with
+HFS+ or APFS (and Windows with NTFS or ReFS), and only for loose objects. RepoDB
+therefore retains the existing filesystem/device assumptions and recovery checks;
+the production default remains `fsync` pending an explicit platform policy.
 
 Complete sync measurements, including equal heads, sparse divergence at all
 three row counts, selected and many unchanged tables, conflict resolution, a

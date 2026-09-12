@@ -16,15 +16,19 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 var processCount atomic.Uint64
 var objectWriteCount atomic.Uint64
+var objectWriteBytes atomic.Uint64
 
 func ProcessCount() uint64     { return processCount.Load() }
 func ResetProcessCount()       { processCount.Store(0) }
 func ObjectWriteCount() uint64 { return objectWriteCount.Load() }
 func ResetObjectWriteCount()   { objectWriteCount.Store(0) }
+func ObjectWriteBytes() uint64 { return objectWriteBytes.Load() }
+func ResetObjectWriteBytes()   { objectWriteBytes.Store(0) }
 
 type CLI struct{}
 
@@ -182,11 +186,12 @@ func (CLI) PushCommit(ctx context.Context, root, remote, commit, destination str
 }
 
 func (CLI) HashObject(ctx context.Context, root string, data []byte) (string, error) {
-	out, err := run(ctx, root, data, nil, durableArgs("hash-object", "-w", "--stdin")...)
+	out, err := run(ctx, root, data, nil, durableArgs(ctx, "hash-object", "-w", "--stdin")...)
 	if err != nil {
 		return "", fmt.Errorf("write Git blob: %w", err)
 	}
 	objectWriteCount.Add(1)
+	objectWriteBytes.Add(uint64(len(data)))
 	return strings.TrimSpace(out), nil
 }
 
@@ -213,7 +218,7 @@ func (CLI) HashObjects(ctx context.Context, root, tempRoot string, objects [][]b
 		}
 		paths[i] = path
 	}
-	out, err := run(ctx, root, []byte(strings.Join(paths, "\n")+"\n"), nil, durableArgs("hash-object", "-w", "--stdin-paths")...)
+	out, err := run(ctx, root, []byte(strings.Join(paths, "\n")+"\n"), nil, durableArgs(ctx, "hash-object", "-w", "--stdin-paths")...)
 	if err != nil {
 		return nil, fmt.Errorf("batch write Git objects: %w", err)
 	}
@@ -222,6 +227,9 @@ func (CLI) HashObjects(ctx context.Context, root, tempRoot string, objects [][]b
 		return nil, fmt.Errorf("batch write returned %d object IDs for %d objects", len(oids), len(objects))
 	}
 	objectWriteCount.Add(uint64(len(objects)))
+	for _, data := range objects {
+		objectWriteBytes.Add(uint64(len(data)))
+	}
 	return oids, nil
 }
 
@@ -281,7 +289,7 @@ func writeTree(ctx context.Context, root, commonDir, baseCommit string, entries 
 	if _, err := run(ctx, root, []byte(input.String()), env, "update-index", "--index-info"); err != nil {
 		return "", fmt.Errorf("populate temporary Git tree: %w", err)
 	}
-	out, err := run(ctx, root, nil, env, durableArgs("write-tree")...)
+	out, err := run(ctx, root, nil, env, durableArgs(ctx, "write-tree")...)
 	if err != nil {
 		return "", fmt.Errorf("write Git tree: %w", err)
 	}
@@ -309,7 +317,7 @@ func (CLI) CommitTreeParents(ctx context.Context, root, tree string, parents []s
 		"GIT_COMMITTER_NAME=RepoDB",
 		"GIT_COMMITTER_EMAIL=repodb@localhost",
 	}
-	out, err := run(ctx, root, []byte(message+"\n"), env, durableArgs(args...)...)
+	out, err := run(ctx, root, []byte(message+"\n"), env, durableArgs(ctx, args...)...)
 	if err != nil {
 		return "", fmt.Errorf("write RepoDB commit: %w", err)
 	}
@@ -317,7 +325,7 @@ func (CLI) CommitTreeParents(ctx context.Context, root, tree string, parents []s
 }
 
 func (CLI) UpdateRef(ctx context.Context, root, ref, newValue, oldValue string) error {
-	_, err := run(ctx, root, nil, nil, durableArgs("update-ref", ref, newValue, oldValue)...)
+	_, err := run(ctx, root, nil, nil, durableArgs(ctx, "update-ref", ref, newValue, oldValue)...)
 	if err != nil {
 		return fmt.Errorf("update %s: %w", ref, err)
 	}
@@ -404,8 +412,8 @@ func (CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (ma
 	return objects, nil
 }
 
-func durableArgs(args ...string) []string {
-	return append([]string{"-c", "core.fsync=committed", "-c", "core.fsyncMethod=fsync"}, args...)
+func durableArgs(ctx context.Context, args ...string) []string {
+	return append([]string{"-c", "core.fsync=committed,reference", "-c", "core.fsyncMethod=" + string(durabilityMethod(ctx))}, args...)
 }
 
 func run(ctx context.Context, dir string, stdin []byte, env []string, args ...string) (string, error) {
@@ -417,6 +425,44 @@ func run(ctx context.Context, dir string, stdin []byte, env []string, args ...st
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	audit := durabilityAudit(ctx)
+	command := gitCommand(args)
+	var before map[string]int64
+	var trace []byte
+	started := time.Now()
+	if audit != nil && isDurableCommand(command) {
+		before = audit.looseObjects()
+		readPipe, writePipe, pipeErr := os.Pipe()
+		if pipeErr != nil {
+			return "", pipeErr
+		}
+		cmd.ExtraFiles = []*os.File{writePipe}
+		cmd.Env = append(cmd.Env, "GIT_TRACE2_EVENT=3")
+		if err := cmd.Start(); err != nil {
+			readPipe.Close()
+			writePipe.Close()
+			return "", err
+		}
+		writePipe.Close()
+		traceDone := make(chan []byte, 1)
+		go func() {
+			data, _ := io.ReadAll(readPipe)
+			readPipe.Close()
+			traceDone <- data
+		}()
+		err := cmd.Wait()
+		elapsed := time.Since(started)
+		trace = <-traceDone
+		audit.record(command, elapsed, before, audit.looseObjects(), trace)
+		if err != nil {
+			message := strings.TrimSpace(stderr.String())
+			if message != "" {
+				return "", fmt.Errorf("%w: %s", err, message)
+			}
+			return "", err
+		}
+		return stdout.String(), nil
+	}
 	if err := cmd.Run(); err != nil {
 		message := strings.TrimSpace(stderr.String())
 		if message != "" {
@@ -425,4 +471,24 @@ func run(ctx context.Context, dir string, stdin []byte, env []string, args ...st
 		return "", err
 	}
 	return stdout.String(), nil
+}
+
+func gitCommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return ""
+}
+
+func isDurableCommand(command string) bool {
+	switch command {
+	case "hash-object", "write-tree", "commit-tree", "update-ref":
+		return true
+	default:
+		return false
+	}
 }

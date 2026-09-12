@@ -62,7 +62,7 @@ authoritative. Deleting that directory cannot affect snapshot reads.
 Object, tree, commit, and ref writes invoke Git with:
 
 ```text
--c core.fsync=committed -c core.fsyncMethod=fsync
+-c core.fsync=committed,reference -c core.fsyncMethod=fsync
 ```
 
 RepoDB reports a normal successful publication only after the compare-and-swap
@@ -74,6 +74,8 @@ implementation requires POSIX `flock`. Automated round trips cover both Git's
 SHA-1 and SHA-256 repository object formats; RepoDB content identities remain
 SHA-256 in either case.
 
+`reference` is explicit because Git documents it as a separate component; the
+name `committed` alone must not be read as proof that ref hardening is enabled.
 The durability claim assumes Git honors those fsync settings and the filesystem
 and storage device honor `fsync` and atomic ref replacement. Filesystems with
 weaker persistence or locking semantics require separate qualification. RepoDB
