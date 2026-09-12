@@ -14,7 +14,7 @@ import (
 	"github.com/nicbet/repodb/integration"
 )
 
-func TestEnableSyncFastForwardAndDivergence(t *testing.T) {
+func TestEnableSyncFastForwardMergeConflictAndResolution(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -142,22 +142,147 @@ func TestEnableSyncFastForwardAndDivergence(t *testing.T) {
 	if _, err := integration.Sync(ctx, a, "origin"); err != nil {
 		t.Fatal(err)
 	}
-	localBefore := git(t, b, "rev-parse", "refs/repodb/data")
 	status, err := integration.Sync(ctx, b, "origin")
-	var divergence *integration.DivergenceError
-	if !errors.As(err, &divergence) {
-		t.Fatalf("divergence error = %v", err)
+	if err != nil || status.Action != "merged" {
+		t.Fatalf("disjoint merge = %#v, %v", status, err)
 	}
-	if status.Action != "diverged" || git(t, b, "rev-parse", "refs/repodb/data") != localBefore {
-		t.Fatal("divergent sync replaced local history")
+	if parents := strings.Fields(git(t, b, "rev-list", "--parents", "-n", "1", status.LocalHead)); len(parents) != 3 {
+		t.Fatalf("merge commit parents = %v", parents)
 	}
-	if git(t, b, "rev-parse", status.TrackingRef) != divergence.RemoteHead {
-		t.Fatal("divergent sync did not preserve fetched history")
+	merged, err := fresh.Query(ctx, "SELECT id, title FROM issues ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged.Rows) != 3 || merged.Rows[1][1] != "local-b" || merged.Rows[2][1] != "remote-a" {
+		t.Fatalf("merged rows = %#v", merged.Rows)
+	}
+	if status, err := integration.Sync(ctx, a, "origin"); err != nil || status.Action != "fast-forwarded-local" {
+		t.Fatalf("converge first clone = %#v, %v", status, err)
+	}
+
+	if err := sessionA.Exec(ctx, "UPDATE issues SET title = 'choice-a' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Exec(ctx, "UPDATE issues SET title = 'choice-b' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Sync(ctx, a, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	localBefore := git(t, b, "rev-parse", repository.DataRef)
+	status, err = integration.Sync(ctx, b, "origin")
+	var conflictErr *integration.MergeConflictError
+	if !errors.As(err, &conflictErr) || len(conflictErr.Set.Unresolved()) != 1 {
+		t.Fatalf("row conflict = %#v, %v", conflictErr, err)
+	}
+	if status.Action != "conflicts" || git(t, b, "rev-parse", repository.DataRef) != localBefore {
+		t.Fatal("conflicting merge changed the live local history")
+	}
+
+	// Conflict details and a partial resolution are durable outside the process.
+	persisted, err := integration.Conflicts(ctx, b, "origin")
+	if err != nil || persisted.Conflicts[0].ID != conflictErr.Set.Conflicts[0].ID {
+		t.Fatalf("persisted conflicts = %#v, %v", persisted, err)
+	}
+	status, err = integration.Resolve(ctx, b, "origin", persisted.Conflicts[0].ID, engine.TakeRemote)
+	if err != nil || status.Action != "merged" {
+		t.Fatalf("resolve conflict = %#v, %v", status, err)
+	}
+	if _, err := integration.Conflicts(ctx, b, "origin"); !errors.Is(err, integration.ErrNoConflicts) {
+		t.Fatalf("completed conflict state remains: %v", err)
+	}
+	resolved, err := fresh.Query(ctx, "SELECT title FROM issues WHERE id = 1")
+	if err != nil || resolved.Rows[0][0] != "choice-a" {
+		t.Fatalf("resolved row = %#v, %v", resolved.Rows, err)
+	}
+	if status, err := integration.Sync(ctx, a, "origin"); err != nil || status.Action != "fast-forwarded-local" {
+		t.Fatalf("pull resolution = %#v, %v", status, err)
+	}
+	afterMergeEngineA, err := engine.Open(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer afterMergeEngineA.Close()
+	afterMergeA, _ := afterMergeEngineA.NewSession()
+	if err := afterMergeA.Exec(ctx, "DELETE FROM repodb.issues WHERE id = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Exec(ctx, "UPDATE issues SET title = 'updated-b' WHERE id = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Sync(ctx, a, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = integration.Sync(ctx, b, "origin")
+	if !errors.As(err, &conflictErr) || len(conflictErr.Set.Unresolved()) != 1 {
+		t.Fatalf("update/delete conflict = %#v, %v", conflictErr, err)
+	}
+	status, err = integration.Resolve(ctx, b, "origin", conflictErr.Set.Unresolved()[0].ID, engine.TakeRemote)
+	if err != nil || status.Action != "merged" {
+		t.Fatalf("resolve deletion = %#v, %v", status, err)
+	}
+	deleted, err := fresh.Query(ctx, "SELECT id FROM issues WHERE id = 2")
+	if err != nil || len(deleted.Rows) != 0 {
+		t.Fatalf("resolved deletion rows = %#v, %v", deleted.Rows, err)
+	}
+	head := git(t, b, "rev-parse", repository.DataRef)
+	if status, err := integration.Sync(ctx, b, "origin"); err != nil || status.Action != "up-to-date" || git(t, b, "rev-parse", repository.DataRef) != head {
+		t.Fatalf("repeat sync = %#v, %v", status, err)
 	}
 	for _, clone := range []string{a, b} {
 		if got := git(t, clone, "status", "--porcelain=v1"); got != "" {
 			t.Fatalf("source worktree dirty in %s: %q", clone, got)
 		}
+	}
+}
+
+func TestSyncReportsIncompatibleSchemaChanges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	git(t, root, "init", "--bare", remote)
+	git(t, root, "init", "--quiet", "-b", "main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, seed, "add", "README.md")
+	git(t, seed, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "source")
+	git(t, seed, "remote", "add", "origin", remote)
+	git(t, seed, "push", "origin", "main")
+	git(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+	git(t, root, "clone", "--quiet", remote, a)
+	git(t, root, "clone", "--quiet", remote, b)
+	if _, err := integration.Enable(ctx, a, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Sync(ctx, a, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Enable(ctx, b, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	engA, _ := engine.Open(ctx, a)
+	defer engA.Close()
+	engB, _ := engine.Open(ctx, b)
+	defer engB.Close()
+	sa, _ := engA.NewSession()
+	sb, _ := engB.NewSession()
+	if err := sa.Exec(ctx, "CREATE TABLE settings (id BIGINT PRIMARY KEY, value TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Exec(ctx, "CREATE TABLE settings (id BIGINT PRIMARY KEY, enabled BOOLEAN NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Sync(ctx, a, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := integration.Sync(ctx, b, "origin")
+	var conflictErr *integration.MergeConflictError
+	if !errors.As(err, &conflictErr) || len(conflictErr.Set.Conflicts) != 1 || conflictErr.Set.Conflicts[0].Kind != "schema" {
+		t.Fatalf("schema conflict = %#v, %v", conflictErr, err)
 	}
 }
 

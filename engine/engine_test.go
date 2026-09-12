@@ -146,6 +146,33 @@ func TestStatementFailureDoesNotAbortOrLeakPartialChanges(t *testing.T) {
 	}
 }
 
+func TestDeletePublishesRowRemoval(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, _ := engine.Open(ctx, root)
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE issues (id BIGINT PRIMARY KEY, title TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO issues VALUES (1, 'remove'), (2, 'keep')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "DELETE FROM issues WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, title FROM issues ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != int64(2) || result.Rows[0][1] != "keep" {
+		t.Fatalf("rows = %#v", result.Rows)
+	}
+}
+
 func TestDDLUsesMySQLImplicitCommit(t *testing.T) {
 	ctx := context.Background()
 	root := gitRepository(t)

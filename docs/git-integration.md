@@ -68,8 +68,8 @@ The supported ordinary-command behavior is:
 An explicit `repodb sync --remote <remote>` is the guaranteed network operation.
 It fetches the selected remote, validates and fast-forwards its tracking data
 into the local data head when possible, and normally pushes an outgoing
-fast-forward. Until three-way merge lands in M4, divergence is an actionable
-error that preserves both heads.
+fast-forward. Divergence enters M4's three-way merge and durable conflict
+workflow while preserving both heads.
 
 There is no atomicity claim between source and data histories. Even when a remote
 supports Git's atomic push capability, ordinary branch commands above do not

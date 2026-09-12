@@ -19,14 +19,6 @@ var (
 	ErrNotEnabled     = errors.New("RepoDB integration is not enabled for this remote")
 )
 
-type DivergenceError struct {
-	Remote, LocalHead, RemoteHead, TrackingRef string
-}
-
-func (e *DivergenceError) Error() string {
-	return fmt.Sprintf("RepoDB data histories diverged: local %s and %s %s; both refs were preserved (M4 reconciliation is required)", e.LocalHead, e.Remote, e.RemoteHead)
-}
-
 type Status struct {
 	Remote      string
 	TrackingRef string
@@ -141,80 +133,185 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	initialLocal, err := repo.Head(ctx)
-	if err != nil {
-		return Status{}, err
-	}
-	remoteHead, remoteExists, err := fetch(ctx, cli, info.TopLevel, remote, tracking)
-	if err != nil {
-		return Status{Remote: remote, TrackingRef: tracking, LocalHead: initialLocal, Action: "fetch-failed"}, err
-	}
-	if remoteExists {
-		remoteSnapshot, err := repo.SnapshotAt(ctx, tracking)
+	const maxAttempts = 3
+	var last Status
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		localHead, err := repo.Head(ctx)
 		if err != nil {
-			return Status{}, fmt.Errorf("validate fetched RepoDB snapshot: %w", err)
+			return Status{}, err
 		}
-		if err := engine.ValidateSnapshot(ctx, remoteSnapshot); err != nil {
-			return Status{}, fmt.Errorf("validate fetched RepoDB SQL graph: %w", err)
-		}
-	}
-	action := "up-to-date"
-	localHead := ""
-	pushed := false
-	err = repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
-		var err error
-		localHead, err = publication.Head(ctx)
+		remoteHead, remoteExists, err := fetch(ctx, cli, info.TopLevel, remote, tracking)
+		last = Status{Remote: remote, TrackingRef: tracking, LocalHead: localHead, RemoteHead: remoteHead}
 		if err != nil {
-			return err
+			last.Action = "fetch-failed"
+			return last, err
 		}
-		if !remoteExists {
-			if err := cli.PushRef(ctx, info.TopLevel, remote, repository.DataRef, repository.DataRef); err != nil {
-				action = "push-failed"
-				return err
+		if remoteExists {
+			remoteSnapshot, err := repo.SnapshotAt(ctx, tracking)
+			if err != nil {
+				return last, fmt.Errorf("validate fetched RepoDB snapshot: %w", err)
 			}
-			action, pushed = "pushed", true
-			return nil
+			if err := engine.ValidateSnapshot(ctx, remoteSnapshot); err != nil {
+				return last, fmt.Errorf("validate fetched RepoDB SQL graph: %w", err)
+			}
 		}
-		if localHead == remoteHead {
-			return nil
+
+		if !remoteExists || localHead == remoteHead {
+			if localHead == remoteHead {
+				last.Action = "up-to-date"
+				if err := clearConflictSet(repo, remote); err != nil {
+					last.Action = "conflict-cleanup-failed"
+					return last, err
+				}
+				return last, nil
+			}
+			err = pushExpected(ctx, repo, cli, info.TopLevel, remote, localHead)
+			if err == nil {
+				last.RemoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
+				if err != nil {
+					last.Action = "pushed-local-fetch-failed"
+					return last, err
+				}
+				last.Action = "pushed"
+				if err := clearConflictSet(repo, remote); err != nil {
+					last.Action = "conflict-cleanup-failed"
+					return last, err
+				}
+				return last, nil
+			}
+			lastErr, last.Action = err, "push-retry"
+			continue
 		}
+
 		remoteBehind, err := cli.IsAncestor(ctx, info.TopLevel, remoteHead, localHead)
 		if err != nil {
-			return err
+			return last, err
 		}
 		if remoteBehind {
-			if err := cli.PushRef(ctx, info.TopLevel, remote, repository.DataRef, repository.DataRef); err != nil {
-				action = "push-failed"
-				return fmt.Errorf("remote changed or rejected RepoDB fast-forward: %w", err)
+			if err := pushExpected(ctx, repo, cli, info.TopLevel, remote, localHead); err != nil {
+				lastErr, last.Action = err, "push-retry"
+				continue
 			}
-			action, pushed = "pushed", true
-			return nil
+			last.RemoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
+			if err != nil {
+				last.Action = "pushed-local-fetch-failed"
+				return last, err
+			}
+			last.Action = "pushed"
+			if err := clearConflictSet(repo, remote); err != nil {
+				last.Action = "conflict-cleanup-failed"
+				return last, err
+			}
+			return last, nil
 		}
 		localBehind, err := cli.IsAncestor(ctx, info.TopLevel, localHead, remoteHead)
 		if err != nil {
-			return err
+			return last, err
 		}
 		if localBehind {
-			if _, err := publication.FastForward(ctx, localHead, remoteHead); err != nil {
-				action = "publication-failed"
+			err = repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
+				_, err := publication.FastForward(ctx, localHead, remoteHead)
 				return err
+			})
+			if errors.Is(err, repository.ErrConflict) {
+				lastErr, last.Action = err, "publication-retry"
+				continue
 			}
-			localHead, action = remoteHead, "fast-forwarded-local"
-			return nil
+			if err != nil {
+				last.Action = "publication-failed"
+				return last, err
+			}
+			last.LocalHead, last.Action = remoteHead, "fast-forwarded-local"
+			if err := clearConflictSet(repo, remote); err != nil {
+				last.Action = "conflict-cleanup-failed"
+				return last, err
+			}
+			return last, nil
 		}
-		action = "diverged"
-		return &DivergenceError{Remote: remote, LocalHead: localHead, RemoteHead: remoteHead, TrackingRef: tracking}
-	})
-	if err != nil {
-		return Status{Remote: remote, TrackingRef: tracking, LocalHead: localHead, RemoteHead: remoteHead, Action: action}, err
-	}
-	if pushed {
-		remoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
+
+		baseHead, err := repo.MergeBase(ctx, localHead, remoteHead)
 		if err != nil {
-			return Status{Remote: remote, TrackingRef: tracking, LocalHead: localHead, Action: "pushed-local-fetch-failed"}, err
+			return last, err
 		}
+		baseSnapshot, err := repo.SnapshotAt(ctx, baseHead)
+		if err != nil {
+			return last, err
+		}
+		localSnapshot, err := repo.SnapshotAt(ctx, localHead)
+		if err != nil {
+			return last, err
+		}
+		remoteSnapshot, err := repo.SnapshotAt(ctx, remoteHead)
+		if err != nil {
+			return last, err
+		}
+		writer, err := repo.BeginMerge(ctx, localHead, remoteHead)
+		if err != nil {
+			return last, err
+		}
+		resolutions := map[string]engine.Resolution{}
+		if prior, loadErr := loadConflictSet(repo, remote); loadErr == nil && prior.BaseHead == baseHead && prior.LocalHead == localHead && prior.RemoteHead == remoteHead {
+			resolutions = prior.Resolutions
+		}
+		manifest, hashes, conflicts, err := engine.MergeSnapshots(ctx, writer, baseSnapshot, localSnapshot, remoteSnapshot, resolutions)
+		if err != nil {
+			last.Action = "merge-invalid"
+			return last, err
+		}
+		if len(conflicts) != 0 {
+			set := ConflictSet{Version: 1, Remote: remote, BaseHead: baseHead, LocalHead: localHead, RemoteHead: remoteHead, Conflicts: conflicts, Resolutions: resolutions}
+			if err := saveConflictSet(repo, set); err != nil {
+				return last, err
+			}
+			last.Action = "conflicts"
+			return last, &MergeConflictError{Set: set}
+		}
+		if err := writer.RetainOnly(hashes); err != nil {
+			return last, err
+		}
+		result, err := writer.CommitWithOutcome(ctx, manifest)
+		if errors.Is(err, repository.ErrConflict) {
+			lastErr, last.Action = err, "publication-retry"
+			continue
+		}
+		if err != nil {
+			last.Action = "publication-failed"
+			return last, err
+		}
+		localHead = result.Commit
+		last.LocalHead = localHead
+		if err := pushExpected(ctx, repo, cli, info.TopLevel, remote, localHead); err != nil {
+			lastErr, last.Action = err, "push-retry"
+			continue
+		}
+		last.RemoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
+		if err != nil {
+			last.Action = "merged-local-fetch-failed"
+			return last, err
+		}
+		last.Action = "merged"
+		if err := clearConflictSet(repo, remote); err != nil {
+			last.Action = "conflict-cleanup-failed"
+			return last, err
+		}
+		return last, nil
 	}
-	return Status{Remote: remote, TrackingRef: tracking, LocalHead: localHead, RemoteHead: remoteHead, Action: action}, nil
+	last.Action = "retry-exhausted"
+	return last, fmt.Errorf("RepoDB synchronization did not stabilize after %d attempts; both local and tracking histories are preserved: %w", maxAttempts, lastErr)
+}
+
+func pushExpected(ctx context.Context, repo *repository.Repository, cli repodbgit.CLI, root, remote, expected string) error {
+	return repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
+		actual, err := publication.Head(ctx)
+		if err != nil {
+			return err
+		}
+		if actual != expected {
+			return repository.ErrConflict
+		}
+		return cli.PushCommit(ctx, root, remote, expected, repository.DataRef)
+	})
 }
 
 func requireRemote(remote string) (string, error) {

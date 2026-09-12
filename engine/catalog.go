@@ -230,11 +230,13 @@ type table struct {
 	state *tableState
 }
 
-func (t *table) Name() string                           { return t.name }
-func (t *table) String() string                         { return t.name }
-func (t *table) Schema() sql.Schema                     { return t.state.schema.Schema }
-func (t *table) PrimaryKeySchema() sql.PrimaryKeySchema { return t.state.schema }
-func (t *table) Collation() sql.CollationID             { return sql.Collation_Default }
+func (t *table) Name() string       { return t.name }
+func (t *table) String() string     { return t.name }
+func (t *table) Schema() sql.Schema { return sourcedSchema(t.state.schema.Schema, t.name) }
+func (t *table) PrimaryKeySchema() sql.PrimaryKeySchema {
+	return sql.PrimaryKeySchema{Schema: sourcedSchema(t.state.schema.Schema, t.name), PkOrdinals: append([]int(nil), t.state.schema.PkOrdinals...)}
+}
+func (t *table) Collation() sql.CollationID { return sql.Collation_Default }
 func (t *table) Partitions(*sql.Context) (sql.PartitionIter, error) {
 	return sql.PartitionsToPartitionIter(singlePartition{}), nil
 }
@@ -255,6 +257,16 @@ func (t *table) Updater(*sql.Context) sql.RowUpdater   { return &editor{table: t
 func (t *table) Deleter(*sql.Context) sql.RowDeleter   { return &editor{table: t} }
 
 type singlePartition struct{}
+
+func sourcedSchema(schema sql.Schema, source string) sql.Schema {
+	result := make(sql.Schema, len(schema))
+	for i, column := range schema {
+		copy := *column
+		copy.Source = source
+		result[i] = &copy
+	}
+	return result
+}
 
 func (singlePartition) Key() []byte { return []byte("all") }
 

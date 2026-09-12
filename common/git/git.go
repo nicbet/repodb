@@ -87,6 +87,19 @@ func (CLI) IsAncestor(ctx context.Context, root, ancestor, descendant string) (b
 	return false, fmt.Errorf("check Git ancestry: %w", err)
 }
 
+func (CLI) MergeBase(ctx context.Context, root, left, right string) (string, error) {
+	out, err := run(ctx, root, nil, nil, "merge-base", "--all", left, right)
+	if err != nil {
+		return "", fmt.Errorf("find Git merge base: %w", err)
+	}
+	bases := strings.Fields(out)
+	if len(bases) == 0 {
+		return "", errors.New("RepoDB data histories have no common ancestor")
+	}
+	sort.Strings(bases)
+	return bases[0], nil
+}
+
 func (CLI) RemoteURL(ctx context.Context, root, remote string) (string, error) {
 	out, err := run(ctx, root, nil, nil, "remote", "get-url", remote)
 	if err != nil {
@@ -155,6 +168,16 @@ func (CLI) PushRef(ctx context.Context, root, remote, source, destination string
 	return nil
 }
 
+// PushCommit publishes one exact commit. A concurrent local ref update cannot
+// change what this invocation sends, and Git still enforces fast-forward rules.
+func (CLI) PushCommit(ctx context.Context, root, remote, commit, destination string) error {
+	_, err := run(ctx, root, nil, nil, "push", remote, commit+":"+destination)
+	if err != nil {
+		return fmt.Errorf("push RepoDB commit to %q: %w", remote, err)
+	}
+	return nil
+}
+
 func (CLI) HashObject(ctx context.Context, root string, data []byte) (string, error) {
 	out, err := run(ctx, root, data, nil, durableArgs("hash-object", "-w", "--stdin")...)
 	if err != nil {
@@ -203,9 +226,19 @@ func (CLI) WriteTree(ctx context.Context, root, commonDir string, entries []Tree
 }
 
 func (CLI) CommitTree(ctx context.Context, root, tree, parent, message string) (string, error) {
-	args := []string{"commit-tree", tree}
+	parents := []string{}
 	if parent != "" {
-		args = append(args, "-p", parent)
+		parents = append(parents, parent)
+	}
+	return CLI{}.CommitTreeParents(ctx, root, tree, parents, message)
+}
+
+func (CLI) CommitTreeParents(ctx context.Context, root, tree string, parents []string, message string) (string, error) {
+	args := []string{"commit-tree", tree}
+	for _, parent := range parents {
+		if parent != "" {
+			args = append(args, "-p", parent)
+		}
 	}
 	env := []string{
 		"GIT_AUTHOR_NAME=RepoDB",

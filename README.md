@@ -31,9 +31,11 @@ the supported SQL scope, transaction behavior, outcome recovery, and measured
 initial workload.
 
 M3 adds explicit Git transport. `repodb enable --remote <name>` configures and
-fetches a separate tracking ref, and `repodb sync --remote <name>` performs only
-validated fast-forwards. Divergence preserves both histories for M4. See
-[the M3 synchronization contract](docs/sync-m3.md).
+fetches a separate tracking ref, and `repodb sync --remote <name>` performs
+validated fast-forwards or M4's conservative three-way merge. Conflicts preserve
+both histories for inspection and explicit resolution. See
+[the synchronization contract](docs/sync-m3.md) and
+[the merge contract](docs/merge-m4.md).
 
 ## Layout
 
@@ -100,5 +102,7 @@ concurrency, cache, durability, and legacy migration details.
 
 Follow the milestones and acceptance criteria in [plan.md](plan.md): prove Git
 storage/transport, implement durable snapshots, connect persistent embedded SQL
-and the server, add enable/sync, then implement distributed merge and compatibility work.
+and the server, explicit enable/sync, and conservative distributed row merging.
+See [the M4 merge contract](docs/merge-m4.md) for conflict inspection and
+whole-row resolution. Broader SQL compatibility and scaling work remain.
 Ordinary writes will persist automatically without user-managed Git snapshots.

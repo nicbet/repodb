@@ -124,6 +124,7 @@ type Writer struct {
 	expected  string
 	objects   map[storage.Hash][]byte
 	retained  map[storage.Hash]struct{}
+	parents   []string
 	committed bool
 	mu        sync.RWMutex
 }
@@ -234,6 +235,10 @@ func (r *Repository) SnapshotAt(ctx context.Context, revision string) (*Snapshot
 	return r.loadSnapshot(ctx, commit)
 }
 
+func (r *Repository) MergeBase(ctx context.Context, left, right string) (string, error) {
+	return r.git.MergeBase(ctx, r.Root, left, right)
+}
+
 type LockedPublication struct{ repo *Repository }
 
 // WithPublicationLock serializes integration reconciliation with SQL commits.
@@ -302,6 +307,22 @@ func (r *Repository) Begin(ctx context.Context) (*Writer, error) {
 		base:     base,
 		expected: base.Commit,
 		objects:  make(map[storage.Hash][]byte),
+	}, nil
+}
+
+// BeginMerge creates a writer whose publication expects local and whose commit
+// records both reconciled histories as parents.
+func (r *Repository) BeginMerge(ctx context.Context, local, remote string) (*Writer, error) {
+	base, err := r.loadSnapshot(ctx, local)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.loadSnapshot(ctx, remote); err != nil {
+		return nil, err
+	}
+	return &Writer{
+		repo: r, base: base, expected: local,
+		objects: make(map[storage.Hash][]byte), parents: []string{local, remote},
 	}, nil
 }
 
@@ -447,7 +468,11 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 	if err != nil {
 		return result, err
 	}
-	commit, err := w.repo.git.CommitTree(ctx, w.repo.Root, tree, w.expected, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
+	parents := w.parents
+	if len(parents) == 0 && w.expected != "" {
+		parents = []string{w.expected}
+	}
+	commit, err := w.repo.git.CommitTreeParents(ctx, w.repo.Root, tree, parents, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
 	if err != nil {
 		return result, err
 	}

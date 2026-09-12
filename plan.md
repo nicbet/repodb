@@ -1,6 +1,6 @@
 # RepoDB implementation plan
 
-Status: M0 through M3 complete; M4 is next. Updated 2026-09-12 after implementation
+Status: M0 through M4 complete; M5 is next. Updated 2026-09-12 after implementation
 review and a passing `make test` run. Later milestones remain pending.
 
 ## Product goal
@@ -31,7 +31,7 @@ Code and database share a repository and remote, with independent histories.
 - Offer `repodb start` for users who want a standalone MySQL server. Embedded
   applications own the lifecycle of their engine instances.
 
-Proposed user-facing workflow (these commands are not implemented yet):
+User-facing workflow:
 
 ```sh
 # Regular git clone
@@ -39,13 +39,13 @@ git clone <project-url>
 cd <project>
 
 # Fetch database refs and configure future fetches; no hooks or service required
-repodb enable
+repodb enable --remote origin
 
 # Optional: start the MySQL server; embedded applications open the engine directly
 repodb start
 
 # Explicitly synchronize database changes with the selected remote
-repodb sync
+repodb sync --remote origin
 ```
 
 Transparency means persistence and Git storage are handled by RepoDB. Genuine
@@ -67,17 +67,17 @@ network I/O. See [the accepted command matrix](docs/git-integration.md).
 | `client/` | MySQL driver wrapper | Retain as optional network client |
 | `common/prolly/` | Deterministic bulk tree build, point lookup, iteration, and graph validation | Add incremental mutation and diff |
 | `common/storage/` | SHA-256-addressed store interface and memory/filesystem implementations | Retain interface; repository snapshots and writers provide Git-backed stores |
-| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, legacy import | Add merge candidate and conflict storage |
-| `common/git/` | Object/tree/commit operations, classified expected-head updates, fsync, and explicit remote transport | Support bounded merge/push retry diagnostics |
-| CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `start`, and network `sql` | Add merge inspection and resolution |
+| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, two-parent merge candidates, and legacy import | Retain as the durable publication boundary |
+| `common/git/` | Object/tree/commit operations, classified expected-head updates, fsync, explicit remote transport, merge-base lookup, and exact-candidate pushes | Optimize only from measurements |
+| CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `conflicts`, `resolve`, `start`, and network `sql` | Broaden compatibility after merge correctness |
 
 Existing tests cover tree determinism and validation, persistent embedded and
 MySQL SQL, restart recovery, publication outcomes through both interfaces,
 separate-process and linked-worktree contention, injected failures, Git
 SHA-1/SHA-256 formats, legacy import, enable/sync idempotence, fast-forward
-transport, pinned transactions, and divergence preservation. `make test` passes.
-Three-way merge, conflict resolution, broader compatibility, and incremental
-tree mutation remain pending.
+transport, pinned transactions, disjoint offline merging, durable row/schema
+conflicts, explicit resolution, and repeat-sync idempotence. `make test` passes.
+Broader compatibility and incremental tree mutation remain pending.
 
 The original tracked-directory/manual-snapshot design is superseded by this plan.
 Its reusable storage and SQL pieces are a starting point, not the target contract.
@@ -284,10 +284,15 @@ Enabling twice neither duplicates configuration nor starts a process.
 
 ### M4 — Reconcile independently edited clones
 
+**Status: complete (2026-09-12).** Common-ancestor three-way merging, whole-row
+conflicts, durable inspection/resolution, supported-constraint validation,
+two-parent publication, and bounded local/remote race retries are implemented
+and documented in [docs/merge-m4.md](docs/merge-m4.md).
+
 - Add row/schema diffs, three-way merge, conflict inspection and resolution, and
   validation of supported constraints before advancing the live data ref.
 - Cover insert/insert collisions, update/update, update/delete, schema changes,
-  and unique-key conflicts between otherwise distinct rows.
+  and supported primary-key uniqueness. Secondary unique indexes remain M6 scope.
 - Document distributed row identity: a local auto-increment counter alone cannot
   prevent independently generated IDs from colliding across clones.
 - Handle remote advancement during synchronization without force updates or
@@ -328,15 +333,10 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Proceed to M4 on the completed storage, SQL, and explicit synchronization
-foundation. Add deterministic three-way catalog and row merging from the common
-data ancestor, while retaining the M3 publication lock, expected-head checks,
-tracking refs, and normal non-force push behavior.
-
-Accept unchanged, one-sided, and disjoint row changes. Preserve and report both
-histories for competing edits, DDL conflicts, or constraint failures, with
-inspectable conflict details and explicit resolution. Remote advancement during
-merge must use bounded retries and must never discard either history.
+Proceed to M5 on the completed merge foundation. Build the tool-author examples
+and complete integration coverage for worktrees, concurrent embedded/server use,
+read-only and partial synchronization failures, while retaining explicit sync as
+the visible reconciliation boundary.
 
 ## References
 

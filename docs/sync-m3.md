@@ -1,8 +1,8 @@
 # M3 enable and synchronization contract
 
 M3 transports one RepoDB data history with explicit commands. It supports
-initial transfer and fast-forward synchronization. Three-way reconciliation is
-deferred to M4.
+initial transfer and fast-forward synchronization. M4 adds reconciliation on
+top of this transport contract.
 
 ## Enable
 
@@ -48,10 +48,8 @@ commit. A SQL transaction already in progress keeps its immutable snapshot. If
 sync advances the local head, that transaction can continue reading its pinned
 state; its later commit receives the normal stale-writer conflict.
 
-Sync never force-pushes. A remote race is returned as a transport/rejection
-error. If neither head is an ancestor of the other, `DivergenceError` identifies
-both commits and the tracking ref. The writable local history and fetched remote
-history remain intact for M4 reconciliation or manual inspection.
+Sync never force-pushes. M4 now reconciles divergence with a common-ancestor
+three-way merge and bounded retry behavior; see [merge-m4.md](merge-m4.md).
 
 Local SQL durability and remote transport remain separate outcomes. A successful
 SQL commit does not imply successful sync, and a fetch or push failure does not
