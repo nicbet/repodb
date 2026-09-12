@@ -394,7 +394,9 @@ a documented change; a 50,000-row merge microbenchmark alone does not broaden it
 
 ### M4.2 — Establish database performance and remove the largest avoidable costs
 
-**Status: next; pending.** Produce a reproducible database baseline and a bounded
+**Status: in progress.** The reproducible SQL/sync runner, initial baseline, and
+first bounded optimization pass are documented in [docs/performance.md](performance.md).
+Complete the remaining matrix below before M5. Produce a bounded
 round of improvements before M5. This does not require every workload to become
 fast or authorize a general storage rewrite.
 

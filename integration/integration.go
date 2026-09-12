@@ -320,7 +320,7 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 }
 
 func pushExpected(ctx context.Context, repo *repository.Repository, cli repodbgit.CLI, root, remote, expected string) error {
-	return repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
+	if err := repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
 		actual, err := publication.Head(ctx)
 		if err != nil {
 			return err
@@ -328,8 +328,14 @@ func pushExpected(ctx context.Context, repo *repository.Repository, cli repodbgi
 		if actual != expected {
 			return repository.ErrConflict
 		}
-		return cli.PushCommit(ctx, root, remote, expected, repository.DataRef)
-	})
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Push the captured immutable commit after releasing the local publication
+	// lock. A concurrent local descendant remains pending for the next sync;
+	// remote fast-forward enforcement and the bounded retry loop are unchanged.
+	return cli.PushCommit(ctx, root, remote, expected, repository.DataRef)
 }
 
 func requireRemote(remote string) (string, error) {

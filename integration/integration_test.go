@@ -3,11 +3,13 @@ package integration_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
@@ -233,6 +235,80 @@ func TestEnableSyncFastForwardMergeConflictAndResolution(t *testing.T) {
 		if got := git(t, clone, "status", "--porcelain=v1"); got != "" {
 			t.Fatalf("source worktree dirty in %s: %q", clone, got)
 		}
+	}
+}
+
+func TestSyncDoesNotHoldPublicationLockDuringPush(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	clone := filepath.Join(root, "clone")
+	git(t, root, "init", "--bare", "--quiet", remote)
+	git(t, root, "init", "--quiet", "-b", "main", clone)
+	git(t, clone, "remote", "add", "origin", remote)
+	if _, err := integration.Enable(ctx, clone, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, clone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	session, _ := eng.NewSession()
+	if err := session.Exec(ctx, "CREATE TABLE events (id BIGINT PRIMARY KEY, value TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Sync(ctx, clone, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Exec(ctx, "INSERT INTO events VALUES (1, 'outgoing')"); err != nil {
+		t.Fatal(err)
+	}
+	entered := filepath.Join(root, "push-entered")
+	release := filepath.Join(root, "push-release")
+	hook := filepath.Join(remote, "hooks", "pre-receive")
+	script := fmt.Sprintf("#!/bin/sh\n: > '%s'\nwhile [ ! -e '%s' ]; do sleep 0.01; done\n", entered, release)
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	type syncResult struct {
+		status integration.Status
+		err    error
+	}
+	synced := make(chan syncResult, 1)
+	go func() {
+		status, err := integration.Sync(ctx, clone, "origin")
+		synced <- syncResult{status, err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(entered); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("push hook was not entered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	committed := make(chan error, 1)
+	go func() { committed <- session.Exec(ctx, "INSERT INTO events VALUES (2, 'concurrent')") }()
+	select {
+	case err := <-committed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SQL commit waited for the blocked network push")
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := <-synced
+	if result.err != nil || result.status.Action != "pushed" {
+		t.Fatalf("sync = %#v, %v", result.status, result.err)
+	}
+	if status, err := integration.Sync(ctx, clone, "origin"); err != nil || status.Action != "pushed" {
+		t.Fatalf("concurrent descendant sync = %#v, %v", status, err)
 	}
 }
 

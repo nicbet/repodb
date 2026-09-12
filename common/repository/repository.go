@@ -253,6 +253,15 @@ func (r *Repository) SnapshotAt(ctx context.Context, revision string) (*Snapshot
 	return r.loadSnapshot(ctx, commit)
 }
 
+// SnapshotCommit loads an already resolved immutable commit without an
+// additional ref-resolution process.
+func (r *Repository) SnapshotCommit(ctx context.Context, commit string) (*Snapshot, error) {
+	if strings.TrimSpace(commit) == "" {
+		return nil, errors.New("snapshot commit is required")
+	}
+	return r.loadSnapshot(ctx, commit)
+}
+
 func (r *Repository) MergeBase(ctx context.Context, left, right string) (string, error) {
 	return r.git.MergeBase(ctx, r.Root, left, right)
 }
@@ -329,6 +338,14 @@ func (r *Repository) Begin(ctx context.Context) (*Writer, error) {
 	base, err := r.Current(ctx)
 	if err != nil {
 		return nil, err
+	}
+	return r.BeginSnapshot(base)
+}
+
+// BeginSnapshot creates a writer from an already loaded immutable base.
+func (r *Repository) BeginSnapshot(base *Snapshot) (*Writer, error) {
+	if base == nil || base.repo != r {
+		return nil, errors.New("base snapshot belongs to a different repository")
 	}
 	return &Writer{
 		repo:       r,

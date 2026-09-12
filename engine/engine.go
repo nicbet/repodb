@@ -64,7 +64,7 @@ func New(repo *repository.Repository) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	db := &database{name: snapshot.Manifest.DefaultDatabase, repo: repo}
+	db := &database{name: snapshot.Manifest.DefaultDatabase, repo: repo, snapshot: snapshot}
 	if err := ValidateSnapshot(context.Background(), snapshot); err != nil {
 		return nil, err
 	}

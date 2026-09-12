@@ -246,7 +246,7 @@ func TestEmbeddedCommitOutcomeAndRecovery(t *testing.T) {
 	}
 }
 
-func gitRepository(t *testing.T) string {
+func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()
 	cmd := exec.Command("git", "init", "--quiet", "-b", "main")

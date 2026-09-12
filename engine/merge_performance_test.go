@@ -109,6 +109,80 @@ func TestMergeRetainsSelectedRootsAndReusesLoadedSnapshots(t *testing.T) {
 	}
 }
 
+func TestPointLookupAndDirtyTableWorkAreBounded(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	repo, err := repository.Init(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.New(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	session, _ := eng.NewSession()
+	for _, statement := range []string{
+		"CREATE TABLE changed (id BIGINT PRIMARY KEY, value TEXT NOT NULL)",
+		"CREATE TABLE stable (id BIGINT PRIMARY KEY, value TEXT NOT NULL)",
+		"INSERT INTO changed VALUES (1, 'old')",
+		"INSERT INTO stable VALUES (1, 'stable')",
+	} {
+		if err := session.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := repo.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := session.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.ResetPerformanceCounters()
+	result, err := tx.Query(ctx, "SELECT value FROM changed WHERE id = 1")
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("point lookup = %#v, %v", result.Rows, err)
+	}
+	counters := engine.ReadPerformanceCounters()
+	if counters.RowsScanned != 0 || counters.PointKeysVisited != 1 {
+		t.Fatalf("point lookup counters = %#v", counters)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	engine.ResetPerformanceCounters()
+	if err := session.Exec(ctx, "UPDATE changed SET value = 'new' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := repo.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counters = engine.ReadPerformanceCounters()
+	if counters.TablesRebuilt != 1 || counters.TablesReused != 1 || counters.UndoRowsCaptured != 1 {
+		t.Fatalf("bounded update counters = %#v", counters)
+	}
+	if after.Manifest.Tables["stable"] != before.Manifest.Tables["stable"] {
+		t.Fatal("updating one table rebuilt an unchanged table")
+	}
+
+	head := after.Commit
+	engine.ResetPerformanceCounters()
+	if err := session.Exec(ctx, "UPDATE changed SET value = 'new' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := repo.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Commit != head || engine.ReadPerformanceCounters().TablesRebuilt != 0 {
+		t.Fatal("unchanged update published or rebuilt a table")
+	}
+}
+
 func updateDataRef(t *testing.T, root, target, expected string) {
 	t.Helper()
 	cmd := exec.Command("git", "update-ref", repository.DataRef, target, expected)
