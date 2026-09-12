@@ -1,8 +1,8 @@
 # RepoDB implementation plan
 
-Status: M0 through M4.1 complete; M5 is next. Updated 2026-09-12 after the
-[M4.1 implementation and measurements](m4-bench.md). Later milestones remain
-pending.
+Status: M0 through M4.1 complete; M4.2 database performance baseline and targeted
+improvements is next, before M5. Updated 2026-09-12 after the
+[M4.1 implementation and measurements](m4-bench.md). Later milestones remain pending.
 
 ## Product goal
 
@@ -66,11 +66,11 @@ network I/O. See [the accepted command matrix](git-integration.md).
 | --- | --- | --- |
 | `server/` | MySQL listener routed through the persistent shared engine | Broaden compatibility after merge correctness |
 | `client/` | MySQL driver wrapper | Retain as optional network client |
-| `common/prolly/` | Deterministic bulk tree build, point lookup, iteration, and graph validation | Add streaming sorted iteration/building in M4.1; incremental mutation later |
+| `common/prolly/` | Deterministic bulk and sorted streaming construction, lazy iteration, lookup, and graph validation | Measure SQL adoption and changed-subtree operations; incremental mutation later |
 | `common/storage/` | SHA-256-addressed store interface and memory/filesystem implementations | Retain interface; repository snapshots and writers provide Git-backed stores |
 | `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, two-parent merge candidates, and legacy import | Reuse validated snapshots and existing roots while preserving publication guarantees |
-| `common/git/` | Object/tree/commit operations, classified expected-head updates, fsync, explicit remote transport, merge-base lookup, and exact-candidate pushes | Remove duplicate reads; profile validation caching and batched writes in M4.1 |
-| `engine/` and `integration/` | Persistent SQL, three-way merging, explicit sync, and durable conflicts | Reduce whole-table materialization and make unchanged sync cheap |
+| `common/git/` | Batched blob reads/writes, classified expected-head updates, fsync, remote transport, and exact-candidate pushes | Attribute process, temporary-file, object I/O, and durability costs |
+| `engine/` and `integration/` | Persistent SQL, streaming merging, root reuse, validation cache, explicit sync, and durable conflicts | Reduce SQL materialization/rebuilds and network-induced writer stalls |
 | CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `conflicts`, `resolve`, `start`, and network `sql` | Broaden compatibility after merge correctness |
 
 Existing tests cover tree determinism and validation, persistent embedded and
@@ -84,7 +84,8 @@ Broader compatibility and incremental tree mutation remain pending.
 The later M4 benchmark passed engine and integration tests, but its restricted
 environment could not bind a loopback socket for the full MySQL wire suite. Its
 results establish merge costs, not an additional full-suite validation or a
-larger supported workload. M4.1 must run wire tests in a suitable environment.
+larger supported workload. Keep the subsequent M4.1 acceptance record separate
+from M4.2 performance measurements and validation.
 
 The original tracked-directory/manual-snapshot design is superseded by this plan.
 Its reusable storage and SQL pieces are a starting point, not the target contract.
@@ -142,10 +143,12 @@ imply rollback or authorize automatic replay.
 
 M2 derives inventories from reachable catalog objects, batches Git reads, and
 reuses existing Git object IDs. Historical commits retain older snapshots.
-The remaining M4 costs are whole-table copying/rebuilding, materialized three-way
-row merges, repeated eager snapshot validation, and per-object Git writes.
-M4.1 addresses these measured costs without changing the data format, merge
-policy, explicit sync contract, or acknowledged-write durability model.
+M4.1 adds merge root reuse, streaming reconciliation, reuse of loaded snapshots,
+a bounded SQL validation cache, and batched object writes. SQL transactions still
+materialize tables, clone rows for statement rollback, and rebuild all tables on
+a dirty commit. Snapshot reads and publication also retain/copy object inventories.
+M4.2 measures these remaining costs while preserving the data format, merge
+policy, explicit sync contract, and acknowledged-write durability model.
 
 ### Local concurrency and remote concurrency
 
@@ -389,9 +392,116 @@ an implementation or an evidence-backed M6 deferral. All correctness checks pass
 The existing small-database scope remains until the complete measurements support
 a documented change; a 50,000-row merge microbenchmark alone does not broaden it.
 
+### M4.2 — Establish database performance and remove the largest avoidable costs
+
+**Status: next; pending.** Produce a reproducible database baseline and a bounded
+round of improvements before M5. This does not require every workload to become
+fast or authorize a general storage rewrite.
+
+**Evidence and limits:** M4.1 reports 160 ms and 120 MB allocated for a sparse
+50,000-row merge, versus 6.09 s and 371 MB for full local-remote sync. An up-to-date
+1,000-row sync takes 160 ms with 17 Git invocations; sparse sync uses 42 invocations
+at every measured size. Trace the complete path before attributing its cost to
+process startup, fsync, or merging. The microbenchmark and sync differ in scope
+and cache state; subtracting their times is not an exact phase breakdown.
+
+The original baseline used Linux/amd64; M4.1 used Darwin/arm64 and moved snapshot
+loading outside the merge microbenchmark. Neither timing nor allocation ratios
+are a controlled same-scope comparison. Full-sync numbers are single-operation
+warm-cache samples, not latency distributions. Peak RSS includes fixture creation
+and excludes Git child-process memory. The many-table fixture has 49 one-row
+tables, remote selection adds a one-row table, and the conflict case has one
+conflicting row. Extend these before making broader workload claims.
+
+**Baseline deliverable:** a reproducible runner and `docs/performance.md`, with
+raw results, machine/OS/filesystem, Go/Git versions, revision and working-tree
+changes, durability settings, and fixture seeds. Start with a representative
+matrix, then vary dimensions independently rather than testing every combination.
+
+| Dimension | Required coverage |
+| --- | --- |
+| Data | 1,000 / 10,000 / 50,000 rows; narrow rows and larger payloads; one table and multiple populated tables |
+| Reads | Cold open, warm transaction start, primary-key hit/miss, limited range/list query, full scan with consumed results |
+| Writes | Single insert/update/delete, unchanged update, failed statement/rollback, explicit batches of 1 / 10 / 100 / 1,000 mutations |
+| Applications | Append-heavy events and mutable issues; embedded API and persistent MySQL connection; CLI startup measured separately |
+| Concurrency | Readers with 1 / 2 / 4 writers; slow sync overlapping SQL commits; successful throughput, rejection rate, retries, and latency |
+| Sync | Equal heads, sparse divergence, large selected/unchanged tables, multiple conflict fractions and resolution, controlled remote latency |
+| Lifecycle | Fresh process versus warm engine; first object creation versus reuse; loose versus packed objects; longer history at fixed live row count |
+
+Treat larger cases as characterization, not supported capacity. Repeated fixture
+resets must not silently turn new-publication tests into reuse of objects already
+created by earlier iterations. Distinguish process-cold from filesystem-cache-cold
+runs. Collect repeated independent samples and per-operation p50/p95; report p99
+only with enough samples to support it. Record cumulative allocations, live heap,
+and operation memory separately. Prepare fixtures outside a fresh measured process
+for RSS comparisons and include Git children where possible; label unavailable
+measurements. Record repository growth and transmitted bytes separately.
+
+**Attribution:** time SQL analysis/execution, snapshot loading, validation, codecs,
+tree construction, object writes, publication lock wait/hold, ref update, and
+transport. Count decoded rows, visited/reused nodes, bytes read/copied/written,
+and actual newly created objects separately from attempted blob writes. Use Go
+CPU/allocation profiles and execution traces, Git Trace2, and targeted OS I/O
+tracing where needed. Keep profiler runs separate from headline timings.
+
+**Ranked optimization hypotheses from the current implementation:**
+
+1. **Make SQL work proportional to touched data.** `StartTransaction` loads every
+   table, `StatementBegin` clones a whole table, and a dirty `CommitTransaction`
+   rebuilds all tables. Evaluate per-table dirty/root tracking and undo records for
+   touched keys first, preserving failed-statement rollback and no-op behavior.
+   Then evaluate lazy table loading and a transaction overlay of edits/deletions
+   over immutable roots. Reuse unchanged roots and M4.1 iterators/builders before
+   implementing incremental rechunking. Snapshot loading itself must also become
+   lazy or reused to remove database-size cost from warm point reads.
+2. **Expose primary-key lookup to SQL.** Prolly point lookup exists, but the SQL
+   adapter scans through `PartitionRows`, which sorts and clones all rows. Evaluate
+   equality lookup pushdown and lazy result iteration, verified through query
+   plans and node/row counters. Preserve type/collation semantics. The current
+   length-prefixed textual key encoding is not generally SQL-order-preserving;
+   range pushdown requires a separate ordering design or explicit supported subset.
+3. **Keep network latency out of local publication locks.** `pushExpected` holds
+   the publication lock throughout `git push`. Evaluate capturing/checking the
+   immutable candidate under lock and pushing that exact candidate after release.
+   A concurrent local descendant must remain outgoing work; remote races still
+   require bounded reconciliation and accurate status. Preserve candidate
+   reachability. Separately profile moving immutable commit preparation outside
+   the lock, accounting for GC and crash recovery. Keep expected-head checks and
+   repository-wide conflict semantics; shortening locks does not eliminate stale
+   transaction conflicts.
+4. **Remove object-buffer copies before changing codecs.** `ReadObjects` buffers
+   the full batch output before parsing blobs, and publication copies retained
+   bytes. Evaluate streaming pipes, explicit immutable buffer ownership, lazy
+   object access, and byte-budgeted caches. The current 128-entry validation cache
+   bounds entry count, not bytes. Do not expose mutable shared buffers or make a
+   cache authoritative. A persistent Git reader may benefit a long-lived embedded
+   engine without requiring a daemon for CLI users.
+5. **Exploit equal hashes below the table root.** If sparse traversal remains
+   significant, explore skipping equal Prolly subtrees in merges and updates.
+   Align key intervals when chunk boundaries differ; measure nodes visited versus
+   changed key ranges without promising O(changes) for arbitrary rechunking.
+6. **Separate process batching from durable I/O batching.** One `hash-object`
+   invocation still creates temporary inputs and writes loose objects under the
+   configured fsync policy. Measure temporary-file, object, tree/index, and fsync
+   costs before considering pack-oriented ingestion or reuse of Git subtrees.
+   Lower process counts alone do not prove lower disk costs. WALs, group commit,
+   binary-format changes, and a replacement Git backend require separate proposals.
+
+**Implementation scope and exit:** establish the baseline first, then select and
+implement the two or three largest avoidable costs supported by profiles. Measure
+each independently and publish before/after results, raw samples, and profiles.
+Add structural regression checks for unrelated rows decoded, tables rebuilt,
+bytes copied, and lock scope alongside repeatable performance checks. Run the full
+tests, race tests, build, and diff checks from M4.1; retain publication, corruption,
+isolation, merge, and recovery coverage. Document a practical workload envelope
+and latency expectations. Rank remaining ideas by evidence, benefit, and risk for
+M5/M6 instead of opening an unbounded series of performance milestones. Proceed
+to M5 to validate these assumptions with real applications.
+
 ### M5 — Complete the accepted integration and prove the tool-author experience
 
-- Build on the M4.1 measurements and documented workload bounds.
+- Build on the M4.2 database baseline and workload bounds; use the examples to
+  validate or revise its assumptions.
 - Connect M4 reconciliation to the Git integration established in M0/M3, with no
   long-running RepoDB service required just to transport refs.
 - Build a small embedded issue-tracker example and a second namespace for agent
@@ -413,8 +523,8 @@ Git object storage or merging; neither user manages database snapshots.
 - Measure append-heavy traces and mutable issue/board data: commit latency,
   query latency, memory use, repository growth, and synchronization cost.
 - Optimize tree mutation, Git object access, and caches from those measurements.
-  Carry forward only explicitly documented M4.1 deferrals for validation caching
-  and batched object writes; do not defer root reuse or streaming merge implicitly.
+  Carry forward the ranked M4.2 backlog for incremental mutation, subtree diff,
+  memory/I/O improvements, or format/backend changes, with measured justification.
 - Add fault injection, corruption handling, fuzzing, retention/compaction policy,
   and a supported authentication/TLS model for standalone network use.
 
@@ -423,13 +533,16 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Proceed to M5 on the optimized merge foundation. Build the tool-author examples
-and complete integration coverage for worktrees, concurrent embedded/server use,
-read-only and partial synchronization failures, while retaining explicit sync as
-the visible reconciliation boundary and the measured small-database scope.
+Complete M4.2 before M5: characterize SQL reads/writes, transactions, complete
+sync, contention, memory, and repository aging. Attribute the dominant costs and
+implement two or three bounded fixes, prioritizing work that scales with unrelated
+data or holds local publication behind network I/O. Publish the workload envelope
+and ranked backlog, then proceed to M5. Preserve explicit sync and durability.
 
 ## References
 
+- [Go profiling and tracing](https://go.dev/doc/diagnostics)
+- [Git Trace2 performance instrumentation](https://git-scm.com/docs/api-trace2)
 - [Git clone behavior](https://git-scm.com/docs/git-clone)
 - [Git push and refspec selection](https://git-scm.com/docs/git-push)
 - [Git hooks and their execution points](https://git-scm.com/docs/githooks)
