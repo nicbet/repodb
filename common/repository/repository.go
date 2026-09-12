@@ -119,14 +119,15 @@ type Snapshot struct {
 }
 
 type Writer struct {
-	repo      *Repository
-	base      *Snapshot
-	expected  string
-	objects   map[storage.Hash][]byte
-	retained  map[storage.Hash]struct{}
-	parents   []string
-	committed bool
-	mu        sync.RWMutex
+	repo       *Repository
+	base       *Snapshot
+	expected   string
+	objects    map[storage.Hash][]byte
+	objectOIDs map[storage.Hash]string
+	retained   map[storage.Hash]struct{}
+	parents    []string
+	committed  bool
+	mu         sync.RWMutex
 }
 
 // Init creates the initial empty catalog commit. It is idempotent when the data
@@ -147,7 +148,7 @@ func Init(ctx context.Context, start string) (*Repository, error) {
 	if legacyExists(repo.Dir) {
 		return nil, fmt.Errorf("%w; run repodb import-legacy or move it aside before initialization", ErrLegacyLayout)
 	}
-	w := &Writer{repo: repo, objects: make(map[storage.Hash][]byte)}
+	w := &Writer{repo: repo, objects: make(map[storage.Hash][]byte), objectOIDs: make(map[storage.Hash]string)}
 	if _, err := w.Commit(ctx, Manifest{DefaultDatabase: "repodb", Tables: map[string]Table{}}); err != nil {
 		if errors.Is(err, ErrConflict) {
 			if _, openErr := repo.Current(ctx); openErr == nil {
@@ -160,23 +161,33 @@ func Init(ctx context.Context, start string) (*Repository, error) {
 }
 
 func Open(ctx context.Context, start string) (*Repository, error) {
+	repo, _, err := OpenWithSnapshot(ctx, start)
+	return repo, err
+}
+
+// OpenWithSnapshot opens RepoDB and returns the validated current repository
+// snapshot so callers can reuse the load instead of immediately reading it
+// again.
+func OpenWithSnapshot(ctx context.Context, start string) (*Repository, *Snapshot, error) {
 	repo, err := discover(ctx, start)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if _, err := repo.git.ResolveRef(ctx, repo.Root, DataRef); err != nil {
+	commit, err := repo.git.ResolveRef(ctx, repo.Root, DataRef)
+	if err != nil {
 		if errors.Is(err, repodbgit.ErrRefNotFound) {
 			if legacyExists(repo.Dir) {
-				return nil, fmt.Errorf("%w; run repodb import-legacy", ErrLegacyLayout)
+				return nil, nil, fmt.Errorf("%w; run repodb import-legacy", ErrLegacyLayout)
 			}
-			return nil, ErrNotInitialized
+			return nil, nil, ErrNotInitialized
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	if _, err := repo.Current(ctx); err != nil {
-		return nil, err
+	snapshot, err := repo.loadSnapshot(ctx, commit)
+	if err != nil {
+		return nil, nil, err
 	}
-	return repo, nil
+	return repo, snapshot, nil
 }
 
 // Discover locates repository-wide RepoDB state without requiring an initialized
@@ -205,6 +216,13 @@ func discover(ctx context.Context, start string) (*Repository, error) {
 func (r *Repository) CacheDir() string {
 	return filepath.Join(r.CommonDir, "repodb", "cache", fmt.Sprintf("v%d", FormatVersion))
 }
+
+// Identity is stable for repository-scoped caches and includes the object
+// format so cache entries cannot cross incompatible Git repositories.
+func (r *Repository) Identity() string { return r.CommonDir + "\x00" + r.ObjectFormat }
+
+// RepositoryIdentity identifies the repository that owns this snapshot.
+func (s *Snapshot) RepositoryIdentity() string { return s.repo.Identity() }
 
 func (r *Repository) Current(ctx context.Context) (*Snapshot, error) {
 	commit, err := r.git.ResolveRef(ctx, r.Root, DataRef)
@@ -266,6 +284,16 @@ func (p *LockedPublication) FastForward(ctx context.Context, expected, target st
 	if err != nil {
 		return nil, err
 	}
+	return p.FastForwardSnapshot(ctx, expected, snapshot)
+}
+
+// FastForwardSnapshot advances to a snapshot already loaded and validated by
+// the caller, while retaining the publication-time expected-head check.
+func (p *LockedPublication) FastForwardSnapshot(ctx context.Context, expected string, snapshot *Snapshot) (*Snapshot, error) {
+	if snapshot == nil || snapshot.repo != p.repo {
+		return nil, errors.New("fast-forward snapshot belongs to a different repository")
+	}
+	target := snapshot.Commit
 	actual, err := p.Head(ctx)
 	if err != nil {
 		return nil, err
@@ -303,10 +331,11 @@ func (r *Repository) Begin(ctx context.Context) (*Writer, error) {
 		return nil, err
 	}
 	return &Writer{
-		repo:     r,
-		base:     base,
-		expected: base.Commit,
-		objects:  make(map[storage.Hash][]byte),
+		repo:       r,
+		base:       base,
+		expected:   base.Commit,
+		objects:    make(map[storage.Hash][]byte),
+		objectOIDs: make(map[storage.Hash]string),
 	}, nil
 }
 
@@ -317,12 +346,26 @@ func (r *Repository) BeginMerge(ctx context.Context, local, remote string) (*Wri
 	if err != nil {
 		return nil, err
 	}
-	if _, err := r.loadSnapshot(ctx, remote); err != nil {
+	other, err := r.loadSnapshot(ctx, remote)
+	if err != nil {
 		return nil, err
 	}
+	return r.BeginMergeSnapshots(base, other)
+}
+
+// BeginMergeSnapshots creates a merge writer from snapshots already loaded and
+// validated by the caller. Both snapshots must belong to this repository and
+// their immutable commit IDs become the expected head and merge parents.
+func (r *Repository) BeginMergeSnapshots(local, remote *Snapshot) (*Writer, error) {
+	if local == nil || remote == nil {
+		return nil, errors.New("local and remote merge snapshots are required")
+	}
+	if local.repo != r || remote.repo != r {
+		return nil, errors.New("merge snapshots belong to a different repository")
+	}
 	return &Writer{
-		repo: r, base: base, expected: local,
-		objects: make(map[storage.Hash][]byte), parents: []string{local, remote},
+		repo: r, base: local, expected: local.Commit,
+		objects: make(map[storage.Hash][]byte), objectOIDs: make(map[storage.Hash]string), parents: []string{local.Commit, remote.Commit},
 	}, nil
 }
 
@@ -359,6 +402,41 @@ func (w *Writer) Get(ctx context.Context, hash storage.Hash) ([]byte, error) {
 	return w.base.Store().Get(ctx, hash)
 }
 
+// ImportObjects makes selected immutable objects from another validated
+// snapshot available to this writer. Objects already present in the local base
+// are retained by identity; only missing bytes are copied, and their existing
+// Git object IDs are reused during publication.
+func (w *Writer) ImportObjects(ctx context.Context, source *Snapshot, hashes []storage.Hash) error {
+	if source == nil || source.repo != w.repo {
+		return errors.New("import snapshot belongs to a different repository")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.committed {
+		return errors.New("snapshot writer is already committed")
+	}
+	for _, hash := range hashes {
+		if !hash.Valid() {
+			return fmt.Errorf("invalid imported object hash %q", hash)
+		}
+		if w.base != nil {
+			if _, ok := w.base.objectSet[hash]; ok {
+				continue
+			}
+		}
+		if _, ok := w.objects[hash]; ok {
+			continue
+		}
+		data, err := source.Store().Get(ctx, hash)
+		if err != nil {
+			return err
+		}
+		w.objects[hash] = data
+		w.objectOIDs[hash] = source.objectOIDs[hash]
+	}
+	return nil
+}
+
 // RetainOnly bounds the next snapshot inventory to the supplied object graph.
 // Callers must include schema roots, data roots, and every descendant.
 func (w *Writer) RetainOnly(hashes []storage.Hash) error {
@@ -393,6 +471,10 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 	}
 	w.committed = true
 	newObjects := cloneObjects(w.objects)
+	newObjectOIDs := make(map[storage.Hash]string, len(w.objectOIDs))
+	for hash, oid := range w.objectOIDs {
+		newObjectOIDs[hash] = oid
+	}
 	retained := w.retained
 	w.mu.Unlock()
 
@@ -446,9 +528,30 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 	defer release()
 
 	entries := make([]repodbgit.TreeEntry, 0, len(all)+1)
-	manifestOID, err := w.repo.git.HashObject(ctx, w.repo.Root, manifestData)
+	missing := make([]storage.Hash, 0, len(manifest.Objects))
+	writeData := make([][]byte, 0, len(manifest.Objects)+1)
+	writeData = append(writeData, manifestData)
+	for _, hash := range manifest.Objects {
+		oid := ""
+		if w.base != nil {
+			oid = w.base.objectOIDs[hash]
+		}
+		if oid == "" {
+			oid = newObjectOIDs[hash]
+		}
+		if oid == "" {
+			missing = append(missing, hash)
+			writeData = append(writeData, all[hash])
+		}
+	}
+	oids, err := w.repo.git.HashObjects(ctx, w.repo.Root, filepath.Join(w.repo.CommonDir, "repodb", "tmp"), writeData)
 	if err != nil {
 		return result, err
+	}
+	manifestOID := oids[0]
+	writtenOIDs := make(map[storage.Hash]string, len(missing))
+	for i, hash := range missing {
+		writtenOIDs[hash] = oids[i+1]
 	}
 	entries = append(entries, repodbgit.TreeEntry{Path: "manifest.json", ObjectID: manifestOID})
 	for _, hash := range manifest.Objects {
@@ -457,10 +560,10 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 			oid = w.base.objectOIDs[hash]
 		}
 		if oid == "" {
-			oid, err = w.repo.git.HashObject(ctx, w.repo.Root, all[hash])
-			if err != nil {
-				return result, err
-			}
+			oid = newObjectOIDs[hash]
+		}
+		if oid == "" {
+			oid = writtenOIDs[hash]
 		}
 		entries = append(entries, repodbgit.TreeEntry{Path: objectPath(hash), ObjectID: oid})
 	}

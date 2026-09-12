@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +15,25 @@ import (
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/vitess/go/mysql"
+	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
+	"github.com/nicbet/repodb/common/storage"
 )
+
+const snapshotValidationVersion = 1
+
+var validatedSnapshots = struct {
+	sync.Mutex
+	entries map[string]*list.Element
+	order   *list.List
+}{entries: make(map[string]*list.Element), order: list.New()}
+
+const maxValidatedSnapshots = 128
+
+type validationCacheEntry struct {
+	key          string
+	tableObjects map[string][]storage.Hash
+}
 
 type Engine struct {
 	repo     *repository.Repository
@@ -64,12 +82,55 @@ func New(repo *repository.Repository) (*Engine, error) {
 // ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
 // and primary-key encoding before integration publishes a fetched snapshot.
 func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error {
+	if snapshot == nil {
+		return errors.New("snapshot is required")
+	}
+	key := fmt.Sprintf("%s\x00%s\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshotValidationVersion)
+	validatedSnapshots.Lock()
+	if element := validatedSnapshots.entries[key]; element != nil {
+		validatedSnapshots.order.MoveToFront(element)
+		validatedSnapshots.Unlock()
+		return nil
+	}
+	validatedSnapshots.Unlock()
+	tableObjects := make(map[string][]storage.Hash, len(snapshot.Manifest.Tables))
 	for name, table := range snapshot.Manifest.Tables {
 		if _, err := loadTable(ctx, snapshot.Store(), table); err != nil {
 			return fmt.Errorf("validate SQL table %s: %w", name, err)
 		}
+		hashes, err := prolly.Reachable(ctx, snapshot.Store(), table.DataRoot)
+		if err != nil {
+			return fmt.Errorf("validate SQL table %s reachability: %w", name, err)
+		}
+		tableObjects[name] = append([]storage.Hash{table.SchemaRoot}, hashes...)
 	}
+	validatedSnapshots.Lock()
+	if element := validatedSnapshots.entries[key]; element != nil {
+		validatedSnapshots.order.MoveToFront(element)
+	} else {
+		entry := validationCacheEntry{key: key, tableObjects: tableObjects}
+		validatedSnapshots.entries[key] = validatedSnapshots.order.PushFront(entry)
+		if validatedSnapshots.order.Len() > maxValidatedSnapshots {
+			oldest := validatedSnapshots.order.Back()
+			delete(validatedSnapshots.entries, oldest.Value.(validationCacheEntry).key)
+			validatedSnapshots.order.Remove(oldest)
+		}
+	}
+	validatedSnapshots.Unlock()
 	return nil
+}
+
+func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]storage.Hash, bool) {
+	key := fmt.Sprintf("%s\x00%s\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshotValidationVersion)
+	validatedSnapshots.Lock()
+	defer validatedSnapshots.Unlock()
+	element := validatedSnapshots.entries[key]
+	if element == nil {
+		return nil, false
+	}
+	validatedSnapshots.order.MoveToFront(element)
+	hashes, ok := element.Value.(validationCacheEntry).tableObjects[table]
+	return append([]storage.Hash(nil), hashes...), ok
 }
 
 func (e *Engine) Repository() *repository.Repository { return e.repo }

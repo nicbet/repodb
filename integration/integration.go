@@ -86,7 +86,7 @@ func Enable(ctx context.Context, start, remote string) (Status, error) {
 		}
 		if localHead == "" {
 			err = repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
-				_, err := publication.FastForward(ctx, "", remoteHead)
+				_, err := publication.FastForwardSnapshot(ctx, "", remoteSnapshot)
 				return err
 			})
 			if err != nil {
@@ -129,7 +129,7 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	if !slices.Contains(values, spec) {
 		return Status{}, fmt.Errorf("%w: run repodb enable --remote %s", ErrNotEnabled, remote)
 	}
-	repo, err := repository.Open(ctx, info.TopLevel)
+	repo, openedSnapshot, err := repository.OpenWithSnapshot(ctx, info.TopLevel)
 	if err != nil {
 		return Status{}, err
 	}
@@ -147,18 +147,18 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 			last.Action = "fetch-failed"
 			return last, err
 		}
-		if remoteExists {
-			remoteSnapshot, err := repo.SnapshotAt(ctx, tracking)
-			if err != nil {
-				return last, fmt.Errorf("validate fetched RepoDB snapshot: %w", err)
-			}
-			if err := engine.ValidateSnapshot(ctx, remoteSnapshot); err != nil {
-				return last, fmt.Errorf("validate fetched RepoDB SQL graph: %w", err)
-			}
-		}
-
 		if !remoteExists || localHead == remoteHead {
 			if localHead == remoteHead {
+				localSnapshot := openedSnapshot
+				if localSnapshot == nil || localSnapshot.Commit != localHead {
+					localSnapshot, err = repo.SnapshotAt(ctx, localHead)
+					if err != nil {
+						return last, fmt.Errorf("validate local RepoDB snapshot: %w", err)
+					}
+				}
+				if err := engine.ValidateSnapshot(ctx, localSnapshot); err != nil {
+					return last, fmt.Errorf("validate local RepoDB SQL graph: %w", err)
+				}
 				last.Action = "up-to-date"
 				if err := clearConflictSet(repo, remote); err != nil {
 					last.Action = "conflict-cleanup-failed"
@@ -210,8 +210,15 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 			return last, err
 		}
 		if localBehind {
+			remoteSnapshot, err := repo.SnapshotAt(ctx, remoteHead)
+			if err != nil {
+				return last, fmt.Errorf("validate fetched RepoDB snapshot: %w", err)
+			}
+			if err := engine.ValidateSnapshot(ctx, remoteSnapshot); err != nil {
+				return last, fmt.Errorf("validate fetched RepoDB SQL graph: %w", err)
+			}
 			err = repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
-				_, err := publication.FastForward(ctx, localHead, remoteHead)
+				_, err := publication.FastForwardSnapshot(ctx, localHead, remoteSnapshot)
 				return err
 			})
 			if errors.Is(err, repository.ErrConflict) {
@@ -238,15 +245,26 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 		if err != nil {
 			return last, err
 		}
-		localSnapshot, err := repo.SnapshotAt(ctx, localHead)
-		if err != nil {
-			return last, err
+		localSnapshot := openedSnapshot
+		if localSnapshot == nil || localSnapshot.Commit != localHead {
+			localSnapshot, err = repo.SnapshotAt(ctx, localHead)
+			if err != nil {
+				return last, err
+			}
 		}
 		remoteSnapshot, err := repo.SnapshotAt(ctx, remoteHead)
 		if err != nil {
 			return last, err
 		}
-		writer, err := repo.BeginMerge(ctx, localHead, remoteHead)
+		for _, item := range []struct {
+			label    string
+			snapshot *repository.Snapshot
+		}{{"base", baseSnapshot}, {"local", localSnapshot}, {"remote", remoteSnapshot}} {
+			if err := engine.ValidateSnapshot(ctx, item.snapshot); err != nil {
+				return last, fmt.Errorf("validate %s RepoDB SQL graph: %w", item.label, err)
+			}
+		}
+		writer, err := repo.BeginMergeSnapshots(localSnapshot, remoteSnapshot)
 		if err != nil {
 			return last, err
 		}

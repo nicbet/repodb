@@ -100,6 +100,78 @@ startup overhead for large merges.
 4. Measure complete local-remote synchronization, conflict-heavy workloads,
    validation caching, repository growth, and peak resident memory.
 
-The engine and integration test suites passed after adding the benchmark. The
-full test suite could not run its MySQL wire tests in the restricted benchmark
-environment because binding a loopback socket was not permitted.
+## M4.1 results
+
+Measured 2026-09-12 on Darwin/arm64 with an Apple M1 Max and Go 1.27.1.
+These timings are not directly comparable with the Linux/amd64 baseline above;
+the allocation profiles and eliminated work identify the effect of the changes.
+
+M4.1 now retains selected schema and data roots, reuses caller-supplied validated
+snapshots, streams three ordered tree iterators into a canonical sorted builder,
+caches successful SQL validation for 128 immutable repository/commit/version
+keys, and writes new Git blobs in one batch. The iterator retains at most one
+decoded node per input tree level and the builder at most one bounded chunk per
+output level. Loaded snapshot object buffers, output objects, and accumulated
+conflicts remain separately proportional to their inputs; the complete sync is
+therefore not claimed to use constant memory.
+
+The original microbenchmark command (500 ms, three samples) produced these
+medians after M4.1:
+
+| Rows | Sparse changes | Sparse allocations | Unchanged table | Unchanged allocations | Git processes/op |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 3.51 ms | 2.35 MB | 19.0 us | 135 KB | 0 |
+| 10,000 | 34.5 ms | 24.2 MB | 177 us | 1.47 MB | 0 |
+| 50,000 | 160 ms | 120 MB | 973 us | 7.35 MB | 0 |
+
+The unchanged path no longer decodes or rebuilds rows. Its remaining allocation
+growth is the selected table's cached reachable-object inventory copied into the
+result set. Sparse merge allocation is still linear because all three validated
+snapshots keep object bytes in memory, the output writer keeps new objects until
+publication, and JSON decoding allocates row values. M6 should target those
+buffers if larger supported workloads require it.
+
+### Complete local-remote synchronization
+
+`integration/sync_bench_test.go` uses a local bare remote and two clones. Fixture
+creation, state reset, and repository-size inspection are outside the timer;
+fetch, merge/conflict handling, publication, push, and the confirming fetch are
+inside it. These are one-operation warm-cache measurements without real network
+latency. Allocated bytes are cumulative. Peak RSS is the isolated benchmark
+process high-water mark and includes fixture construction. Repository growth is
+the local `.git` size delta and can include Git bookkeeping in addition to blobs.
+
+| Workload | Time | Allocated | Peak RSS | Git processes | Object writes | Repository growth |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Up-to-date, 1,000 rows | 160 ms | 0.93 MB | 57.7 MB | 17 | 0 | 0 |
+| Sparse, 1,000 rows | 748 ms | 7.87 MB | 58.1 MB | 42 | 14 | 28.7 KB |
+| Sparse, 10,000 rows | 1.97 s | 78.0 MB | 67.6 MB | 42 | 129 | 306 KB |
+| Sparse, 50,000 rows | 6.09 s | 371 MB | 129 MB | 42 | 637 | 1.52 MB |
+| Remote-selected table, 1,000 rows | 469 ms | 5.86 MB | 58.7 MB | 42 | 1 | 4.93 KB |
+| 50 tables, only one changed | 734 ms | 8.57 MB | 59.9 MB | 42 | 14 | 29.4 KB |
+| Conflict plus resolution, 1,000 rows | 774 ms | 12.0 MB | 55.9 MB | 73 | 15 | 14.5 KB |
+| One rejected-push retry, 1,000 rows | 1.06 s | 8.00 MB | 58.7 MB | 48 | 14 | 28.7 KB |
+
+Run the complete path benchmarks with:
+
+```sh
+go test ./integration -run '^$' \
+  -bench '^(BenchmarkSyncUpToDateWarm|BenchmarkSyncDivergent)$' \
+  -benchmem -benchtime=1x -count=1
+```
+
+Run each sub-benchmark in a separate process when comparing peak RSS; `ru_maxrss`
+is a process-wide high-water mark. Cold opens deliberately reconstruct and
+validate snapshots from Git. Warm repeated validation is bounded by repository
+identity, immutable commit ID, and validation version; eviction or process exit
+falls back to full validation. Batch writes retain Git's `core.fsync=committed`
+and `core.fsyncMethod=fsync` settings and do not delay publication durability.
+
+The measurements retain the existing small-database support statement. In
+particular, the full 50,000-row local synchronization still allocates 371 MB
+cumulatively and takes about six seconds on this machine, so the microbenchmark
+improvement alone does not justify broadening the workload claim.
+
+The complete Go suite, including MySQL loopback tests, passed in an environment
+where loopback binding was allowed. The repository, engine, and integration race
+tests, both production builds, and `git diff --check` also passed.

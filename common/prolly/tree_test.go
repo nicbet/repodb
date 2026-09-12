@@ -52,3 +52,66 @@ func TestBuildRejectsDuplicateKeys(t *testing.T) {
 		t.Fatal("expected duplicate-key error")
 	}
 }
+
+func TestSortedBuilderMatchesBuildAndIterator(t *testing.T) {
+	ctx := context.Background()
+	for _, count := range []int{0, 1, 31, 32, 127, 128, 129, 300, 10_000} {
+		t.Run(fmt.Sprintf("entries=%d", count), func(t *testing.T) {
+			entries := make([]prolly.Entry, count)
+			for i := range entries {
+				entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%08d", i)), Value: []byte(fmt.Sprintf("value-%08d", i))}
+			}
+			store := storage.NewMemory()
+			want, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			builder, err := prolly.NewSortedBuilder(ctx, store, prolly.DefaultOptions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if err := builder.Add(entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := builder.Finish()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Root() != want.Root() {
+				t.Fatalf("roots differ: got %s want %s", got.Root(), want.Root())
+			}
+			iterator, err := got.Iterator(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer iterator.Close()
+			for i, wantEntry := range entries {
+				entry, ok, err := iterator.Next()
+				if err != nil || !ok {
+					t.Fatalf("entry %d: ok=%v err=%v", i, ok, err)
+				}
+				if string(entry.Key) != string(wantEntry.Key) || string(entry.Value) != string(wantEntry.Value) {
+					t.Fatalf("entry %d = %q/%q, want %q/%q", i, entry.Key, entry.Value, wantEntry.Key, wantEntry.Value)
+				}
+			}
+			if _, ok, err := iterator.Next(); err != nil || ok {
+				t.Fatalf("iterator end: ok=%v err=%v", ok, err)
+			}
+		})
+	}
+}
+
+func TestSortedBuilderRejectsUnorderedEntries(t *testing.T) {
+	builder, err := prolly.NewSortedBuilder(context.Background(), storage.NewMemory(), prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Add(prolly.Entry{Key: []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.Add(prolly.Entry{Key: []byte("a")}); err == nil {
+		t.Fatal("expected unordered-entry error")
+	}
+}

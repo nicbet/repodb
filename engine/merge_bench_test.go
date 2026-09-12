@@ -112,6 +112,11 @@ func benchmarkMergeFixture(b *testing.B, rows int) *mergeFixture {
 	_ = session.Close()
 	_ = eng.Close()
 	runBenchmarkGit(b, root, "update-ref", repository.DataRef, local.Commit, remote.Commit)
+	for _, snapshot := range []*repository.Snapshot{base, local, remote} {
+		if err := engine.ValidateSnapshot(ctx, snapshot); err != nil {
+			b.Fatal(err)
+		}
+	}
 
 	actual, loaded := mergeFixtures.LoadOrStore(rows, &mergeFixture{root: root, repo: repo, base: base, local: local, remote: remote})
 	if loaded {
@@ -155,7 +160,7 @@ func BenchmarkMergeSnapshotsSparseChanges(b *testing.B) {
 			repodbgit.ResetProcessCount()
 			b.ResetTimer()
 			for range b.N {
-				writer, err := fixture.repo.BeginMerge(ctx, fixture.local.Commit, fixture.remote.Commit)
+				writer, err := fixture.repo.BeginMergeSnapshots(fixture.local, fixture.remote)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -179,7 +184,7 @@ func BenchmarkMergeSnapshotsUnchangedTable(b *testing.B) {
 			repodbgit.ResetProcessCount()
 			b.ResetTimer()
 			for range b.N {
-				writer, err := fixture.repo.BeginMerge(ctx, fixture.local.Commit, fixture.remote.Commit)
+				writer, err := fixture.repo.BeginMergeSnapshots(fixture.local, fixture.remote)
 				if err != nil {
 					b.Fatal(err)
 				}

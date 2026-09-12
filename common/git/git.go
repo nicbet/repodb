@@ -19,9 +19,12 @@ import (
 )
 
 var processCount atomic.Uint64
+var objectWriteCount atomic.Uint64
 
-func ProcessCount() uint64 { return processCount.Load() }
-func ResetProcessCount()   { processCount.Store(0) }
+func ProcessCount() uint64     { return processCount.Load() }
+func ResetProcessCount()       { processCount.Store(0) }
+func ObjectWriteCount() uint64 { return objectWriteCount.Load() }
+func ResetObjectWriteCount()   { objectWriteCount.Store(0) }
 
 type CLI struct{}
 
@@ -183,7 +186,43 @@ func (CLI) HashObject(ctx context.Context, root string, data []byte) (string, er
 	if err != nil {
 		return "", fmt.Errorf("write Git blob: %w", err)
 	}
+	objectWriteCount.Add(1)
 	return strings.TrimSpace(out), nil
+}
+
+// HashObjects writes blobs in one Git process and returns their object IDs in
+// input order. Temporary input files are not part of the repository and Git's
+// configured committed-object fsync policy still applies to the object writes.
+func (CLI) HashObjects(ctx context.Context, root, tempRoot string, objects [][]byte) ([]string, error) {
+	if len(objects) == 0 {
+		return nil, nil
+	}
+	if err := os.MkdirAll(tempRoot, 0o755); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(tempRoot, "hash-input-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	paths := make([]string, len(objects))
+	for i, data := range objects {
+		path := filepath.Join(dir, fmt.Sprintf("%08d", i))
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return nil, err
+		}
+		paths[i] = path
+	}
+	out, err := run(ctx, root, []byte(strings.Join(paths, "\n")+"\n"), nil, durableArgs("hash-object", "-w", "--stdin-paths")...)
+	if err != nil {
+		return nil, fmt.Errorf("batch write Git objects: %w", err)
+	}
+	oids := strings.Fields(out)
+	if len(oids) != len(objects) {
+		return nil, fmt.Errorf("batch write returned %d object IDs for %d objects", len(oids), len(objects))
+	}
+	objectWriteCount.Add(uint64(len(objects)))
+	return oids, nil
 }
 
 func (CLI) WriteTree(ctx context.Context, root, commonDir string, entries []TreeEntry) (string, error) {

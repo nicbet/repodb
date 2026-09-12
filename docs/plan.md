@@ -1,7 +1,8 @@
 # RepoDB implementation plan
 
-Status: M0 through M4 complete; M5 is next. Updated 2026-09-12 after implementation
-review and a passing `make test` run. Later milestones remain pending.
+Status: M0 through M4.1 complete; M5 is next. Updated 2026-09-12 after the
+[M4.1 implementation and measurements](m4-bench.md). Later milestones remain
+pending.
 
 ## Product goal
 
@@ -57,7 +58,7 @@ M0 established an explicit transport contract: enable adds a fetch refspec into
 neither push refspecs nor hooks. Ordinary `git push` does not publish database
 changes; `repodb sync` is the guaranteed database network operation. Engine open
 and new transaction boundaries inspect already fetched state without implicit
-network I/O. See [the accepted command matrix](docs/git-integration.md).
+network I/O. See [the accepted command matrix](git-integration.md).
 
 ## What exists today
 
@@ -65,10 +66,11 @@ network I/O. See [the accepted command matrix](docs/git-integration.md).
 | --- | --- | --- |
 | `server/` | MySQL listener routed through the persistent shared engine | Broaden compatibility after merge correctness |
 | `client/` | MySQL driver wrapper | Retain as optional network client |
-| `common/prolly/` | Deterministic bulk tree build, point lookup, iteration, and graph validation | Add incremental mutation and diff |
+| `common/prolly/` | Deterministic bulk tree build, point lookup, iteration, and graph validation | Add streaming sorted iteration/building in M4.1; incremental mutation later |
 | `common/storage/` | SHA-256-addressed store interface and memory/filesystem implementations | Retain interface; repository snapshots and writers provide Git-backed stores |
-| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, two-parent merge candidates, and legacy import | Retain as the durable publication boundary |
-| `common/git/` | Object/tree/commit operations, classified expected-head updates, fsync, explicit remote transport, merge-base lookup, and exact-candidate pushes | Optimize only from measurements |
+| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, two-parent merge candidates, and legacy import | Reuse validated snapshots and existing roots while preserving publication guarantees |
+| `common/git/` | Object/tree/commit operations, classified expected-head updates, fsync, explicit remote transport, merge-base lookup, and exact-candidate pushes | Remove duplicate reads; profile validation caching and batched writes in M4.1 |
+| `engine/` and `integration/` | Persistent SQL, three-way merging, explicit sync, and durable conflicts | Reduce whole-table materialization and make unchanged sync cheap |
 | CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `conflicts`, `resolve`, `start`, and network `sql` | Broaden compatibility after merge correctness |
 
 Existing tests cover tree determinism and validation, persistent embedded and
@@ -78,6 +80,11 @@ SHA-1/SHA-256 formats, legacy import, enable/sync idempotence, fast-forward
 transport, pinned transactions, disjoint offline merging, durable row/schema
 conflicts, explicit resolution, and repeat-sync idempotence. `make test` passes.
 Broader compatibility and incremental tree mutation remain pending.
+
+The later M4 benchmark passed engine and integration tests, but its restricted
+environment could not bind a loopback socket for the full MySQL wire suite. Its
+results establish merge costs, not an additional full-suite validation or a
+larger supported workload. M4.1 must run wire tests in a suitable environment.
 
 The original tracked-directory/manual-snapshot design is superseded by this plan.
 Its reusable storage and SQL pieces are a starting point, not the target contract.
@@ -128,19 +135,17 @@ atomic ref replacement alone is not a complete power-loss durability guarantee.
 Benchmark this baseline before introducing batching or a write-ahead log, which
 would change the relationship between acknowledged writes and Git-owned state.
 
-Distinguish definite rejection, successful publication, and an unknown commit
-outcome. M1 currently performs a fallible verification read after advancing the
-ref, so an error can be returned after publication succeeded. Cancellation or
-process failure during ref publication can also leave the caller uncertain.
-Define outcome reporting and recovery before exposing SQL commit semantics;
-an arbitrary commit error must not imply rollback or authorize automatic replay.
+M2 distinguishes definite rejection, successful publication, and unknown commit
+outcomes, including recovery through embedded and MySQL interfaces. Preserve this
+contract during optimization: a post-publication verification error must not
+imply rollback or authorize automatic replay.
 
-M1 retains every base-snapshot object and rereads the inventory during publication
-and validation, with individual Git processes for object access. This is a proof
-baseline, not the intended scaling behavior. M2 must define and measure a bounded
-initial workload. Build inventories from objects reachable from current catalog
-roots when SQL graph traversal exists; historical commits retain older snapshots.
-Reuse existing Git object IDs and batch object access as measurements warrant.
+M2 derives inventories from reachable catalog objects, batches Git reads, and
+reuses existing Git object IDs. Historical commits retain older snapshots.
+The remaining M4 costs are whole-table copying/rebuilding, materialized three-way
+row merges, repeated eager snapshot validation, and per-object Git writes.
+M4.1 addresses these measured costs without changing the data format, merge
+policy, explicit sync contract, or acknowledged-write durability model.
 
 ### Local concurrency and remote concurrency
 
@@ -221,7 +226,7 @@ expose partial state; source HEAD/index/worktree remain unchanged.
 
 **Status: complete (2026-09-12).** The persistent embedded engine, shared MySQL
 server path, transaction outcome recovery, process/fault tests, and bounded
-benchmark are implemented and documented in [docs/sql-m2.md](docs/sql-m2.md).
+benchmark are implemented and documented in [docs/sql-m2.md](sql-m2.md).
 The implemented SQL scope is deliberately narrow; the completed contract and
 failure checks are listed below.
 
@@ -266,7 +271,7 @@ Separate-process tests demonstrate stale-writer rejection without lost writes.
 **Status: complete (2026-09-12).** Idempotent explicit-remote enable, validated
 tracking fetches, shared-lock fast-forward synchronization, divergence
 preservation, CLI diagnostics, and pinned-transaction behavior are implemented
-and documented in [docs/sync-m3.md](docs/sync-m3.md).
+and documented in [docs/sync-m3.md](sync-m3.md).
 
 - Implement idempotent `repodb enable` based on M0's proven integration, including
   existing-state discovery and an explicit empty-database initialization path.
@@ -284,10 +289,10 @@ Enabling twice neither duplicates configuration nor starts a process.
 
 ### M4 — Reconcile independently edited clones
 
-**Status: complete (2026-09-12).** Common-ancestor three-way merging, whole-row
+**Status: functionally complete (2026-09-12).** Common-ancestor three-way merging, whole-row
 conflicts, durable inspection/resolution, supported-constraint validation,
 two-parent publication, and bounded local/remote race retries are implemented
-and documented in [docs/merge-m4.md](docs/merge-m4.md).
+and documented in [docs/merge-m4.md](merge-m4.md).
 
 - Add row/schema diffs, three-way merge, conflict inspection and resolution, and
   validation of supported constraints before advancing the live data ref.
@@ -302,8 +307,91 @@ and documented in [docs/merge-m4.md](docs/merge-m4.md).
 edits surface as conflicts, survive restart, and converge after explicit resolution.
 Repeat synchronization is idempotent and preserves both histories.
 
+### M4.1 — Close the measured merge performance gaps
+
+**Status: complete (2026-09-12).** This focused follow-up was completed before M5. Functional
+M4 acceptance remains satisfied; the [benchmark](m4-bench.md) exposes avoidable
+work that should be removed before expanding examples or workload claims.
+
+**Baseline:** on the recorded Linux/amd64 system, a 50,000-row table with disjoint
+1% edits on each side takes about 763 ms and allocates 288 MB. An unchanged table
+takes about 555 ms and allocates 163 MB. These are medians of three runs covering
+`BeginMerge` and `MergeSnapshots`, including snapshot loading. They exclude final
+Git publication and network transport. Allocated bytes are cumulative allocation,
+not peak resident memory. `BeginMerge` adds six Git processes by reloading local
+and remote snapshots. Keep this baseline reproducible at 1,000, 10,000, and
+50,000 rows; compare changes on the same machine and benchmark configuration.
+
+Implement and measure in this order:
+
+1. **Reuse selected immutable table roots.** When a selected table is already in
+   the writer's local base, retain its schema/data roots and reachable inventory
+   directly. For a remote-selected table, import only reachable objects missing
+   locally. Avoid decoding and rebuilding rows merely to copy a table. Preserve
+   validation of incoming data and complete Git reachability. Cover unchanged,
+   one-sided, identical-change, and whole-table conflict-resolution selections,
+   including multiple tables with only one changed.
+2. **Reuse loaded snapshots and check equal heads early.** Let merge writers use
+   the already validated immutable snapshots, tied to the correct repository and
+   expected parent IDs, instead of reloading them. Keep the publication-time
+   expected-head check. After fetch/ref resolution, detect equal heads before
+   eager remote loading. Repeated up-to-date sync should perform no row decoding,
+   rebuilding, or new commit creation. An equality shortcut must not substitute
+   for validation when opening or adopting an unvalidated snapshot.
+3. **Stream the ordered row merge.** Add lazy sorted Prolly iterators and a builder
+   accepting sorted entries, then merge base/local/remote in primary-key order.
+   Remove the three full row maps, all-key set, and repeated cloning/sorting from
+   the merge path. Preserve canonical roots, whole-row conflict semantics, schema
+   and constraint validation, cancellation, and iterator cleanup. Bound iterator
+   and builder buffering; report snapshot/object buffers, output, and accumulated
+   conflicts separately rather than claiming constant memory for the entire sync.
+4. **Measure the complete synchronization path.** Add benchmarks with a bare
+   remote and two clones covering unchanged sync, sparse edits, remote-selected
+   tables, many unchanged tables, and conflict-heavy edits plus resolution. Include
+   publication, fetch/push, retries, and repeated sync. Record wall time, allocated
+   bytes, peak resident memory, Git processes, object writes, and repository growth;
+   distinguish local-remote measurements from real network latency and warm-cache
+   measurements from cold opens.
+5. **Address the remaining measured I/O costs.** Profile bounded validation caching
+   by repository identity, immutable commit ID, and validation/format version,
+   plus batch Git object writes. Implement where the full-path measurements show
+   material benefit, or record evidence for deferral to M6. A cache miss, eviction,
+   or deletion must permit full reconstruction and validation from Git. Batched
+   writes must preserve object verification, required fsync ordering, and explicit
+   publication outcomes; this does not introduce delayed durability or a WAL.
+
+**Acceptance and validation:**
+
+- Retained tables keep exactly the selected schema/data roots; copying an already
+  available table performs no row rebuild or redundant blob write. Remote imports
+  remain complete after cache deletion, transfer, and GC.
+- Writer construction adds no duplicate local/remote snapshot loads or the six
+  associated Git subprocesses when supplied validated snapshots. After fetch and
+  ref resolution, an already validated equal-head sync performs no table scan;
+  measure both this repeated path and cold validation explicitly.
+- Streaming output matches the existing implementation's roots, rows, and conflict
+  decisions on deterministic fixtures, including empty tables, insert/delete,
+  conflicting updates, and schema selections. Report before/after sparse and
+  unchanged results at all three sizes, with lower allocations attributable to
+  removal of full-table intermediates. Establish measured workload limits rather
+  than an arbitrary cross-machine millisecond threshold.
+- Preserve pinned readers, stale-writer rejection, bounded local/remote retries,
+  conflict persistence/resolution, and committed/rejected/unknown outcomes. Keep
+  corruption tests for previously unseen incoming snapshots and cache-miss paths.
+- Run `go test ./...`, `go test -race ./common/repository ./engine ./integration`,
+  `make build`, and `git diff --check`, plus the benchmark command in
+  [m4-bench.md](m4-bench.md). Run MySQL wire tests where loopback binding is allowed;
+  do not count an environment-blocked run as a pass.
+
+**Exit:** steps 1–3 are implemented with regression coverage; full-sync measurements
+and before/after results are published in the benchmark documentation; step 5 has
+an implementation or an evidence-backed M6 deferral. All correctness checks pass.
+The existing small-database scope remains until the complete measurements support
+a documented change; a 50,000-row merge microbenchmark alone does not broaden it.
+
 ### M5 — Complete the accepted integration and prove the tool-author experience
 
+- Build on the M4.1 measurements and documented workload bounds.
 - Connect M4 reconciliation to the Git integration established in M0/M3, with no
   long-running RepoDB service required just to transport refs.
 - Build a small embedded issue-tracker example and a second namespace for agent
@@ -325,6 +413,8 @@ Git object storage or merging; neither user manages database snapshots.
 - Measure append-heavy traces and mutable issue/board data: commit latency,
   query latency, memory use, repository growth, and synchronization cost.
 - Optimize tree mutation, Git object access, and caches from those measurements.
+  Carry forward only explicitly documented M4.1 deferrals for validation caching
+  and batched object writes; do not defer root reuse or streaming merge implicitly.
 - Add fault injection, corruption handling, fuzzing, retention/compaction policy,
   and a supported authentication/TLS model for standalone network use.
 
@@ -333,10 +423,10 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Proceed to M5 on the completed merge foundation. Build the tool-author examples
+Proceed to M5 on the optimized merge foundation. Build the tool-author examples
 and complete integration coverage for worktrees, concurrent embedded/server use,
 read-only and partial synchronization failures, while retaining explicit sync as
-the visible reconciliation boundary.
+the visible reconciliation boundary and the measured small-database scope.
 
 ## References
 

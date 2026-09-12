@@ -47,6 +47,41 @@ type Tree struct {
 	options Options
 }
 
+// Iterator lazily walks a tree in key order. At most one node per tree level is
+// retained, so callers do not need to materialize the complete entry set.
+type Iterator struct {
+	ctx   context.Context
+	store storage.Store
+	stack []iteratorFrame
+	leaf  []Entry
+	index int
+	done  bool
+}
+
+type iteratorFrame struct {
+	node node
+	next int
+}
+
+// SortedBuilder incrementally constructs the same canonical tree as Build from
+// strictly ordered entries. It buffers at most one chunk per tree level.
+type SortedBuilder struct {
+	ctx         context.Context
+	store       storage.Store
+	options     Options
+	leaves      []Entry
+	leafRolling uint64
+	levels      []linkBuffer
+	lastKey     []byte
+	haveKey     bool
+	finished    bool
+}
+
+type linkBuffer struct {
+	links   []link
+	rolling uint64
+}
+
 func Open(store storage.Store, root storage.Hash) (*Tree, error) {
 	if store == nil {
 		return nil, errors.New("store is required")
@@ -107,7 +142,192 @@ func Build(ctx context.Context, store storage.Store, entries []Entry, options Op
 	return &Tree{store: store, root: links[0].Hash, options: options}, nil
 }
 
+// NewSortedBuilder creates a builder for entries supplied in strictly
+// increasing key order.
+func NewSortedBuilder(ctx context.Context, store storage.Store, options Options) (*SortedBuilder, error) {
+	if store == nil {
+		return nil, errors.New("store is required")
+	}
+	if err := options.validate(); err != nil {
+		return nil, err
+	}
+	return &SortedBuilder{ctx: ctx, store: store, options: options}, nil
+}
+
+// Add appends one entry. The key and value are copied before Add returns.
+func (b *SortedBuilder) Add(entry Entry) error {
+	if b.finished {
+		return errors.New("sorted builder is already finished")
+	}
+	if err := b.ctx.Err(); err != nil {
+		return err
+	}
+	if b.haveKey && bytes.Compare(b.lastKey, entry.Key) >= 0 {
+		return fmt.Errorf("entries are not strictly ordered at key %q", entry.Key)
+	}
+	item := Entry{Key: clone(entry.Key), Value: clone(entry.Value)}
+	b.leaves = append(b.leaves, item)
+	b.lastKey = clone(entry.Key)
+	b.haveKey = true
+	b.leafRolling = bits.RotateLeft64(b.leafRolling, 1) ^ entryFingerprint(item)
+	if shouldCut(len(b.leaves), b.leafRolling, b.options) {
+		return b.flushLeaf()
+	}
+	return nil
+}
+
+// Finish flushes buffered chunks and returns the completed tree.
+func (b *SortedBuilder) Finish() (*Tree, error) {
+	if b.finished {
+		return nil, errors.New("sorted builder is already finished")
+	}
+	b.finished = true
+	if err := b.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(b.leaves) != 0 {
+		if err := b.flushLeaf(); err != nil {
+			return nil, err
+		}
+	} else if !b.haveKey {
+		hash, err := writeNode(b.ctx, b.store, node{Level: 0, Entries: []Entry{}})
+		return &Tree{store: b.store, root: hash, options: b.options}, err
+	}
+	for level := 0; ; level++ {
+		if level >= len(b.levels) || len(b.levels[level].links) == 0 {
+			continue
+		}
+		if len(b.levels[level].links) == 1 && !b.hasLinksAbove(level) {
+			return &Tree{store: b.store, root: b.levels[level].links[0].Hash, options: b.options}, nil
+		}
+		if err := b.flushLinks(level); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (b *SortedBuilder) flushLeaf() error {
+	group := b.leaves
+	b.leaves = nil
+	b.leafRolling = 0
+	hash, err := writeNode(b.ctx, b.store, node{Level: 0, Entries: group})
+	if err != nil {
+		return err
+	}
+	return b.addLink(0, link{MaxKey: clone(group[len(group)-1].Key), Hash: hash})
+}
+
+func (b *SortedBuilder) addLink(level int, item link) error {
+	for len(b.levels) <= level {
+		b.levels = append(b.levels, linkBuffer{})
+	}
+	buffer := &b.levels[level]
+	buffer.links = append(buffer.links, item)
+	buffer.rolling = bits.RotateLeft64(buffer.rolling, 1) ^ linkFingerprint(item)
+	if shouldCut(len(buffer.links), buffer.rolling, b.options) {
+		return b.flushLinks(level)
+	}
+	return nil
+}
+
+func (b *SortedBuilder) flushLinks(level int) error {
+	buffer := &b.levels[level]
+	group := buffer.links
+	buffer.links = nil
+	buffer.rolling = 0
+	hash, err := writeNode(b.ctx, b.store, node{Level: uint8(level + 1), Children: group})
+	if err != nil {
+		return err
+	}
+	return b.addLink(level+1, link{MaxKey: clone(group[len(group)-1].MaxKey), Hash: hash})
+}
+
+func (b *SortedBuilder) hasLinksAbove(level int) bool {
+	for i := level + 1; i < len(b.levels); i++ {
+		if len(b.levels[i].links) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Tree) Root() storage.Hash { return t.root }
+
+// Iterator returns a lazy ordered iterator positioned before the first entry.
+func (t *Tree) Iterator(ctx context.Context) (*Iterator, error) {
+	it := &Iterator{ctx: ctx, store: t.store}
+	if err := it.descend(t.root); err != nil {
+		return nil, err
+	}
+	return it, nil
+}
+
+// Next returns the next entry, or ok=false at end of input. Returned bytes are
+// owned by the caller and remain valid after subsequent calls.
+func (it *Iterator) Next() (entry Entry, ok bool, err error) {
+	if it.done {
+		return Entry{}, false, nil
+	}
+	if err := it.ctx.Err(); err != nil {
+		it.Close()
+		return Entry{}, false, err
+	}
+	for {
+		if it.index < len(it.leaf) {
+			entry := it.leaf[it.index]
+			it.index++
+			return entry, true, nil
+		}
+		if err := it.advance(); err != nil {
+			it.Close()
+			return Entry{}, false, err
+		}
+		if it.done {
+			return Entry{}, false, nil
+		}
+	}
+}
+
+// Close releases iterator buffers. It is safe to call more than once.
+func (it *Iterator) Close() error {
+	it.stack = nil
+	it.leaf = nil
+	it.done = true
+	return nil
+}
+
+func (it *Iterator) descend(hash storage.Hash) error {
+	for {
+		n, err := readNode(it.ctx, it.store, hash)
+		if err != nil {
+			return err
+		}
+		if n.Level == 0 {
+			it.leaf, it.index = n.Entries, 0
+			return nil
+		}
+		if len(n.Children) == 0 {
+			return fmt.Errorf("invalid internal Prolly node %s", hash)
+		}
+		it.stack = append(it.stack, iteratorFrame{node: n, next: 1})
+		hash = n.Children[0].Hash
+	}
+}
+
+func (it *Iterator) advance() error {
+	for len(it.stack) != 0 {
+		top := &it.stack[len(it.stack)-1]
+		if top.next < len(top.node.Children) {
+			hash := top.node.Children[top.next].Hash
+			top.next++
+			return it.descend(hash)
+		}
+		it.stack = it.stack[:len(it.stack)-1]
+	}
+	it.done = true
+	it.leaf = nil
+	return nil
+}
 
 // Entries returns every entry in key order.
 func (t *Tree) Entries(ctx context.Context) ([]Entry, error) {
@@ -213,21 +433,34 @@ func (o Options) validate() error {
 
 func chunkEntries(entries []Entry, options Options) [][]Entry {
 	return chunk(len(entries), options, func(i int) uint64 {
-		h := fnv.New64a()
-		h.Write(entries[i].Key)
-		h.Write([]byte{0})
-		h.Write(entries[i].Value)
-		return h.Sum64()
+		return entryFingerprint(entries[i])
 	}, func(start, end int) []Entry { return entries[start:end] })
 }
 
 func chunkLinks(links []link, options Options) [][]link {
 	return chunk(len(links), options, func(i int) uint64 {
-		h := fnv.New64a()
-		h.Write(links[i].MaxKey)
-		h.Write([]byte(links[i].Hash))
-		return h.Sum64()
+		return linkFingerprint(links[i])
 	}, func(start, end int) []link { return links[start:end] })
+}
+
+func entryFingerprint(entry Entry) uint64 {
+	h := fnv.New64a()
+	h.Write(entry.Key)
+	h.Write([]byte{0})
+	h.Write(entry.Value)
+	return h.Sum64()
+}
+
+func linkFingerprint(item link) uint64 {
+	h := fnv.New64a()
+	h.Write(item.MaxKey)
+	h.Write([]byte(item.Hash))
+	return h.Sum64()
+}
+
+func shouldCut(size int, rolling uint64, options Options) bool {
+	mask := uint64(1)<<options.BoundaryBits - 1
+	return size >= options.MaxChunkEntries || (size >= options.MinChunkEntries && rolling&mask == 0)
 }
 
 func chunk[T any](length int, options Options, fingerprint func(int) uint64, slice func(int, int) []T) [][]T {
