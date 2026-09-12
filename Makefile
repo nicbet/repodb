@@ -8,7 +8,7 @@ test:
 	go test ./...
 
 fmt:
-	gofmt -w client cmd common server
+	gofmt -w client cmd common engine experiments integration server
 
 m0:
 	go run ./experiments/gitstorage -root /tmp/repodb-m0

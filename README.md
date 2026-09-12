@@ -1,108 +1,202 @@
 # RepoDB
 
-RepoDB is an experiment in shared database infrastructure for tools whose state
-belongs to an existing Git repository. The target is an embedded Go engine with
-an optional MySQL-compatible server, automatic persistence under dedicated Git
-refs, and synchronization configured through `repodb enable`.
+RepoDB is an embedded SQL database for Go that stores and synchronizes application data in Git, with an optional MySQL-compatible server.
 
-Database history is independent of code history. Applications control the
-embedded engine's lifecycle; `repodb start` offers a separate server when
-wanted. Enabling repository integration will not start a server.
+Build issue trackers, kanban boards, and agent tools whose data travels with a
+repository. Write data locally, work offline, and synchronize across clones.
+Database transactions persist automatically in their own Git history, leaving
+your source files, index, and code branches untouched.
 
-See [plan.md](plan.md) for the agreed requirements, proposed architecture, and
-implementation milestones. The enable/sync/start workflow is implemented.
-The M0 storage and ordinary-Git command contract is recorded in
-[docs/git-integration.md](docs/git-integration.md).
+**Early development:** persistent SQL, synchronization, and three-way merging are
+implemented. The current scope is small tool databases with a documented
+[SQL subset](docs/sql-m2.md); broader compatibility and scaling are on the roadmap.
 
-The current prototype is written in Go and combines:
+## Quickstart
 
-- `go-mysql-server` for SQL analysis, planning, and execution;
-- DoltHub's Vitess fork for MySQL syntax and the wire protocol;
-- an immutable, content-addressed Prolly tree for table data; and
-- ordinary Git commits for history, branching, transport, and collaboration.
-
-## Status
-
-M2 provides persistent SQL through an embedded Go engine and the MySQL server.
-Schemas and typed rows are stored in deterministic Prolly trees and every
-successful write transaction automatically publishes one independent Git data
-commit under `refs/repodb/data`. See [the M2 SQL contract](docs/sql-m2.md) for
-the supported SQL scope, transaction behavior, outcome recovery, and measured
-initial workload.
-
-M3 adds explicit Git transport. `repodb enable --remote <name>` configures and
-fetches a separate tracking ref, and `repodb sync --remote <name>` performs
-validated fast-forwards or M4's conservative three-way merge. Conflicts preserve
-both histories for inspection and explicit resolution. See
-[the synchronization contract](docs/sync-m3.md) and
-[the merge contract](docs/merge-m4.md).
-
-## Layout
-
-```text
-cmd/repodb/          CLI: initialize, inspect, snapshot, and query
-cmd/repodb-server/   MySQL-compatible server process
-client/              reusable MySQL wire client
-server/              go-mysql-server host and storage adapters
-engine/              embedded persistent SQL engine and table adapters
-integration/         enable and explicit fast-forward synchronization
-common/prolly/       deterministic content-defined tree construction
-common/storage/      content-addressed memory and filesystem stores
-common/repository/   durable Git snapshots, manifests, and legacy import
-common/git/          typed Git object/ref plumbing boundary
-common/query/        Vitess parser boundary
-```
-
-These are Go packages in one Go module. Keeping one module initially avoids
-cross-module release/version churn; `server`, `client`, and `common` can become
-separate Go modules later without changing their architectural boundaries.
-
-## Try it
-
-Go 1.27 or newer is expected by the current experiment.
+After [installing RepoDB](#installation), create a local demo repository and start
+the server:
 
 ```sh
-make test
-make build
-make m0 # repeat the Git integration experiment under /tmp/repodb-m0
-./bin/repodb enable --remote origin
-./bin/repodb sync --remote origin
-./bin/repodb start -repo .
+git init repodb-demo
+cd repodb-demo
+repodb init
+repodb start
 ```
 
-In a second terminal, either use any MySQL client or the included one:
+In a second terminal, create a table and query it using the included client:
 
 ```sh
-./bin/repodb sql 'SELECT 1 + 1 AS answer'
+repodb sql 'CREATE TABLE issues (id BIGINT PRIMARY KEY, title TEXT NOT NULL)'
+repodb sql "INSERT INTO issues VALUES (1, 'Ship the first version')"
+repodb sql 'SELECT * FROM issues'
+```
+
+Writes are persisted automatically. Stop and restart the server to read the same
+data. The server listens on `127.0.0.1:3306` by default; you can also connect with
+a MySQL client:
+
+```sh
 mysql --host=127.0.0.1 --port=3306 --user=root repodb
 ```
 
-Repository state now lives outside the source branch:
+### Synchronize an existing project
+
+From a Git repository with a configured remote:
 
 ```sh
-./bin/repodb status
-./bin/repodb import-legacy # only for the superseded tracked .repodb layout
+repodb enable --remote origin
+repodb sync --remote origin
 ```
 
-Snapshot publication never stages files or changes the source worktree, index,
-or branch. SQL transactions publish this separate history automatically.
+`enable` adopts existing remote database history or initializes an empty catalog
+if neither side has one. It is safe to repeat and does not start a server.
+On a fresh clone, run `enable` before creating a separate local database with
+`init`.
 
-## Git snapshot model
+`sync` fetches and publishes database changes, merging independent row edits.
+Competing edits are preserved for explicit resolution:
+
+```sh
+repodb conflicts --remote origin
+repodb resolve --remote origin --id '<conflict-id>' --take local
+```
+
+Resolution choices are `local`, `remote`, `base`, and `delete`. See the
+[merge guide](docs/merge-m4.md) for row and schema conflict behavior.
+
+**Use `repodb sync` to share database changes.** Ordinary `git push` publishes
+source branches according to your Git configuration. A successful SQL write is
+durable locally and does not imply that the remote has received it.
+
+## Installation
+
+Build from source with **Go 1.27 or newer**, Git, and Make. The current
+implementation requires POSIX file locking; the documented baseline uses macOS
+and Git 2.55. See [storage and durability assumptions](docs/storage-format.md).
+
+```sh
+git clone https://github.com/nicbet/repodb.git
+cd repodb
+make build
+export PATH="$PWD/bin:$PATH"
+```
+
+This builds `bin/repodb` and `bin/repodb-server` and adds them to the current
+shell's `PATH`. Add the absolute `bin` path to your shell configuration to keep
+them available in new terminals.
+
+For embedded Go applications, add the module to your project:
+
+```sh
+go get github.com/nicbet/repodb/engine
+```
+
+Import `github.com/nicbet/repodb/engine`, open an initialized repository with
+`engine.Open`, and create a session with `NewSession`. Embedded applications own
+the engine lifecycle and need no server or network listener. See the
+[embedded API and transaction guide](docs/sql-m2.md).
+
+You can also install the command-line programs directly:
+
+```sh
+go install github.com/nicbet/repodb/cmd/repodb@latest
+go install github.com/nicbet/repodb/cmd/repodb-server@latest
+```
+
+## Development
+
+```sh
+make build
+make test
+go test -race ./common/repository ./engine ./integration
+git diff --check
+```
+
+The test suite covers persistent SQL, embedded/MySQL interoperability, transaction
+outcome recovery, concurrent writers, Git transport, and merge conflicts.
+
+Two repeatable experiments support storage and performance work:
+
+```sh
+make m0        # Git storage and transport experiment
+make m2-bench  # Bounded SQL persistence benchmark
+```
+
+These recreate `/tmp/repodb-m0` and `/tmp/repodb-m2`, respectively. The
+[SQL guide](docs/sql-m2.md) records workload limits and benchmark results.
+
+## Design and Architecture
+
+RepoDB combines `go-mysql-server` for SQL execution, DoltHub's Vitess fork for
+MySQL parsing and protocol support, immutable Prolly trees for table data, and
+Git objects and refs for persistence and transport.
 
 ```text
-refs/repodb/data -> commit -> tree
-  manifest.json
-  objects/sha256/ab/cdef...  # immutable objects addressed by RepoDB SHA-256
+Go application          MySQL client
+      |                       |
+      |                  server/
+      +-----------+-----------+
+                  |
+               engine/
+        SQL tables and transactions
+                  |
+        common/prolly/ + common/repository/
+        Immutable data and Git snapshots
+                  |
+         refs/repodb/data
+                  |
+             integration/
+         Sync and reconciliation
+                  |
+              Git remote
 ```
 
-See [docs/storage-format.md](docs/storage-format.md) for format, integrity,
-concurrency, cache, durability, and legacy migration details.
+- **One engine, two entry points.** Embedded sessions and MySQL connections use
+  the same catalog, table adapters, and transaction implementation.
+- **Independent database history.** Each write transaction that changes state
+  publishes a data commit under `refs/repodb/data`. Git trees reference every
+  required schema and data blob so snapshots survive transport and garbage
+  collection.
+- **Snapshot isolation.** Transactions read a pinned snapshot plus their own
+  writes. Publication uses a repository-wide lock and an expected-head check;
+  stale writers receive a conflict instead of overwriting newer data.
+- **Explicit synchronization.** Remote data is fetched into separate tracking
+  refs. Sync validates incoming state, fast-forwards compatible histories, and
+  uses a three-way merge for divergence. Conflicts remain inspectable across
+  restarts.
 
-## Build sequence
+The current SQL scope supports one database namespace, explicit primary keys,
+basic DDL/DML, and a limited set of persisted types. Secondary indexes,
+auto-increment, foreign keys, and `ALTER TABLE` are not yet supported. Table
+updates use bulk rebuilds within the documented small-database workload.
 
-Follow the milestones and acceptance criteria in [plan.md](plan.md): prove Git
-storage/transport, implement durable snapshots, connect persistent embedded SQL
-and the server, explicit enable/sync, and conservative distributed row merging.
-See [the M4 merge contract](docs/merge-m4.md) for conflict inspection and
-whole-row resolution. Broader SQL compatibility and scaling work remain.
-Ordinary writes will persist automatically without user-managed Git snapshots.
+| Documentation | Covers |
+| --- | --- |
+| [SQL and embedded API](docs/sql-m2.md) | Supported types, transactions, commit recovery, and workload bounds |
+| [Storage format](docs/storage-format.md) | Snapshots, object inventories, locking, durability, and legacy import |
+| [Git integration](docs/git-integration.md) | Ref layout and ordinary Git command behavior |
+| [Synchronization](docs/sync-m3.md) | Enable, tracking refs, and transport |
+| [Merging](docs/merge-m4.md) | Three-way merge, conflict resolution, and distributed row identity |
+
+## Roadmap
+
+- [x] **M0–M1:** Git storage experiments and durable repository snapshots.
+- [x] **M2:** Persistent embedded SQL and a shared MySQL server.
+- [x] **M3:** Repository enablement and explicit synchronization.
+- [x] **M4:** Three-way merging and persistent conflict resolution.
+- [ ] **M5:** Example applications and broader integration coverage.
+- [ ] **M6:** Broader SQL compatibility, indexing, performance, and operational hardening.
+
+See [the implementation plan](docs/plan.md) for milestone scope and acceptance criteria.
+
+## Contributing
+
+Issues and pull requests are welcome. For substantial changes, open an issue to
+discuss the use case and approach first; the [implementation plan](docs/plan.md) is the
+starting point for scope and priorities.
+
+Keep pull requests focused, format changed Go files with `gofmt`, and add tests
+for behavioral changes. Run the development checks above and update the relevant
+documentation when changing SQL behavior, storage, or synchronization. Bug reports
+should include a minimal reproduction, the operating system, Go and Git versions,
+and the expected and actual behavior.
