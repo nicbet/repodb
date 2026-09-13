@@ -14,18 +14,22 @@ type PerformanceCounters struct {
 	TreeMutationNanos  uint64
 	ReachabilityNanos  uint64
 	SnapshotBuildNanos uint64
+	MetadataCacheHits  uint64
+	MetadataCacheMisses uint64
 }
 
 var performanceCounters struct {
-	rowsDecoded        atomic.Uint64
-	rowsScanned        atomic.Uint64
-	pointKeysVisited   atomic.Uint64
-	tablesRebuilt      atomic.Uint64
-	tablesReused       atomic.Uint64
-	undoRowsCaptured   atomic.Uint64
-	treeMutationNanos  atomic.Uint64
-	reachabilityNanos  atomic.Uint64
-	snapshotBuildNanos atomic.Uint64
+	rowsDecoded         atomic.Uint64
+	rowsScanned         atomic.Uint64
+	pointKeysVisited    atomic.Uint64
+	tablesRebuilt       atomic.Uint64
+	tablesReused        atomic.Uint64
+	undoRowsCaptured    atomic.Uint64
+	treeMutationNanos   atomic.Uint64
+	reachabilityNanos   atomic.Uint64
+	snapshotBuildNanos  atomic.Uint64
+	metadataCacheHits   atomic.Uint64
+	metadataCacheMisses atomic.Uint64
 }
 
 func ResetPerformanceCounters() {
@@ -38,18 +42,22 @@ func ResetPerformanceCounters() {
 	performanceCounters.treeMutationNanos.Store(0)
 	performanceCounters.reachabilityNanos.Store(0)
 	performanceCounters.snapshotBuildNanos.Store(0)
+	performanceCounters.metadataCacheHits.Store(0)
+	performanceCounters.metadataCacheMisses.Store(0)
 }
 
 func ReadPerformanceCounters() PerformanceCounters {
 	return PerformanceCounters{
-		RowsDecoded:        performanceCounters.rowsDecoded.Load(),
-		RowsScanned:        performanceCounters.rowsScanned.Load(),
-		PointKeysVisited:   performanceCounters.pointKeysVisited.Load(),
-		TablesRebuilt:      performanceCounters.tablesRebuilt.Load(),
-		TablesReused:       performanceCounters.tablesReused.Load(),
-		UndoRowsCaptured:   performanceCounters.undoRowsCaptured.Load(),
-		TreeMutationNanos:  performanceCounters.treeMutationNanos.Load(),
-		ReachabilityNanos:  performanceCounters.reachabilityNanos.Load(),
-		SnapshotBuildNanos: performanceCounters.snapshotBuildNanos.Load(),
+		RowsDecoded:         performanceCounters.rowsDecoded.Load(),
+		RowsScanned:         performanceCounters.rowsScanned.Load(),
+		PointKeysVisited:    performanceCounters.pointKeysVisited.Load(),
+		TablesRebuilt:       performanceCounters.tablesRebuilt.Load(),
+		TablesReused:        performanceCounters.tablesReused.Load(),
+		UndoRowsCaptured:    performanceCounters.undoRowsCaptured.Load(),
+		TreeMutationNanos:   performanceCounters.treeMutationNanos.Load(),
+		ReachabilityNanos:   performanceCounters.reachabilityNanos.Load(),
+		SnapshotBuildNanos:  performanceCounters.snapshotBuildNanos.Load(),
+		MetadataCacheHits:   performanceCounters.metadataCacheHits.Load(),
+		MetadataCacheMisses: performanceCounters.metadataCacheMisses.Load(),
 	}
 }

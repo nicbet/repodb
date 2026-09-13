@@ -84,7 +84,7 @@ func TestJournalCheckpointPublishesOneGitSnapshot(t *testing.T) {
 	if err := session.Exec(ctx, "INSERT INTO issues VALUES (1, 'checkpoint me')"); err != nil {
 		t.Fatal(err)
 	}
-	result, err := eng.WorkingState().Checkpoint(ctx, "Triage issues")
+	result, err := eng.Checkpoint(ctx, "Triage issues")
 	if err != nil || result.Outcome != repository.OutcomeCommitted || result.Commit == before {
 		t.Fatalf("checkpoint = %#v, %v", result, err)
 	}
@@ -102,7 +102,7 @@ func TestJournalCheckpointPublishesOneGitSnapshot(t *testing.T) {
 	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "checkpoint me" {
 		t.Fatalf("checkpoint rows = %#v, %v", rows.Rows, err)
 	}
-	if again, err := eng.WorkingState().Checkpoint(ctx, "no changes"); err != nil || again.Commit != result.Commit {
+	if again, err := eng.Checkpoint(ctx, "no changes"); err != nil || again.Commit != result.Commit {
 		t.Fatalf("unchanged checkpoint = %#v, %v", again, err)
 	}
 }

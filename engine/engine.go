@@ -3,11 +3,13 @@
 package engine
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,6 +148,12 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 	validatedSnapshots.Unlock()
 	tableObjects := make(map[string][]storage.Hash, len(snapshot.Manifest.Tables))
 	for name, table := range snapshot.Manifest.Tables {
+		if !table.DataRoot.Valid() {
+			if table.SchemaRoot.Valid() {
+				tableObjects[name] = []storage.Hash{table.SchemaRoot}
+			}
+			continue
+		}
 		if _, err := loadTable(ctx, snapshot.Store(), table); err != nil {
 			return fmt.Errorf("validate SQL table %s: %w", name, err)
 		}
@@ -195,7 +203,17 @@ func (e *Engine) Checkpoint(ctx context.Context, message string) (repository.Com
 	if e.working == nil {
 		return repository.CommitResult{Outcome: repository.OutcomeRejected}, errors.New("checkpoint requires journal persistence")
 	}
-	result, err := e.working.Checkpoint(ctx, message)
+	snapshot, err := e.working.Current(ctx)
+	if err != nil {
+		return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+	}
+	pending := snapshot.PendingEdits()
+	var result repository.CommitResult
+	if pending != nil {
+		result, err = e.checkpointTypedEdits(ctx, message, snapshot, pending)
+	} else {
+		result, err = e.working.Checkpoint(ctx, message)
+	}
 	if result.Snapshot != nil {
 		if validateErr := ValidateSnapshot(ctx, result.Snapshot); validateErr != nil {
 			return result, errors.Join(err, validateErr)
@@ -205,6 +223,103 @@ func (e *Engine) Checkpoint(ctx context.Context, message string) (repository.Com
 		e.database.mu.Unlock()
 	}
 	return result, err
+}
+
+func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snapshot *repository.Snapshot, pending map[string]map[string]repository.TypedRowEdit) (repository.CommitResult, error) {
+	base, err := e.repo.SnapshotCommit(ctx, snapshot.Commit)
+	if err != nil {
+		return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+	}
+	writer, err := e.repo.BeginSnapshot(base)
+	if err != nil {
+		return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+	}
+	manifest := repository.Manifest{DefaultDatabase: snapshot.Manifest.DefaultDatabase, Tables: make(map[string]repository.Table, len(snapshot.Manifest.Tables))}
+	reachable := make(map[storage.Hash]struct{})
+	for name, table := range snapshot.Manifest.Tables {
+		rowEdits, hasPending := pending[name]
+		if !hasPending {
+			manifest.Tables[name] = table
+			objects, cached := validatedTableObjects(base, name)
+			if !cached {
+				hashes, err := prolly.Reachable(ctx, base.Store(), table.DataRoot)
+				if err != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+				}
+				objects = append([]storage.Hash{table.SchemaRoot}, hashes...)
+			}
+			for _, hash := range objects {
+				reachable[hash] = struct{}{}
+			}
+			continue
+		}
+		if table.SchemaRoot.Valid() {
+			if _, present := base.Manifest.Tables[name]; !present {
+				schemaData, err := snapshot.Store().Get(ctx, table.SchemaRoot)
+				if err != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, fmt.Errorf("checkpoint schema for %s: %w", name, err)
+				}
+				if _, putErr := writer.Put(ctx, schemaData); putErr != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, putErr
+				}
+			}
+			reachable[table.SchemaRoot] = struct{}{}
+		}
+		edits := make([]prolly.Edit, 0, len(rowEdits))
+		for _, re := range rowEdits {
+			item := prolly.Edit{Key: append([]byte(nil), re.Key...), Delete: re.Delete}
+			if !re.Delete {
+				item.Value = append([]byte(nil), re.Value...)
+			}
+			edits = append(edits, item)
+		}
+		sort.Slice(edits, func(i, j int) bool { return bytes.Compare(edits[i].Key, edits[j].Key) < 0 })
+		if table.DataRoot.Valid() {
+			baseTree, err := prolly.Open(base.Store(), table.DataRoot)
+			if err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			}
+			tree, err := prolly.Apply(ctx, writer, baseTree, edits)
+			if err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			}
+			hashes, err := prolly.Reachable(ctx, writer, tree.Root())
+			if err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			}
+			for _, hash := range hashes {
+				reachable[hash] = struct{}{}
+			}
+			manifest.Tables[name] = repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
+		} else {
+			entries := make([]prolly.Entry, 0, len(edits))
+			for _, edit := range edits {
+				if !edit.Delete {
+					entries = append(entries, prolly.Entry{Key: edit.Key, Value: edit.Value})
+				}
+			}
+			tree, err := prolly.Build(ctx, writer, entries, prolly.DefaultOptions)
+			if err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			}
+			hashes, err := prolly.Reachable(ctx, writer, tree.Root())
+			if err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			}
+			for _, hash := range hashes {
+				reachable[hash] = struct{}{}
+			}
+			manifest.Tables[name] = repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
+		}
+	}
+	hashes := make([]storage.Hash, 0, len(reachable))
+	for hash := range reachable {
+		hashes = append(hashes, hash)
+	}
+	if err := writer.RetainOnly(hashes); err != nil {
+		return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+	}
+	return e.working.CheckpointPrepared(ctx, message, writer, manifest)
 }
 
 func (e *Engine) Close() error {

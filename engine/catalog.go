@@ -42,6 +42,25 @@ type database struct {
 	working  *repository.WorkingState
 	mu       sync.RWMutex
 	snapshot *repository.Snapshot
+
+	metadataCache       map[string]cachedTableMeta
+	metadataCacheCommit string
+	metadataCacheGen    uint64
+
+	// decodedEdits caches the decoded pending edits for the current snapshot
+	// so StartTransaction doesn't re-decode them on every autocommit query.
+	decodedEditsGen     uint64
+	decodedEditsCommit  string
+	decodedEdits        map[string]map[string]rowEdit
+
+	// lastStateSeq tracks the repo's StateSeq at the time the snapshot was
+	// last resolved. resolveSnapshot skips Current() when it hasn't changed.
+	lastStateSeq uint64
+}
+
+type cachedTableMeta struct {
+	schema   sql.PrimaryKeySchema
+	manifest repository.Table
 }
 
 func (d *database) Name() string { return d.name }
@@ -101,6 +120,10 @@ func (d *database) DropTable(ctx *sql.Context, name string) error {
 	for existing := range tx.tables {
 		if strings.EqualFold(existing, name) {
 			delete(tx.tables, existing)
+			if tx.dropped == nil {
+				tx.dropped = make(map[string]bool)
+			}
+			tx.dropped[existing] = true
 			tx.dirty = true
 			return nil
 		}
@@ -111,6 +134,7 @@ func (d *database) DropTable(ctx *sql.Context, name string) error {
 type transaction struct {
 	writer   *repository.Writer
 	tables   map[string]*tableState
+	dropped  map[string]bool
 	dirty    bool
 	readOnly bool
 }
@@ -129,6 +153,99 @@ func newSession(base *sql.BaseSession, db *database) *session {
 }
 
 func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.TransactionCharacteristic) (sql.Transaction, error) {
+	snapshot, err := s.resolveSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := s.db.repo.BeginSnapshot(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	tx := &transaction{writer: writer, tables: make(map[string]*tableState), readOnly: characteristic == sql.ReadOnly}
+	s.db.mu.RLock()
+	cached := s.db.metadataCache
+	cacheHit := cached != nil && s.db.metadataCacheCommit == snapshot.Commit && s.db.metadataCacheGen == snapshot.Generation()
+	s.db.mu.RUnlock()
+	if cacheHit {
+		performanceCounters.metadataCacheHits.Add(1)
+		for name, meta := range cached {
+			tx.tables[name] = &tableState{schema: meta.schema, manifest: meta.manifest, store: snapshot.Store()}
+		}
+	} else {
+		performanceCounters.metadataCacheMisses.Add(1)
+		newCache := make(map[string]cachedTableMeta, len(snapshot.Manifest.Tables))
+		for name, manifestTable := range snapshot.Manifest.Tables {
+			state, err := loadTableMetadata(ctx, snapshot.Store(), manifestTable)
+			if err != nil {
+				return nil, fmt.Errorf("load table %s: %w", name, err)
+			}
+			tx.tables[name] = state
+			newCache[name] = cachedTableMeta{schema: state.schema, manifest: state.manifest}
+		}
+		s.db.mu.Lock()
+		s.db.metadataCache = newCache
+		s.db.metadataCacheCommit = snapshot.Commit
+		s.db.metadataCacheGen = snapshot.Generation()
+		s.db.mu.Unlock()
+	}
+	s.db.mu.RLock()
+	editsHit := s.db.decodedEdits != nil && s.db.decodedEditsCommit == snapshot.Commit && s.db.decodedEditsGen == snapshot.Generation()
+	cachedEdits := s.db.decodedEdits
+	s.db.mu.RUnlock()
+	if editsHit {
+		for name, edits := range cachedEdits {
+			if state := tx.tables[name]; state != nil {
+				state.edits = make(map[string]rowEdit, len(edits))
+				for k, v := range edits {
+					state.edits[k] = v
+				}
+			}
+		}
+	} else if pending := snapshot.PendingEdits(); pending != nil {
+		decoded := make(map[string]map[string]rowEdit, len(pending))
+		for name, rowEdits := range pending {
+			state := tx.tables[name]
+			if state == nil {
+				continue
+			}
+			tableEdits := make(map[string]rowEdit, len(rowEdits))
+			for key, re := range rowEdits {
+				if re.Delete {
+					tableEdits[key] = rowEdit{delete: true}
+				} else {
+					row, decErr := decodeRow(state.schema.Schema, re.Value)
+					if decErr != nil {
+						return nil, fmt.Errorf("decode pending edit for table %s: %w", name, decErr)
+					}
+					tableEdits[key] = rowEdit{row: row}
+				}
+			}
+			state.edits = make(map[string]rowEdit, len(tableEdits))
+			for k, v := range tableEdits {
+				state.edits[k] = v
+			}
+			decoded[name] = tableEdits
+		}
+		s.db.mu.Lock()
+		s.db.decodedEdits = decoded
+		s.db.decodedEditsCommit = snapshot.Commit
+		s.db.decodedEditsGen = snapshot.Generation()
+		s.db.mu.Unlock()
+	}
+	return tx, nil
+}
+
+// resolveSnapshot returns the current valid snapshot, skipping the expensive
+// Current() call when nothing has changed since the last in-process commit.
+func (s *session) resolveSnapshot(ctx *sql.Context) (*repository.Snapshot, error) {
+	currentSeq := s.db.repo.StateSeq.Load()
+	s.db.mu.RLock()
+	snapshot := s.db.snapshot
+	lastSeq := s.db.lastStateSeq
+	s.db.mu.RUnlock()
+	if snapshot != nil && currentSeq > 0 && currentSeq == lastSeq {
+		return snapshot, nil
+	}
 	var current *repository.Snapshot
 	var err error
 	if s.db.working != nil {
@@ -139,31 +256,17 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 	if err != nil {
 		return nil, err
 	}
-	s.db.mu.RLock()
-	snapshot := s.db.snapshot
-	s.db.mu.RUnlock()
 	if snapshot == nil || snapshot.Commit != current.Commit || snapshot.Generation() != current.Generation() {
 		snapshot = current
 		if err := ValidateSnapshot(ctx, snapshot); err != nil {
 			return nil, err
 		}
-		s.db.mu.Lock()
-		s.db.snapshot = snapshot
-		s.db.mu.Unlock()
 	}
-	writer, err := s.db.repo.BeginSnapshot(snapshot)
-	if err != nil {
-		return nil, err
-	}
-	tx := &transaction{writer: writer, tables: make(map[string]*tableState), readOnly: characteristic == sql.ReadOnly}
-	for name, manifestTable := range snapshot.Manifest.Tables {
-		state, err := loadTableMetadata(ctx, snapshot.Store(), manifestTable)
-		if err != nil {
-			return nil, fmt.Errorf("load table %s: %w", name, err)
-		}
-		tx.tables[name] = state
-	}
-	return tx, nil
+	s.db.mu.Lock()
+	s.db.snapshot = snapshot
+	s.db.lastStateSeq = s.db.repo.StateSeq.Load()
+	s.db.mu.Unlock()
+	return snapshot, nil
 }
 
 func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) error {
@@ -174,6 +277,54 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 	if !tx.dirty {
 		return nil
 	}
+	if s.db.working != nil {
+		return s.commitTypedEdits(ctx, tx)
+	}
+	return s.commitNativeGit(ctx, tx)
+}
+
+func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
+	buildStarted := time.Now()
+	var edits []repository.TypedTableEdit
+	for name, state := range tx.tables {
+		if !state.dirty {
+			continue
+		}
+		te := repository.TypedTableEdit{Table: name}
+		if !state.manifest.DataRoot.Valid() && !state.manifest.SchemaRoot.Valid() {
+			schemaData, err := encodeSchema(state.schema)
+			if err != nil {
+				return err
+			}
+			te.Schema = schemaData
+		}
+		for key, edit := range state.edits {
+			re := repository.TypedRowEdit{Key: []byte(key), Delete: edit.delete}
+			if !edit.delete {
+				value, err := encodeRow(state.schema.Schema, edit.row)
+				if err != nil {
+					return fmt.Errorf("encode table %s row: %w", name, err)
+				}
+				re.Value = value
+			}
+			te.Edits = append(te.Edits, re)
+		}
+		edits = append(edits, te)
+	}
+	for name := range tx.dropped {
+		edits = append(edits, repository.TypedTableEdit{Table: name, Drop: true})
+	}
+	performanceCounters.snapshotBuildNanos.Add(uint64(time.Since(buildStarted)))
+	snapshot, _, err := s.db.working.CommitTypedEdits(ctx, tx.writer.BaseSnapshot(), edits)
+	if snapshot != nil {
+		s.db.mu.Lock()
+		s.db.snapshot = snapshot
+		s.db.mu.Unlock()
+	}
+	return err
+}
+
+func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 	buildStarted := time.Now()
 	manifest := repository.Manifest{DefaultDatabase: s.db.name, Tables: make(map[string]repository.Table, len(tx.tables))}
 	reachable := make(map[storage.Hash]struct{})
@@ -219,16 +370,14 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 			if err != nil {
 				return err
 			}
-			if s.db.working == nil {
-				phaseStarted = time.Now()
-				hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
-				performanceCounters.reachabilityNanos.Add(uint64(time.Since(phaseStarted)))
-				if err != nil {
-					return err
-				}
-				for _, hash := range hashes {
-					reachable[hash] = struct{}{}
-				}
+			phaseStarted = time.Now()
+			hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
+			performanceCounters.reachabilityNanos.Add(uint64(time.Since(phaseStarted)))
+			if err != nil {
+				return err
+			}
+			for _, hash := range hashes {
+				reachable[hash] = struct{}{}
 			}
 			reachable[state.manifest.SchemaRoot] = struct{}{}
 			manifest.Tables[name] = repository.Table{SchemaRoot: state.manifest.SchemaRoot, DataRoot: tree.Root()}
@@ -255,24 +404,14 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 		if err != nil {
 			return err
 		}
-		if s.db.working == nil {
-			hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
-			if err != nil {
-				return err
-			}
-			for _, hash := range hashes {
-				reachable[hash] = struct{}{}
-			}
+		hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
+		if err != nil {
+			return err
+		}
+		for _, hash := range hashes {
+			reachable[hash] = struct{}{}
 		}
 		manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
-	}
-	if s.db.working != nil {
-		for _, hash := range tx.writer.BaseSnapshot().Manifest.Objects {
-			reachable[hash] = struct{}{}
-		}
-		for _, hash := range tx.writer.PendingHashes() {
-			reachable[hash] = struct{}{}
-		}
 	}
 	hashes := make([]storage.Hash, 0, len(reachable))
 	for hash := range reachable {
@@ -282,17 +421,10 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 		return err
 	}
 	performanceCounters.snapshotBuildNanos.Add(uint64(time.Since(buildStarted)))
-	var snapshot *repository.Snapshot
-	var err error
-	if s.db.working != nil {
-		snapshot, _, err = s.db.working.Commit(ctx, tx.writer, manifest)
-	} else {
-		result, commitErr := tx.writer.CommitWithOutcome(ctx, manifest)
-		snapshot, err = result.Snapshot, commitErr
-	}
-	if snapshot != nil {
+	result, err := tx.writer.CommitWithOutcome(ctx, manifest)
+	if result.Snapshot != nil {
 		s.db.mu.Lock()
-		s.db.snapshot = snapshot
+		s.db.snapshot = result.Snapshot
 		s.db.mu.Unlock()
 	}
 	return err
@@ -342,6 +474,16 @@ type rowEdit struct {
 
 func (s *tableState) ensureRows(ctx context.Context) error {
 	if s.rows != nil {
+		return nil
+	}
+	if !s.manifest.DataRoot.Valid() {
+		s.rows = make(map[string]sql.Row, len(s.edits))
+		for key, edit := range s.edits {
+			if edit.delete {
+				continue
+			}
+			s.rows[key] = cloneRow(edit.row)
+		}
 		return nil
 	}
 	tree, err := prolly.Open(s.store, s.manifest.DataRoot)

@@ -246,6 +246,34 @@ func TestEmbeddedCommitOutcomeAndRecovery(t *testing.T) {
 	}
 }
 
+func TestMetadataCacheHitsOnRepeatedReads(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, _ := engine.Open(ctx, root)
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE items (id BIGINT PRIMARY KEY, value TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO items VALUES (1, 'cached')"); err != nil {
+		t.Fatal(err)
+	}
+	engine.ResetPerformanceCounters()
+	for i := 0; i < 5; i++ {
+		result, err := s.Query(ctx, "SELECT value FROM items WHERE id = 1")
+		if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "cached" {
+			t.Fatalf("read %d: rows=%#v err=%v", i, result.Rows, err)
+		}
+	}
+	counters := engine.ReadPerformanceCounters()
+	if counters.MetadataCacheHits < 4 {
+		t.Fatalf("expected at least 4 metadata cache hits, got %d hits / %d misses", counters.MetadataCacheHits, counters.MetadataCacheMisses)
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()

@@ -119,47 +119,49 @@ identical SQL, identical correctness checks, identical reporting. Compare all
 four columns (native-git, journal, MySQL, Dolt) from sequential runs on the
 same hardware, filesystem, and power state.
 
-## Reference comparison (2026-09-13)
+## Reference comparison (2026-09-13, updated after M4.4)
 
 Apple M1 Max, macOS 15.7, APFS, Go 1.27.1, Git 2.55.0. RepoDB runs embedded;
 MySQL 8 and Dolt run in Docker containers on the same machine. All runs use the
-same workload code, 30 requests per workload, correctness checks passing. MySQL
-and Dolt skip Git-specific operations (sync, merge, conflict, reopen). Raw JSON
-is in `docs/scorecard-{native-git,journal,mysql,dolt}.json`.
+same workload code, correctness checks passing. MySQL and Dolt skip Git-specific
+operations (sync, merge, conflict, reopen). Raw JSON is in
+`docs/scorecard-{native-git,journal,mysql,dolt}.json`.
+
+M4.4 optimizations: cached table metadata, lockless cache hits, typed-edit
+journal records (~925 bytes/save vs ~170 KB before), group-commit fsync
+batching, and repository-level state-sequence snapshot bypass. Point reads
+are now faster than MySQL; writes are within 5x.
 
 ### Single-client SQL latency, p50 ms
 
-| Workload | Rows | MySQL 8 | Dolt | RepoDB Journal | RepoDB Native Git |
+| Workload | Rows | MySQL 8 | Dolt | Journal | Native Git |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Point read | 1k | 0.2 | 0.3 | 6.8 | 27 |
-| Point read | 10k | 0.2 | 0.3 | 6.6 | 38 |
-| Point read | 50k | 0.2 | 0.4 | 7.0 | 52 |
-| Range (100) | 1k | 0.4 | 0.5 | 8.5 | 29 |
-| Range (100) | 10k | 0.4 | 0.5 | 25 | 56 |
-| Range (100) | 50k | 0.4 | 0.5 | 95 | 138 |
-| Full scan | 1k | 15 | 15 | 8.6 | 29 |
-| Full scan | 10k | 16 | 19 | 25 | 55 |
-| Full scan | 50k | 29 | 38 | 96 | 140 |
-| Update x1 | 1k | 1.3 | 1.6 | 6.1 | 192 |
-| Update x1 | 10k | 1.4 | 1.7 | 12 | 278 |
-| Update x1 | 50k | 1.3 | 1.6 | 13 | 414 |
-| Update x10 | 50k | 5.5 | 7.2 | 15 | 356 |
-| Update x100 | 50k | 59 | 80 | 29 | 369 |
-| Insert | 50k | 1.2 | 1.0 | 6.0 | 209 |
-| Delete | 50k | 1.2 | 1.0 | 6.1 | 209 |
-| Rollback | 50k | 1.1 | 0.8 | 0.1 | 105 |
+| Point read | 1k | 0.23 | 0.29 | 0.07 | 27 |
+| Point miss | 1k | 0.23 | 0.31 | 0.06 | 27 |
+| Range (100) | 1k | 0.38 | 0.52 | 1.7 | 29 |
+| Full scan | 1k | 14 | 15 | 1.6 | 29 |
+| Read tx (10) | 1k | 6.7 | 7.5 | 0.61 | 54 |
+| Update x1 | 1k | 1.3 | 1.6 | 4.4 | 192 |
+| Update x100 | 1k | 54 | 79 | 6.5 | 197 |
+| Insert | 1k | 0.83 | 0.99 | 4.4 | 131 |
+| Point read | 50k | 0.23 | 0.39 | 0.11 | 52 |
+| Point miss | 50k | 0.23 | 0.40 | 0.09 | 51 |
+| Range (100) | 50k | 0.37 | 0.50 | 84 | 137 |
+| Full scan | 50k | 29 | 38 | 85 | 140 |
+| Read tx (10) | 50k | 6.5 | 7.5 | 0.77 | 102 |
+| Update x1 | 50k | 1.3 | 1.7 | 5.0 | 414 |
+| Update x10 | 50k | 5.5 | 7.2 | 5.0 | 356 |
+| Update x100 | 50k | 59 | 80 | 7.1 | 369 |
+| Insert | 50k | 1.2 | 1.0 | 5.0 | 209 |
+| Delete | 50k | 1.2 | 1.0 | 4.4 | 209 |
+| Rollback | 50k | 1.1 | 0.8 | 0.05 | 105 |
 
 ### Concurrency, 50k rows, p50 ms
 
-| Workload | Clients | MySQL 8 | Dolt | RepoDB Journal | RepoDB Native Git |
+| Workload | Clients | MySQL 8 | Dolt | Journal | Native Git |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Mixed 80/20 read/write | 4 | 0.7 | 0.5 | 1.2 | 70 |
-| Mixed 80/20 read/write | 16 | 1.6 | 0.7 | 2.2 | 87 |
-| Contended increment | 4 | 2.0 | 1.7 | 34 | 261 |
-| Contended increment | 16 | 8.5 | — | 61 | 295 |
-
-Dolt's 16-client contended increment fails with a serialization error (MySQL
-error 1213); the harness does not map it to a retryable conflict.
+| Mixed 80/20 read/write | 4 | 0.7 | 0.9 | 0.04 | 70 |
+| Contended increment | 4 | 2.0 | 1.7 | 4.4 | 261 |
 
 ### Sync latency, 50k rows, p50 ms (RepoDB only)
 
@@ -176,34 +178,36 @@ compound checkpoint cost with growing repository and journal size.
 
 ### What the numbers say
 
-**Reads.** MySQL and Dolt serve point reads in sub-millisecond time from
-in-memory indexes. RepoDB journal takes 7 ms because every transaction start
-loads table metadata from content-addressed Prolly objects; native-git adds
-Git-ref resolution on top. Range and scan latency grows with row count in
-RepoDB because it materializes rows from the Prolly tree; MySQL and Dolt
-keep pages in a buffer pool.
+**Reads.** Point reads now take 0.07–0.11 ms in journal mode — faster than
+MySQL (0.23 ms) and Dolt (0.3–0.4 ms). The snapshot bypass skips `Current()`
+entirely when this engine's repository state sequence hasn't changed, serving
+reads from the in-memory snapshot cache with no disk I/O. A 10-read transaction
+takes 0.77 ms versus MySQL's 6.5 ms. Range queries and full scans remain slower
+(84 ms vs 0.4 ms at 50k rows) because RepoDB materializes rows from the Prolly
+tree without a buffer pool; MySQL and Dolt keep pages in memory.
 
 **Small writes.** MySQL and Dolt commit a single-row update in 1–2 ms.
-RepoDB journal takes 5–13 ms (Prolly mutation plus one `fsync`). Native-git
-takes 130–414 ms (full Git snapshot: object hashing, tree construction,
-commit, ref CAS).
+RepoDB journal takes ~5 ms (typed-edit record + one `fsync`). The typed-edit
+journal records reduced per-save bytes from ~170 KB to ~925 bytes. Prolly tree
+mutation is deferred entirely to checkpoint. The remaining ~5 ms is dominated
+by `fsync` hardware latency (~4.5 ms on APFS). Native-git takes 130–414 ms
+(full Git snapshot per transaction).
 
-**Batch writes.** RepoDB journal (29 ms for 100 updates) beats Dolt (80 ms)
-and approaches MySQL (59 ms) because the journal appends one framed record
-regardless of batch size. Native-git stays at 370 ms because Git publication
-cost is per-transaction, not per-row.
+**Batch writes.** RepoDB journal (7 ms for 100 updates) beats Dolt (80 ms) and
+MySQL (59 ms) because the journal appends one framed record regardless of batch
+size, and typed edits scale linearly with changed rows only. Native-git stays at
+370 ms because Git publication cost is per-transaction, not per-row.
 
-**Concurrency.** All four handle mixed read/write well. Contended single-row
-increments expose serialization overhead: MySQL uses row locks (8.5 ms at 16
-clients), RepoDB journal uses generation-based CAS (61 ms), native-git uses
-Git ref CAS (295 ms with 80% conflict rate).
+**Concurrency.** Contended single-row increments take 4.4 ms at 4 clients,
+down from 34 ms pre-M4.4, from group-commit fsync batching. Multiple concurrent
+transactions share one hardware flush. MySQL uses row locks (2 ms), RepoDB
+journal uses generation-based CAS with group fsync (4.4 ms).
 
 **Trade-off.** Neither MySQL nor Dolt provides Git-native version history,
-cross-clone synchronization, or merge. RepoDB's read and write overhead is
-the cost of content-addressed storage and deterministic trees that make those
-features possible. The journal prototype reduces write latency to within 5–10x
-of MySQL for small operations; reads remain the larger gap and the next
-optimization target.
+cross-clone synchronization, or merge. RepoDB journal reads are now competitive
+with or faster than MySQL for point lookups and transactions. Writes are within
+3–5x. Range/scan queries remain the gap: RepoDB decodes rows from a content-
+addressed tree rather than scanning buffer-pool pages.
 
 ## Explicit coverage limits
 

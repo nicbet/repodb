@@ -48,6 +48,13 @@ type WorkingState struct {
 	mu      sync.Mutex
 	cache   *workingCache
 	metrics workingMetricCounters
+
+	groupMu    sync.Mutex
+	groupQueue []groupCommitEntry
+}
+
+type groupCommitEntry struct {
+	result chan error
 }
 
 type WorkingMetrics struct {
@@ -108,13 +115,34 @@ type journalRecord struct {
 	GitCommit  string                  `json:"git_commit,omitempty"`
 	Manifest   *Manifest               `json:"manifest,omitempty"`
 	Objects    map[storage.Hash][]byte `json:"objects,omitempty"`
+	TypedEdits []TypedTableEdit        `json:"typed_edits,omitempty"`
+}
+
+type TypedTableEdit struct {
+	Table  string           `json:"table"`
+	Schema []byte           `json:"schema,omitempty"`
+	Drop   bool             `json:"drop,omitempty"`
+	Edits  []TypedRowEdit   `json:"edits,omitempty"`
+}
+
+type TypedRowEdit struct {
+	Key    []byte `json:"key"`
+	Value  []byte `json:"value,omitempty"`
+	Delete bool   `json:"delete,omitempty"`
 }
 
 type workingView struct {
-	snapshot   *Snapshot
-	generation uint64
-	dirty      bool
-	baseCommit string
+	snapshot     *Snapshot
+	generation   uint64
+	dirty        bool
+	baseCommit   string
+	pendingEdits map[string]*pendingTableEdits
+}
+
+type pendingTableEdits struct {
+	schemaData []byte
+	dropped    bool
+	rows       map[string]TypedRowEdit
 }
 
 type journalFrame struct {
@@ -170,6 +198,38 @@ func (w *WorkingState) Exists() bool {
 }
 
 func (w *WorkingState) Current(ctx context.Context) (*Snapshot, error) {
+	w.mu.Lock()
+	cached := w.cache
+	if cached != nil {
+		info, statErr := os.Stat(w.JournalPath())
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			w.mu.Unlock()
+			return nil, statErr
+		}
+		sameFile := (info == nil && cached.info == nil) || (info != nil && cached.info != nil && os.SameFile(info, cached.info) && info.Size() == cached.offset)
+		if sameFile {
+			w.metrics.cacheHits.Add(1)
+			if cached.view.dirty {
+				snapshot := cached.view.snapshot
+				w.mu.Unlock()
+				return snapshot, nil
+			}
+			head, err := w.repo.Head(ctx)
+			if err != nil {
+				w.mu.Unlock()
+				return nil, err
+			}
+			view, err := w.reconcileHead(ctx, cached.view, head)
+			if err != nil {
+				w.mu.Unlock()
+				return nil, err
+			}
+			cached.view = view
+			w.mu.Unlock()
+			return view.snapshot, nil
+		}
+	}
+	w.mu.Unlock()
 	release, err := w.lock(ctx)
 	if err != nil {
 		return nil, err
@@ -291,12 +351,142 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
 		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit}, info: info, offset: info.Size()}
 	}
+	w.repo.StateSeq.Add(1)
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
 			return snapshot, txid, &WorkingCommitError{Outcome: OutcomeCommitted, TransactionID: txid, Err: err}
 		}
 	}
 	return snapshot, txid, nil
+}
+
+// CommitTypedEdits durably appends typed row/schema edits to the journal.
+// This is the M4.4 compact persistence path: journal bytes per save drop from
+// ~1.5 MB (full Prolly chunks) to ~200 bytes (encoded key + value).
+func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edits []TypedTableEdit) (*Snapshot, string, error) {
+	if base == nil {
+		return nil, "", errors.New("typed-edit base snapshot is required")
+	}
+	release, err := w.lock(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer release()
+	view, err := w.load(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if base.Generation() != view.generation || base.Commit != view.snapshot.Commit {
+		return nil, "", ErrConflict
+	}
+	txid, err := randomID()
+	if err != nil {
+		return nil, "", err
+	}
+	generation := view.generation + 1
+	prepare := journalRecord{Version: workingFormatVersion, Kind: "typed-prepare", TxID: txid, Generation: generation, BaseCommit: view.baseCommit, TypedEdits: edits}
+	marker := journalRecord{Version: workingFormatVersion, Kind: "commit", TxID: txid, Generation: generation, BaseCommit: view.baseCommit}
+	if w.fault != nil {
+		if err := w.fault(BeforeJournalAppend); err != nil {
+			return nil, txid, &WorkingCommitError{Outcome: OutcomeRejected, TransactionID: txid, Err: err}
+		}
+	}
+	if err := w.truncateIncompleteTail(); err != nil {
+		return nil, txid, &WorkingCommitError{Outcome: OutcomeUnknown, TransactionID: txid, Err: err}
+	}
+	prepareStarted := time.Now()
+	var preparedBytes uint64
+	for _, te := range edits {
+		preparedBytes += uint64(len(te.Schema))
+		for _, re := range te.Edits {
+			preparedBytes += uint64(len(re.Key) + len(re.Value))
+		}
+	}
+	w.metrics.prepareNanos.Add(uint64(time.Since(prepareStarted)))
+	w.metrics.preparedBytes.Add(preparedBytes)
+	writeMetrics, err := w.appendRecords(prepare, marker)
+	w.recordWriteMetrics(writeMetrics)
+	if err != nil {
+		return nil, txid, &WorkingCommitError{Outcome: OutcomeUnknown, TransactionID: txid, Err: err}
+	}
+	snapshot, newPending := applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, edits, generation)
+	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
+		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit, pendingEdits: newPending}, info: info, offset: info.Size()}
+	}
+	w.repo.StateSeq.Add(1)
+	if w.fault != nil {
+		if err := w.fault(AfterJournalFlush); err != nil {
+			return snapshot, txid, &WorkingCommitError{Outcome: OutcomeCommitted, TransactionID: txid, Err: err}
+		}
+	}
+	return snapshot, txid, nil
+}
+
+func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTableEdits, edits []TypedTableEdit, generation uint64) (*Snapshot, map[string]*pendingTableEdits) {
+	pending := make(map[string]*pendingTableEdits, len(existing)+len(edits))
+	for name, te := range existing {
+		rows := make(map[string]TypedRowEdit, len(te.rows))
+		for k, v := range te.rows {
+			rows[k] = v
+		}
+		pending[name] = &pendingTableEdits{schemaData: te.schemaData, dropped: te.dropped, rows: rows}
+	}
+	manifest := Manifest{FormatVersion: base.Manifest.FormatVersion, DefaultDatabase: base.Manifest.DefaultDatabase, Tables: make(map[string]Table, len(base.Manifest.Tables))}
+	for name, table := range base.Manifest.Tables {
+		manifest.Tables[name] = table
+	}
+	cache := base.cache
+	if cache == nil {
+		cache = &snapshotObjectCache{data: make(map[storage.Hash][]byte)}
+	}
+	for _, te := range edits {
+		if te.Drop {
+			delete(manifest.Tables, te.Table)
+			delete(pending, te.Table)
+			continue
+		}
+		entry := pending[te.Table]
+		if entry == nil {
+			entry = &pendingTableEdits{rows: make(map[string]TypedRowEdit)}
+			pending[te.Table] = entry
+		}
+		if len(te.Schema) > 0 {
+			entry.schemaData = te.Schema
+			schemaHash := storage.Sum(te.Schema)
+			cache.mu.Lock()
+			cache.data[schemaHash] = append([]byte(nil), te.Schema...)
+			cache.mu.Unlock()
+			manifest.Tables[te.Table] = Table{SchemaRoot: schemaHash}
+		}
+		for _, re := range te.Edits {
+			entry.rows[string(re.Key)] = re
+		}
+	}
+	objectSet := make(map[storage.Hash]struct{})
+	for hash := range base.objectSet {
+		objectSet[hash] = struct{}{}
+	}
+	for _, table := range manifest.Tables {
+		if table.SchemaRoot.Valid() {
+			objectSet[table.SchemaRoot] = struct{}{}
+		}
+	}
+	objects := make([]storage.Hash, 0, len(objectSet))
+	for hash := range objectSet {
+		objects = append(objects, hash)
+	}
+	manifest.Objects = objects
+	snapshotEdits := make(map[string]map[string]TypedRowEdit, len(pending))
+	for name, te := range pending {
+		if len(te.rows) > 0 {
+			rows := make(map[string]TypedRowEdit, len(te.rows))
+			for k, v := range te.rows {
+				rows[k] = v
+			}
+			snapshotEdits[name] = rows
+		}
+	}
+	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: objectSet, objectOIDs: base.objectOIDs, cache: cache, pendingEdits: snapshotEdits}, pending
 }
 
 func (w *WorkingState) truncateIncompleteTail() error {
@@ -331,7 +521,7 @@ func (w *WorkingState) RecoverTransaction(ctx context.Context, transactionID str
 			continue
 		}
 		switch record.Kind {
-		case "prepare":
+		case "prepare", "typed-prepare":
 			prepared, result.Generation = true, record.Generation
 		case "commit":
 			if prepared && record.Generation == result.Generation {
@@ -409,7 +599,73 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
 		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
 	}
+	w.repo.StateSeq.Add(1)
 	return result, err
+}
+
+// CheckpointPrepared publishes a pre-materialized snapshot as a Git data
+// commit. The engine calls this after building Prolly trees from accumulated
+// typed edits. The writer must be based on the current working base snapshot.
+func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, writer *Writer, manifest Manifest) (CommitResult, error) {
+	if writer == nil || writer.repo != w.repo {
+		return CommitResult{Outcome: OutcomeRejected}, errors.New("checkpoint writer belongs to a different repository")
+	}
+	release, err := w.lock(ctx)
+	if err != nil {
+		return CommitResult{Outcome: OutcomeRejected}, err
+	}
+	defer release()
+	view, err := w.load(ctx)
+	if err != nil {
+		return CommitResult{Outcome: OutcomeRejected}, err
+	}
+	if !view.dirty {
+		return CommitResult{Outcome: OutcomeCommitted, Commit: view.snapshot.Commit, Snapshot: view.snapshot}, nil
+	}
+	result, err := writer.CommitWithOutcomeMessage(ctx, manifest, message)
+	if err != nil && result.Outcome != OutcomeCommitted {
+		return result, err
+	}
+	if w.fault != nil {
+		if faultErr := w.fault(AfterCheckpointRef); faultErr != nil {
+			return result, errors.Join(err, faultErr)
+		}
+	}
+	rec := journalRecord{Version: workingFormatVersion, Kind: "checkpoint", Generation: view.generation, BaseCommit: view.baseCommit, GitCommit: result.Commit}
+	writeMetrics, appendErr := w.appendRecords(rec)
+	w.recordWriteMetrics(writeMetrics)
+	if appendErr != nil {
+		w.cache = nil
+		return result, errors.Join(err, fmt.Errorf("checkpoint %s published but journal bookkeeping failed: %w", result.Commit, appendErr))
+	}
+	checkpointSnapshot := result.Snapshot
+	if checkpointSnapshot == nil {
+		checkpointSnapshot, appendErr = w.repo.SnapshotCommit(ctx, result.Commit)
+		if appendErr != nil {
+			return result, errors.Join(err, appendErr)
+		}
+	}
+	checkpointSnapshot.generation = view.generation
+	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
+		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
+	}
+	w.repo.StateSeq.Add(1)
+	return result, err
+}
+
+// PendingEdits returns the accumulated typed edits from the current working
+// state, if any. Must be called under the working state's process lock.
+func (w *WorkingState) PendingTableEdits(ctx context.Context) (map[string]*pendingTableEdits, error) {
+	release, err := w.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	view, err := w.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return view.pendingEdits, nil
 }
 
 func takeWorkingWriter(w *Writer, manifest Manifest) (Manifest, map[storage.Hash]struct{}, map[storage.Hash][]byte, error) {
@@ -546,7 +802,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 	}
 	for _, frame := range frames {
 		record := frame.record
-		if record.Kind == "prepare" && record.BaseCommit != "" {
+		if (record.Kind == "prepare" || record.Kind == "typed-prepare") && record.BaseCommit != "" {
 			initial = record.BaseCommit
 			break
 		}
@@ -576,6 +832,11 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				}
 			}
 			pending[record.TxID] = record
+		case "typed-prepare":
+			if record.TxID == "" || len(record.TypedEdits) == 0 {
+				return workingView{}, fmt.Errorf("%w: incomplete typed-prepare record", ErrWorkingCorrupt)
+			}
+			pending[record.TxID] = record
 		case "commit":
 			prepare, ok := pending[record.TxID]
 			if !ok || prepare.Generation != record.Generation {
@@ -588,23 +849,27 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				if view.dirty {
 					return workingView{}, fmt.Errorf("%w: transaction base changed while dirty", ErrWorkingCorrupt)
 				}
-				// Clean journal: an external operation (sync) advanced the
-				// Git head between the last checkpoint and this transaction.
 				newBase, err := w.repo.SnapshotCommit(ctx, prepare.BaseCommit)
 				if err != nil {
 					return workingView{}, fmt.Errorf("load advanced base %s: %w", prepare.BaseCommit, err)
 				}
 				newBase.generation = view.generation
 				view.snapshot, view.baseCommit = newBase, prepare.BaseCommit
+				view.pendingEdits = nil
 			}
-			available := make(map[storage.Hash]struct{}, len(prepare.Manifest.Objects))
-			for _, hash := range prepare.Manifest.Objects {
-				available[hash] = struct{}{}
+			if prepare.Kind == "typed-prepare" {
+				view.snapshot, view.pendingEdits = applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, prepare.TypedEdits, prepare.Generation)
+			} else {
+				available := make(map[storage.Hash]struct{}, len(prepare.Manifest.Objects))
+				for _, hash := range prepare.Manifest.Objects {
+					available[hash] = struct{}{}
+				}
+				if err := validateManifestInventory(*prepare.Manifest, available); err != nil {
+					return workingView{}, err
+				}
+				view.snapshot = workingSnapshot(view.snapshot, *prepare.Manifest, available, prepare.Objects, prepare.Generation)
+				view.pendingEdits = nil
 			}
-			if err := validateManifestInventory(*prepare.Manifest, available); err != nil {
-				return workingView{}, err
-			}
-			view.snapshot = workingSnapshot(view.snapshot, *prepare.Manifest, available, prepare.Objects, prepare.Generation)
 			view.generation, view.dirty = prepare.Generation, true
 			delete(pending, record.TxID)
 			safeOffset = frame.end
@@ -621,6 +886,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 			}
 			base.generation = view.generation
 			view.snapshot, view.baseCommit, view.dirty = base, record.GitCommit, false
+			view.pendingEdits = nil
 			safeOffset = frame.end
 		default:
 			return workingView{}, fmt.Errorf("%w: unknown record kind %q", ErrWorkingCorrupt, record.Kind)
@@ -694,9 +960,36 @@ func (w *WorkingState) appendRecords(records ...journalRecord) (journalWriteMetr
 		}
 	}
 	started := time.Now()
-	err = file.Sync()
+	err = w.groupSync(file)
 	metrics.flushNanos += uint64(time.Since(started))
 	return metrics, err
+}
+
+// groupSync batches concurrent fsync calls so multiple transactions share one
+// hardware flush. The first waiter becomes the leader, collects followers that
+// arrive before the sync completes, calls Sync once, and broadcasts the result.
+// Followers whose writes landed before the leader's Sync are covered by it;
+// followers arriving after Sync starts become the next batch's leader.
+func (w *WorkingState) groupSync(file *os.File) error {
+	ch := make(chan error, 1)
+	w.groupMu.Lock()
+	w.groupQueue = append(w.groupQueue, groupCommitEntry{result: ch})
+	isLeader := len(w.groupQueue) == 1
+	w.groupMu.Unlock()
+	if !isLeader {
+		return <-ch
+	}
+	// Drain the queue before sync so we know exactly which waiters this
+	// flush covers. Anyone arriving after this drain becomes the next leader.
+	w.groupMu.Lock()
+	batch := w.groupQueue
+	w.groupQueue = nil
+	w.groupMu.Unlock()
+	err := file.Sync()
+	for _, entry := range batch {
+		entry.result <- err
+	}
+	return err
 }
 
 func (w *WorkingState) recordWriteMetrics(metrics journalWriteMetrics) {

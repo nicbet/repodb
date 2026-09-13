@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	repodbgit "github.com/nicbet/repodb/common/git"
@@ -92,6 +93,11 @@ type Repository struct {
 	ObjectFormat string
 	git          repodbgit.CLI
 	fault        func(PublicationPoint) error
+
+	// StateSeq is bumped on every successful state change visible to readers:
+	// commits, checkpoints, and ref publications. Engines compare it to skip
+	// expensive Current() calls when nothing has changed.
+	StateSeq atomic.Uint64
 }
 
 type PublicationPoint string
@@ -116,11 +122,20 @@ type Snapshot struct {
 	objectSet  map[storage.Hash]struct{}
 	objectOIDs map[storage.Hash]string
 	cache      *snapshotObjectCache
+
+	pendingEdits map[string]map[string]TypedRowEdit
 }
 
 // Generation identifies the durable working-state version layered over Commit.
 // Native-Git snapshots use generation zero.
 func (s *Snapshot) Generation() uint64 { return s.generation }
+
+// PendingEdits returns accumulated typed row edits since the last checkpoint.
+// The map is keyed by table name; each inner map is keyed by encoded primary
+// key. Returns nil when no typed edits are pending.
+func (s *Snapshot) PendingEdits() map[string]map[string]TypedRowEdit {
+	return s.pendingEdits
+}
 
 type snapshotObjectCache struct {
 	mu   sync.RWMutex
@@ -338,6 +353,7 @@ func (p *LockedPublication) FastForwardSnapshot(ctx context.Context, expected st
 		}
 		return nil, err
 	}
+	p.repo.StateSeq.Add(1)
 	return snapshot, nil
 }
 
@@ -690,6 +706,7 @@ func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest
 		}
 	}
 	publicationMetrics.refUpdate.Add(uint64(time.Since(phaseStarted)))
+	w.repo.StateSeq.Add(1)
 	result = CommitResult{Outcome: OutcomeCommitted, Commit: commit}
 	if w.repo.fault != nil {
 		if err := w.repo.fault(AfterRefPublication); err != nil {
