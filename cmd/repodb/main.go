@@ -28,7 +28,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: repodb <init|status|import-legacy|enable|sync|conflicts|resolve|start|sql>")
+		return errors.New("usage: repodb <init|status|diff|commit|import-legacy|enable|sync|conflicts|resolve|start|sql>")
 	}
 	switch args[0] {
 	case "init":
@@ -61,6 +61,53 @@ func run(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("RepoDB data head: %s\n", snapshot.Commit)
 		fmt.Printf("Format: %d, objects: %d, tables: %d\n", snapshot.Manifest.FormatVersion, len(snapshot.Manifest.Objects), len(snapshot.Manifest.Tables))
+		working, _ := repository.OpenWorkingState(repo)
+		if working.Exists() {
+			state, err := working.Status(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Working generation: %d (%s)\n", state.Generation, map[bool]string{true: "dirty", false: "clean"}[state.Dirty])
+		}
+		return nil
+	case "diff":
+		repo, err := repository.Open(ctx, ".")
+		if err != nil {
+			return err
+		}
+		working, _ := repository.OpenWorkingState(repo)
+		changes, err := working.Diff(ctx)
+		if err != nil {
+			return err
+		}
+		if len(changes) == 0 {
+			fmt.Println("No uncommitted data changes.")
+			return nil
+		}
+		for _, change := range changes {
+			fmt.Printf("%s\t%s\n", change.Change, change.Table)
+		}
+		return nil
+	case "commit":
+		set := flag.NewFlagSet("commit", flag.ContinueOnError)
+		message := set.String("m", "", "data commit message")
+		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		if err := set.Parse(args[1:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*message) == "" {
+			return errors.New("commit requires -m <message>")
+		}
+		repo, err := repository.Open(ctx, *repoPath)
+		if err != nil {
+			return err
+		}
+		working, _ := repository.OpenWorkingState(repo)
+		result, err := working.Checkpoint(ctx, *message)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("RepoDB data commit: %s\n", result.Commit)
 		return nil
 	case "snapshot":
 		return errors.New("snapshot is obsolete; RepoDB transactions publish data commits automatically")
@@ -165,6 +212,7 @@ func run(ctx context.Context, args []string) error {
 		set := flag.NewFlagSet("start", flag.ContinueOnError)
 		address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")
 		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		persistence := set.String("persistence", string(engine.PersistenceNativeGit), "persistence mode: native-git or journal")
 		if err := set.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -172,7 +220,7 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		srv, err := repodbserver.New(repodbserver.Config{Address: *address, Repository: repo})
+		srv, err := repodbserver.New(repodbserver.Config{Address: *address, Repository: repo, Persistence: engine.PersistenceMode(*persistence)})
 		if err != nil {
 			return err
 		}

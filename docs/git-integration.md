@@ -1,5 +1,9 @@
 # Git storage and integration decision (M0)
 
+The native-Git path remains the default. In the opt-in M4.3 journal prototype,
+sync refuses dirty durable working state and only exchanges intentional data
+commits; see [working-state.md](working-state.md).
+
 Status: accepted baseline from the executable M0 experiment on 2026-09-11.
 The recorded run used Git 2.55.0 on macOS; the automated experiment remains the
 compatibility check for other supported Git versions and operating systems.

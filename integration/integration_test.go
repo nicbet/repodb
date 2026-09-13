@@ -238,6 +238,31 @@ func TestEnableSyncFastForwardMergeConflictAndResolution(t *testing.T) {
 	}
 }
 
+func TestSyncRefusesDirtyJournalWorkingState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	local := filepath.Join(root, "local")
+	git(t, root, "init", "--bare", remote)
+	git(t, root, "init", "--quiet", "-b", "main", local)
+	git(t, local, "remote", "add", "origin", remote)
+	if _, err := integration.Enable(ctx, local, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.OpenWithOptions(ctx, local, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	session, _ := eng.NewSession()
+	if err := session.Exec(ctx, "CREATE TABLE pending (id BIGINT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := integration.Sync(ctx, local, "origin"); !errors.Is(err, integration.ErrWorkingDirty) {
+		t.Fatalf("dirty sync error = %v", err)
+	}
+}
+
 func TestSyncDoesNotHoldPublicationLockDuringPush(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

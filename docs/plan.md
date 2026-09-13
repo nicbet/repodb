@@ -2,8 +2,8 @@
 
 Status: M0 through M4.1 complete; M4.2's bounded investigation is closed with
 explicit follow-ups. M4.3 durable working state and intentional data commits is
-next, before M5. Updated 2026-09-12. M4.3 describes target behavior, not features
-already implemented.
+in progress, before M5. Updated 2026-09-13. M4.3's section distinguishes its
+implemented prototype from remaining target behavior.
 
 ## Product goal
 
@@ -543,8 +543,10 @@ to M5 to validate these assumptions with real applications.
 
 ### M4.3 — Design and benchmark durable working state and intentional data commits
 
-**Status: next; pending.** Deliver a design and executable, opt-in prototype
-comparing journal-backed SQL with M4.2's native-Git publication path. Use the
+**Status: in progress (2026-09-13).** The design, opt-in journal/checkpoint
+prototype, and paired save/checkpoint harness are implemented; the full benchmark,
+realistic fixture, and hardening matrix remain pending. Continue comparing
+journal-backed SQL with M4.2's native-Git publication path. Use the
 results to make an explicit adoption decision before changing defaults. This
 milestone plans and tests the new persistence model; it does not assume its
 latency or production readiness.

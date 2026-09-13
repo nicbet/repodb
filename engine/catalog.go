@@ -39,6 +39,7 @@ func (p *provider) AllDatabases(*sql.Context) []sql.Database { return []sql.Data
 type database struct {
 	name     string
 	repo     *repository.Repository
+	working  *repository.WorkingState
 	mu       sync.RWMutex
 	snapshot *repository.Snapshot
 }
@@ -128,18 +129,21 @@ func newSession(base *sql.BaseSession, db *database) *session {
 }
 
 func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.TransactionCharacteristic) (sql.Transaction, error) {
-	head, err := s.db.repo.Head(ctx)
+	var current *repository.Snapshot
+	var err error
+	if s.db.working != nil {
+		current, err = s.db.working.Current(ctx)
+	} else {
+		current, err = s.db.repo.Current(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
 	s.db.mu.RLock()
 	snapshot := s.db.snapshot
 	s.db.mu.RUnlock()
-	if snapshot == nil || snapshot.Commit != head {
-		snapshot, err = s.db.repo.SnapshotCommit(ctx, head)
-		if err != nil {
-			return nil, err
-		}
+	if snapshot == nil || snapshot.Commit != current.Commit || snapshot.Generation() != current.Generation() {
+		snapshot = current
 		if err := ValidateSnapshot(ctx, snapshot); err != nil {
 			return nil, err
 		}
@@ -264,10 +268,17 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 	if err := tx.writer.RetainOnly(hashes); err != nil {
 		return err
 	}
-	result, err := tx.writer.CommitWithOutcome(ctx, manifest)
-	if result.Snapshot != nil {
+	var snapshot *repository.Snapshot
+	var err error
+	if s.db.working != nil {
+		snapshot, _, err = s.db.working.Commit(ctx, tx.writer, manifest)
+	} else {
+		result, commitErr := tx.writer.CommitWithOutcome(ctx, manifest)
+		snapshot, err = result.Snapshot, commitErr
+	}
+	if snapshot != nil {
 		s.db.mu.Lock()
-		s.db.snapshot = result.Snapshot
+		s.db.snapshot = snapshot
 		s.db.mu.Unlock()
 	}
 	return err

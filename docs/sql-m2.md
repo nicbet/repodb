@@ -1,5 +1,9 @@
 # M2 persistent SQL contract
 
+This document describes the default native-Git transaction path. The opt-in M4.3
+journal uses the same SQL semantics while separating durable SQL saves from
+intentional Git data commits; see [working-state.md](working-state.md).
+
 M2 provides one repository-backed SQL engine through two entry points: the Go
 `engine` package and the MySQL wire server. Both use the same catalog, table,
 transaction, and publication implementations. Embedded use opens no listener.

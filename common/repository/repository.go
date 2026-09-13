@@ -111,11 +111,16 @@ func (r *Repository) SetPublicationFaultInjector(inject func(PublicationPoint) e
 type Snapshot struct {
 	repo       *Repository
 	Commit     string
+	generation uint64
 	Manifest   Manifest
 	objectSet  map[storage.Hash]struct{}
 	objectOIDs map[storage.Hash]string
 	cache      *snapshotObjectCache
 }
+
+// Generation identifies the durable working-state version layered over Commit.
+// Native-Git snapshots use generation zero.
+func (s *Snapshot) Generation() uint64 { return s.generation }
 
 type snapshotObjectCache struct {
 	mu   sync.RWMutex
@@ -489,6 +494,12 @@ func (w *Writer) Commit(ctx context.Context, manifest Manifest) (*Snapshot, erro
 }
 
 func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (CommitResult, error) {
+	return w.CommitWithOutcomeMessage(ctx, manifest, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
+}
+
+// CommitWithOutcomeMessage publishes a snapshot with an explicit data-history
+// message. SQL's native-Git path continues to use CommitWithOutcome.
+func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest, message string) (CommitResult, error) {
 	result := CommitResult{Outcome: OutcomeRejected}
 	inventoryStarted := time.Now()
 	w.mu.Lock()
@@ -629,7 +640,10 @@ func (w *Writer) CommitWithOutcome(ctx context.Context, manifest Manifest) (Comm
 	if len(parents) == 0 && w.expected != "" {
 		parents = []string{w.expected}
 	}
-	commit, err := w.repo.git.CommitTreeParents(ctx, w.repo.Root, tree, parents, fmt.Sprintf("RepoDB snapshot v%d", FormatVersion))
+	if strings.TrimSpace(message) == "" {
+		message = fmt.Sprintf("RepoDB snapshot v%d", FormatVersion)
+	}
+	commit, err := w.repo.git.CommitTreeParents(ctx, w.repo.Root, tree, parents, message)
 	publicationMetrics.treeCommit.Add(uint64(time.Since(phaseStarted)))
 	if err != nil {
 		return result, err

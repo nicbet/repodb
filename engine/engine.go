@@ -37,10 +37,22 @@ type validationCacheEntry struct {
 
 type Engine struct {
 	repo     *repository.Repository
+	working  *repository.WorkingState
 	database *database
 	provider *provider
 	sql      *sqle.Engine
 	closed   atomic.Bool
+}
+
+type PersistenceMode string
+
+const (
+	PersistenceNativeGit PersistenceMode = "native-git"
+	PersistenceJournal   PersistenceMode = "journal"
+)
+
+type Options struct {
+	Persistence PersistenceMode
 }
 
 type Result struct {
@@ -49,18 +61,43 @@ type Result struct {
 }
 
 func Open(ctx context.Context, path string) (*Engine, error) {
+	return OpenWithOptions(ctx, path, Options{})
+}
+
+func OpenWithOptions(ctx context.Context, path string, options Options) (*Engine, error) {
 	repo, err := repository.Open(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	return New(repo)
+	return NewWithOptions(repo, options)
 }
 
 func New(repo *repository.Repository) (*Engine, error) {
+	return NewWithOptions(repo, Options{})
+}
+
+func NewWithOptions(repo *repository.Repository, options Options) (*Engine, error) {
 	if repo == nil {
 		return nil, errors.New("repository is required")
 	}
-	snapshot, err := repo.Current(context.Background())
+	mode := options.Persistence
+	if mode == "" {
+		mode = PersistenceNativeGit
+	}
+	var working *repository.WorkingState
+	var snapshot *repository.Snapshot
+	var err error
+	switch mode {
+	case PersistenceNativeGit:
+		snapshot, err = repo.Current(context.Background())
+	case PersistenceJournal:
+		working, err = repository.OpenWorkingState(repo)
+		if err == nil {
+			snapshot, err = working.Current(context.Background())
+		}
+	default:
+		return nil, fmt.Errorf("unsupported persistence mode %q", mode)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +113,8 @@ func New(repo *repository.Repository) (*Engine, error) {
 			return &recoverCommitExpression{repo: repo, child: child}
 		},
 	})
-	return &Engine{repo: repo, database: db, provider: provider, sql: sqlEngine}, nil
+	db.working = working
+	return &Engine{repo: repo, working: working, database: db, provider: provider, sql: sqlEngine}, nil
 }
 
 // ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
@@ -85,7 +123,7 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 	if snapshot == nil {
 		return errors.New("snapshot is required")
 	}
-	key := fmt.Sprintf("%s\x00%s\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshotValidationVersion)
+	key := fmt.Sprintf("%s\x00%s\x00%d\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshot.Generation(), snapshotValidationVersion)
 	validatedSnapshots.Lock()
 	if element := validatedSnapshots.entries[key]; element != nil {
 		validatedSnapshots.order.MoveToFront(element)
@@ -121,7 +159,7 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 }
 
 func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]storage.Hash, bool) {
-	key := fmt.Sprintf("%s\x00%s\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshotValidationVersion)
+	key := fmt.Sprintf("%s\x00%s\x00%d\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshot.Generation(), snapshotValidationVersion)
 	validatedSnapshots.Lock()
 	defer validatedSnapshots.Unlock()
 	element := validatedSnapshots.entries[key]
@@ -133,8 +171,9 @@ func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]stora
 	return append([]storage.Hash(nil), hashes...), ok
 }
 
-func (e *Engine) Repository() *repository.Repository { return e.repo }
-func (e *Engine) SQLEngine() *sqle.Engine            { return e.sql }
+func (e *Engine) Repository() *repository.Repository     { return e.repo }
+func (e *Engine) WorkingState() *repository.WorkingState { return e.working }
+func (e *Engine) SQLEngine() *sqle.Engine                { return e.sql }
 
 func (e *Engine) Close() error {
 	if e.closed.Swap(true) {

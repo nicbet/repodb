@@ -1,4 +1,4 @@
-.PHONY: build test fmt m0 m2-bench m4.2-bench
+.PHONY: build test fmt m0 m2-bench m4.2-bench m4.3-bench
 
 build:
 	go build -o bin/repodb ./cmd/repodb
@@ -19,3 +19,7 @@ m2-bench:
 m4.2-bench:
 	go test ./engine -run '^$$' -bench '^BenchmarkSQL' -benchmem -benchtime=500ms -count=5
 	go test ./integration -run '^$$' -bench '^(BenchmarkSyncUpToDateWarm|BenchmarkSyncDivergent)$$' -benchmem -benchtime=1x -count=1
+
+m4.3-bench:
+	go test ./engine -run '^$$' -bench '^BenchmarkM43DurableSave$$' -benchmem -benchtime=30x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkM43JournalCheckpoint$$' -benchmem -benchtime=1x -count=5

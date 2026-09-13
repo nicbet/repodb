@@ -4,8 +4,10 @@ RepoDB is an embedded SQL database for Go that stores and synchronizes applicati
 
 Build issue trackers, kanban boards, and agent tools whose data travels with a
 repository. Write data locally, work offline, and synchronize across clones.
-Database transactions persist automatically in their own Git history, leaving
-your source files, index, and code branches untouched.
+Database transactions persist automatically, leaving your source files, index,
+and code branches untouched. The default currently records each transaction in
+Git data history; M4.3 also includes an opt-in durable-journal prototype for
+intentional data commits.
 
 **Early development:** persistent SQL, synchronization, and three-way merging are
 implemented. The current scope is small tool databases with a documented
@@ -120,10 +122,12 @@ Two repeatable experiments support storage and performance work:
 ```sh
 make m0        # Git storage and transport experiment
 make m2-bench  # Bounded SQL persistence benchmark
+make m4.3-bench # Paired native-Git/journal persistence benchmark
 ```
 
-These recreate `/tmp/repodb-m0` and `/tmp/repodb-m2`, respectively. The
-[SQL guide](docs/sql-m2.md) records workload limits and benchmark results.
+The first two recreate `/tmp/repodb-m0` and `/tmp/repodb-m2`; the M4.3 target
+runs paired Go benchmarks. The [SQL guide](docs/sql-m2.md) records workload
+limits and [the M4.3 report](docs/m4.3-bench.md) records the new comparison.
 
 ## Design and Architecture
 
@@ -177,6 +181,7 @@ updates use bulk rebuilds within the documented small-database workload.
 | [Git integration](docs/git-integration.md) | Ref layout and ordinary Git command behavior |
 | [Synchronization](docs/sync-m3.md) | Enable, tracking refs, and transport |
 | [Merging](docs/merge-m4.md) | Three-way merge, conflict resolution, and distributed row identity |
+| [Working state prototype](docs/working-state.md) | Durable journal, checkpoints, limitations, and adoption decision |
 
 ## Roadmap
 

@@ -17,6 +17,7 @@ type Config struct {
 	Address      string
 	DatabaseName string
 	Repository   *repository.Repository
+	Persistence  engine.PersistenceMode
 }
 
 type Server struct {
@@ -36,7 +37,7 @@ func New(config Config) (*Server, error) {
 		config.DatabaseName = "repodb"
 	}
 
-	persistent, err := engine.New(config.Repository)
+	persistent, err := engine.NewWithOptions(config.Repository, engine.Options{Persistence: config.Persistence})
 	if err != nil {
 		return nil, fmt.Errorf("open persistent SQL engine: %w", err)
 	}

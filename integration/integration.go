@@ -17,6 +17,7 @@ import (
 var (
 	ErrRemoteRequired = errors.New("an explicit RepoDB remote is required")
 	ErrNotEnabled     = errors.New("RepoDB integration is not enabled for this remote")
+	ErrWorkingDirty   = errors.New("RepoDB has uncommitted durable working changes")
 )
 
 type Status struct {
@@ -133,10 +134,16 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
+	if err := requireCleanWorkingState(ctx, repo); err != nil {
+		return Status{}, err
+	}
 	const maxAttempts = 3
 	var last Status
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := requireCleanWorkingState(ctx, repo); err != nil {
+			return last, err
+		}
 		localHead, err := repo.Head(ctx)
 		if err != nil {
 			return Status{}, err
@@ -145,6 +152,10 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 		last = Status{Remote: remote, TrackingRef: tracking, LocalHead: localHead, RemoteHead: remoteHead}
 		if err != nil {
 			last.Action = "fetch-failed"
+			return last, err
+		}
+		if err := requireCleanWorkingState(ctx, repo); err != nil {
+			last.Action = "working-dirty"
 			return last, err
 		}
 		if !remoteExists || localHead == remoteHead {
@@ -317,6 +328,24 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	}
 	last.Action = "retry-exhausted"
 	return last, fmt.Errorf("RepoDB synchronization did not stabilize after %d attempts; both local and tracking histories are preserved: %w", maxAttempts, lastErr)
+}
+
+func requireCleanWorkingState(ctx context.Context, repo *repository.Repository) error {
+	working, err := repository.OpenWorkingState(repo)
+	if err != nil {
+		return err
+	}
+	if !working.Exists() {
+		return nil
+	}
+	status, err := working.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if status.Dirty {
+		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", ErrWorkingDirty, status.Generation)
+	}
+	return nil
 }
 
 func pushExpected(ctx context.Context, repo *repository.Repository, cli repodbgit.CLI, root, remote, expected string) error {

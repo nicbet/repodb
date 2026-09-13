@@ -1,5 +1,9 @@
 # Git snapshot format and durability (M1/M2)
 
+This remains the default native-Git persistence path. M4.3's opt-in authoritative
+journal and intentional checkpoint protocol are documented in
+[working-state.md](working-state.md); they do not change the default yet.
+
 Status: format version 1 baseline, implemented 2026-09-11.
 
 ## Authoritative state

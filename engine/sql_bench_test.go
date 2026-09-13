@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -12,6 +13,98 @@ import (
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
 )
+
+func BenchmarkM43DurableSave(b *testing.B) {
+	for _, mode := range []engine.PersistenceMode{engine.PersistenceNativeGit, engine.PersistenceJournal} {
+		for _, rows := range []int{1_000, 10_000, 50_000} {
+			for _, batch := range []int{1, 10, 100} {
+				b.Run(fmt.Sprintf("mode=%s/rows=%d/batch=%d", mode, rows, batch), func(b *testing.B) {
+					eng, repo := sqlBenchmarkEngineWithRepository(b, rows, 64, 1)
+					if mode == engine.PersistenceJournal {
+						_ = eng.Close()
+						var err error
+						eng, err = engine.NewWithOptions(repo, engine.Options{Persistence: mode})
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+					defer eng.Close()
+					session, _ := eng.NewSession()
+					defer session.Close()
+					ctx := context.Background()
+					beforeHead, _ := repo.Head(ctx)
+					var beforeBytes int64
+					if eng.WorkingState() != nil {
+						if info, err := os.Stat(eng.WorkingState().JournalPath()); err == nil {
+							beforeBytes = info.Size()
+						}
+					}
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := range b.N {
+						tx, err := session.Begin(ctx)
+						if err != nil {
+							b.Fatal(err)
+						}
+						for offset := range batch {
+							key := 1 + (i*batch+offset)%rows
+							if err := tx.Exec(ctx, "UPDATE bench SET value = ? WHERE id = ?", fmt.Sprintf("m43-%08d-%03d", i, offset), key); err != nil {
+								b.Fatal(err)
+							}
+						}
+						if err := tx.Commit(ctx); err != nil {
+							b.Fatal(err)
+						}
+					}
+					b.StopTimer()
+					afterHead, _ := repo.Head(ctx)
+					if mode == engine.PersistenceJournal && afterHead != beforeHead {
+						b.Fatalf("journal advanced Git head: %s -> %s", beforeHead, afterHead)
+					}
+					if eng.WorkingState() != nil {
+						info, err := os.Stat(eng.WorkingState().JournalPath())
+						if err != nil {
+							b.Fatal(err)
+						}
+						b.ReportMetric(float64(info.Size()-beforeBytes)/float64(b.N), "journal-bytes/op")
+					}
+				})
+			}
+		}
+	}
+}
+
+func BenchmarkM43JournalCheckpoint(b *testing.B) {
+	for _, batch := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
+			b.StopTimer()
+			for range b.N {
+				eng, repo := sqlBenchmarkEngineWithRepository(b, 10_000, 64, 1)
+				_ = eng.Close()
+				eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceJournal})
+				if err != nil {
+					b.Fatal(err)
+				}
+				session, _ := eng.NewSession()
+				tx, _ := session.Begin(context.Background())
+				for key := 1; key <= batch; key++ {
+					if err := tx.Exec(context.Background(), "UPDATE bench SET value = ? WHERE id = ?", "checkpoint", key); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := tx.Commit(context.Background()); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				if _, err := eng.WorkingState().Checkpoint(context.Background(), "M4.3 benchmark checkpoint"); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				_ = eng.Close()
+			}
+		})
+	}
+}
 
 type durabilitySample struct {
 	metrics    repodbgit.DurabilityMetrics
