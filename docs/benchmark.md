@@ -119,6 +119,92 @@ identical SQL, identical correctness checks, identical reporting. Compare all
 four columns (native-git, journal, MySQL, Dolt) from sequential runs on the
 same hardware, filesystem, and power state.
 
+## Reference comparison (2026-09-13)
+
+Apple M1 Max, macOS 15.7, APFS, Go 1.27.1, Git 2.55.0. RepoDB runs embedded;
+MySQL 8 and Dolt run in Docker containers on the same machine. All runs use the
+same workload code, 30 requests per workload, correctness checks passing. MySQL
+and Dolt skip Git-specific operations (sync, merge, conflict, reopen). Raw JSON
+is in `docs/scorecard-{native-git,journal,mysql,dolt}.json`.
+
+### Single-client SQL latency, p50 ms
+
+| Workload | Rows | MySQL 8 | Dolt | RepoDB Journal | RepoDB Native Git |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Point read | 1k | 0.2 | 0.3 | 6.8 | 27 |
+| Point read | 10k | 0.2 | 0.3 | 6.6 | 38 |
+| Point read | 50k | 0.2 | 0.4 | 7.0 | 52 |
+| Range (100) | 1k | 0.4 | 0.5 | 8.5 | 29 |
+| Range (100) | 10k | 0.4 | 0.5 | 25 | 56 |
+| Range (100) | 50k | 0.4 | 0.5 | 95 | 138 |
+| Full scan | 1k | 15 | 15 | 8.6 | 29 |
+| Full scan | 10k | 16 | 19 | 25 | 55 |
+| Full scan | 50k | 29 | 38 | 96 | 140 |
+| Update x1 | 1k | 1.3 | 1.6 | 6.1 | 192 |
+| Update x1 | 10k | 1.4 | 1.7 | 12 | 278 |
+| Update x1 | 50k | 1.3 | 1.6 | 13 | 414 |
+| Update x10 | 50k | 5.5 | 7.2 | 15 | 356 |
+| Update x100 | 50k | 59 | 80 | 29 | 369 |
+| Insert | 50k | 1.2 | 1.0 | 6.0 | 209 |
+| Delete | 50k | 1.2 | 1.0 | 6.1 | 209 |
+| Rollback | 50k | 1.1 | 0.8 | 0.1 | 105 |
+
+### Concurrency, 50k rows, p50 ms
+
+| Workload | Clients | MySQL 8 | Dolt | RepoDB Journal | RepoDB Native Git |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed 80/20 read/write | 4 | 0.7 | 0.5 | 1.2 | 70 |
+| Mixed 80/20 read/write | 16 | 1.6 | 0.7 | 2.2 | 87 |
+| Contended increment | 4 | 2.0 | 1.7 | 34 | 261 |
+| Contended increment | 16 | 8.5 | — | 61 | 295 |
+
+Dolt's 16-client contended increment fails with a serialization error (MySQL
+error 1213); the harness does not map it to a retryable conflict.
+
+### Sync latency, 50k rows, p50 ms (RepoDB only)
+
+| Workload | Native Git | Journal |
+| --- | ---: | ---: |
+| Sync unchanged | 158 | 236 |
+| Edit/sync roundtrip | 1,023 | 6,394 |
+| Divergent merge | 2,550 | 18,266 |
+| Conflict resolve | 2,812 | 23,887 |
+
+Journal-mode sync is 6–8x slower because each sync iteration checkpoints
+accumulated journal state to Git before exchanging history. Thirty iterations
+compound checkpoint cost with growing repository and journal size.
+
+### What the numbers say
+
+**Reads.** MySQL and Dolt serve point reads in sub-millisecond time from
+in-memory indexes. RepoDB journal takes 7 ms because every transaction start
+loads table metadata from content-addressed Prolly objects; native-git adds
+Git-ref resolution on top. Range and scan latency grows with row count in
+RepoDB because it materializes rows from the Prolly tree; MySQL and Dolt
+keep pages in a buffer pool.
+
+**Small writes.** MySQL and Dolt commit a single-row update in 1–2 ms.
+RepoDB journal takes 5–13 ms (Prolly mutation plus one `fsync`). Native-git
+takes 130–414 ms (full Git snapshot: object hashing, tree construction,
+commit, ref CAS).
+
+**Batch writes.** RepoDB journal (29 ms for 100 updates) beats Dolt (80 ms)
+and approaches MySQL (59 ms) because the journal appends one framed record
+regardless of batch size. Native-git stays at 370 ms because Git publication
+cost is per-transaction, not per-row.
+
+**Concurrency.** All four handle mixed read/write well. Contended single-row
+increments expose serialization overhead: MySQL uses row locks (8.5 ms at 16
+clients), RepoDB journal uses generation-based CAS (61 ms), native-git uses
+Git ref CAS (295 ms with 80% conflict rate).
+
+**Trade-off.** Neither MySQL nor Dolt provides Git-native version history,
+cross-clone synchronization, or merge. RepoDB's read and write overhead is
+the cost of content-addressed storage and deterministic trees that make those
+features possible. The journal prototype reduces write latency to within 5–10x
+of MySQL for small operations; reads remain the larger gap and the next
+optimization target.
+
 ## Explicit coverage limits
 
 This is one extensible scorecard, not proof of every database property. Version 1
