@@ -654,6 +654,104 @@ behavior on every filesystem. Prototype completion does not imply target latency
 or production readiness. Update storage, SQL, sync, recovery, and user docs before
 switching defaults; M5 takes the selected rollout and application work.
 
+### M4.4 — Close the measured per-operation overhead gaps
+
+**Status: planned (2026-09-13).** The four-way scorecard (native-git, journal,
+MySQL 8, Dolt) establishes that journal-mode SQL latency is 5–35x higher than
+MySQL for the same workloads on the same machine. Phase attribution identifies
+three fixable bottlenecks that account for nearly all of the gap: per-transaction
+lock and metadata reload, full-chunk journal writes, and per-transaction fsync.
+
+**Evidence from the scorecard and M4.3 attribution:**
+
+| Phase | Cost | What it does | Why it's avoidable |
+| --- | --- | --- | --- |
+| Working-state lock | ~1–2 ms/tx | `flock` + `OpenFile` + `Stat` on every `Current()` call | A single-process embedded engine with an in-memory cache hit has no concurrent writer to coordinate with |
+| Table metadata reload | ~2–3 ms/tx | `store.Get` + JSON decode of every table's schema blob on every `StartTransaction` | When the snapshot hasn't changed (same generation), the decoded schemas from the previous transaction are still valid |
+| Prolly tree mutation | 1–9 ms/tx | Rebuild affected chunks for a single-row edit, write ~1.5 MB of full chunks to journal | A typed row-edit record (179 bytes for one row) defers chunk materialization to checkpoint |
+| fsync | 5–7 ms/tx | One `file.Sync()` per transaction | Group commit batches multiple transactions into one fsync; the single-writer floor is APFS hardware latency |
+
+**Targets (same reference machine as M4.3, measured against MySQL 8 on Docker):**
+
+- Warm single-row read: **< 1 ms** (currently 7 ms; MySQL is 0.2 ms)
+- Warm single-row write: **< 2 ms** single writer, **< 1 ms** amortized with concurrent writers (currently 13 ms; MySQL is 1.3 ms)
+- These are product targets for the journal path, not guarantees. Report missed
+  targets with bottleneck attribution. Checkpoint and sync costs are measured
+  separately and may increase.
+
+Implement in this order:
+
+1. **Cache decoded table metadata across transactions.** When `StartTransaction`
+   finds the snapshot unchanged (same commit and generation as the previous
+   transaction on this session or database), reuse the previously decoded
+   `tableState` entries — schema, manifest, and store reference — instead of
+   re-reading and re-decoding schema blobs. Invalidate when the snapshot changes
+   (another transaction committed, checkpoint advanced, or sync changed the base).
+   A `tableState` that carried edits from a previous transaction must not leak
+   into a new one; cache the clean decoded metadata, not the mutable transaction
+   state. Preserve the existing validation-cache contract: a cached schema is
+   trusted only for a snapshot whose validation cache entry is present.
+
+2. **Eliminate the filesystem lock for in-process cache hits.** When
+   `WorkingState.Current()` finds its in-memory cache valid (same file identity
+   and size), return the cached snapshot without acquiring the file lock. The
+   process-local mutex is sufficient for in-process coordination; the file lock
+   is needed only when the journal file may have been modified by another process
+   (cache miss, size change, or file replacement). Preserve the file lock for
+   `Commit`, `Checkpoint`, and any `load` that reads new frames. A write that
+   holds only the in-process mutex and discovers a stale cache must re-acquire
+   the file lock before proceeding. Verify with the existing cross-process and
+   linked-worktree tests.
+
+3. **Typed row-edit journal records.** Replace full Prolly-chunk journal payloads
+   with typed row and schema edit records. A `prepare` frame carries the table
+   name, primary key, encoded row value (or deletion marker), and schema changes
+   — not rebuilt chunk blobs. Journal bytes per single-row save drop from ~1.5 MB
+   to ~200 bytes. Reads overlay the accumulated typed edits on the Prolly tree from
+   the checkpoint base: point lookups check the edit map first, scans merge the
+   edit map with the tree iterator. Checkpoint materializes the edits into canonical
+   Prolly trees and publishes the Git snapshot. Recovery replays typed edits onto
+   the checkpoint base. The M4.3 lower-bound experiment (`BenchmarkM43TypedEditJournal`)
+   demonstrated 4.5 ms saves at this payload size; the remaining cost was fsync.
+
+4. **Group commit.** Batch concurrent transactions waiting for durability into one
+   journal append and one `fsync`. A committing transaction enters a queue; the
+   first waiter becomes the leader, collects all transactions that arrived before
+   the fsync completes, appends their records in generation order, calls `fsync`
+   once, and wakes all participants. The amortized cost per transaction drops to
+   encode + append time when multiple writers are active. A single writer still
+   pays one full fsync. Preserve generation monotonicity, stale-writer rejection,
+   and per-transaction outcome reporting. The leader must not acknowledge a
+   participant whose record was not included in the flushed batch. Verify with the
+   contended-increment correctness check from the scorecard.
+
+**Acceptance and measurement:**
+
+- Rerun the four-way scorecard (`make bench BENCH_MODE=journal` and
+  `make bench-external`) on the same machine and report before/after for every
+  workload. The primary comparison is journal-mode p50 versus MySQL 8 p50 at
+  50k rows for point reads, single-row updates, and inserts.
+- Reads must not reload table metadata when the snapshot is unchanged. Add a
+  counter for metadata cache hits/misses and report it in the scorecard JSON.
+- Writes must not include Prolly chunk bytes in the journal. Report journal
+  bytes per save and verify the reduction from ~1.5 MB to ~200 bytes for
+  single-row updates at 50k rows.
+- Group commit must pass the contended-increment lost-update check at 16 clients.
+  Report the fsync count per batch and the amortized per-transaction latency.
+- Checkpoint must produce identical Git snapshots regardless of whether the
+  journal contains chunk-based or typed-edit records. Verify with the existing
+  checkpoint reconstruction tests after cache deletion and GC.
+- Run `go test ./...`, `go test -race ./common/repository ./engine ./integration`,
+  `make build`, and `git diff --check`. Retain publication, corruption, isolation,
+  merge, recovery, cross-process, and linked-worktree coverage.
+
+**Exit:** all four optimizations are implemented, measured, and compared against
+the MySQL/Dolt baselines on the scorecard. The journal path is within 10x of
+MySQL for reads and within 5x for writes, or the remaining gap is attributed to
+specific costs with evidence for further deferral. Checkpoint and sync costs are
+reported separately; displaced work must not disappear from measurements. Update
+`docs/benchmark.md` with the new scorecard results before proceeding to M5.
+
 ### M5 — Complete the accepted integration and prove the tool-author experience
 
 - Complete adoption/migration work selected by M4.3, then build examples around
@@ -691,11 +789,10 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Deliver M4.3's working-state design and paired journal/native-Git prototype
-benchmark. Separate durable SQL saves from intentional data commits; evaluate
-the 10 ms save / 50 ms warm board targets on a realistic fixture. Record the
-adoption and migration decision before M5. Deferred M4.2 characterization remains
-explicitly assigned to M5/M6 rather than blocking this focused experiment.
+Deliver M4.4's per-operation overhead reductions: cached table metadata, lockless
+cache hits, typed-edit journal records, and group commit. The four-way scorecard
+establishes the gap; M4.4 closes the measured bottlenecks. Rerun the scorecard
+after each step and compare against MySQL 8 and Dolt on the same machine.
 
 ## References
 
