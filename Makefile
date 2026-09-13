@@ -1,4 +1,4 @@
-.PHONY: build test fmt bench m0 m2-bench m4.2-bench m4.3-bench
+.PHONY: build test fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
 .DEFAULT_GOAL := build
 
 BENCH_MODE ?= native-git
@@ -6,6 +6,10 @@ BENCH_ARGS ?=
 
 bench:
 	go run ./experiments/dbbench -mode $(BENCH_MODE) $(BENCH_ARGS)
+
+BENCH_DSN ?= root@tcp(127.0.0.1:3306)/
+bench-external:
+	go run ./experiments/dbbench -mode external -dsn '$(BENCH_DSN)' $(BENCH_ARGS)
 
 build:
 	go build -o bin/repodb ./cmd/repodb

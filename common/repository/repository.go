@@ -674,12 +674,15 @@ func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest
 	phaseStarted = time.Now()
 	if err := w.repo.git.UpdateRef(ctx, w.repo.Root, DataRef, commit, w.expected); err != nil {
 		publicationMetrics.refUpdate.Add(uint64(time.Since(phaseStarted)))
+		actual, resolveErr := w.repo.git.ResolveRef(context.Background(), w.repo.Root, DataRef)
+		if resolveErr == nil && actual != w.expected {
+			// Another writer advanced the ref past our expected head. Even if
+			// actual == commit (identical tree/parents/timestamp produced the
+			// same hash), our CAS did not succeed.
+			return CommitResult{Outcome: OutcomeRejected, Commit: commit}, ErrConflict
+		}
 		result = w.repo.resolvePublication(commit, w.expected)
 		if result.Outcome == OutcomeRejected {
-			actual, resolveErr := w.repo.git.ResolveRef(context.Background(), w.repo.Root, DataRef)
-			if resolveErr == nil && actual != w.expected {
-				return result, ErrConflict
-			}
 			return result, err
 		}
 		if result.Outcome == OutcomeUnknown {

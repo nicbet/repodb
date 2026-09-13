@@ -75,7 +75,8 @@ type report struct {
 var ctx = context.Background()
 
 func main() {
-	mode := flag.String("mode", "native-git", "persistence: native-git or journal (setup only)")
+	mode := flag.String("mode", "native-git", "persistence: native-git, journal, or external")
+	dsn := flag.String("dsn", "", "MySQL DSN for external mode (e.g. root@tcp(127.0.0.1:3306)/)")
 	rows := flag.String("rows", "1000,10000,50000", "fixture sizes")
 	clients := flag.String("clients", "1,4,16", "concurrent clients")
 	requests := flag.Int("requests", 30, "requests per client per repeated workload")
@@ -109,7 +110,11 @@ func main() {
 		return
 	}
 	c := config{Mode: *mode, Rows: integers(*rows), Clients: integers(*clients), Requests: *requests}
-	if len(c.Rows) == 0 || len(c.Clients) == 0 || c.Requests < 1 || (c.Mode != "native-git" && c.Mode != "journal") {
+	if *mode == "external" && *dsn == "" {
+		printExternalUsage()
+		os.Exit(2)
+	}
+	if len(c.Rows) == 0 || len(c.Clients) == 0 || c.Requests < 1 || (c.Mode != "native-git" && c.Mode != "journal" && c.Mode != "external") {
 		fmt.Fprintln(os.Stderr, "invalid mode, positive row/client list, or request count")
 		os.Exit(2)
 	}
@@ -125,7 +130,11 @@ func main() {
 		os.Exit(1)
 	}
 	r := report{Version: 1, Started: time.Now().UTC(), Config: c, Go: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH, Git: commandOutput("git", "--version"), Revision: commandOutput("git", "rev-parse", "HEAD"), WorkingTree: commandOutput("git", "status", "--porcelain"), Root: root}
-	err = run(&r)
+	if *mode == "external" {
+		err = runExternal(&r, *dsn)
+	} else {
+		err = run(&r)
+	}
 	if err != nil {
 		r.Failure = err.Error()
 	}

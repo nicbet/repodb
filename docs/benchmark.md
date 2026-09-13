@@ -93,24 +93,60 @@ file lengths across the local repository, remote, and peer; it is neither physic
 disk allocation nor network transfer volume. Setup/client connection establishment
 is outside repeated SQL request timing. There is no artificial warmup.
 
+## External baselines
+
+`make bench-external` runs the portable SQL workloads against an external
+MySQL-compatible server. Git-specific operations (sync, merge, conflict,
+reopen) are skipped; everything else — reads, writes, concurrency, correctness
+checks — uses the same workload code and reporting format.
+
+```sh
+# MySQL (default DSN)
+make bench-external
+
+# Dolt (default sql-server port)
+make bench-external BENCH_DSN='root:@tcp(127.0.0.1:3336)/'
+
+# Quick smoke
+make bench-external BENCH_DSN='root@tcp(127.0.0.1:3306)/' \
+  BENCH_ARGS='-rows 100 -clients 1,4 -requests 2 -output /tmp/mysql-smoke.json'
+```
+
+A fresh database is created per fixture size and dropped on success. The DSN
+follows `go-sql-driver/mysql` format (`user:pass@tcp(host:port)/`). Results are
+directly comparable to the native-git and journal runs on the same machine:
+identical SQL, identical correctness checks, identical reporting. Compare all
+four columns (native-git, journal, MySQL, Dolt) from sequential runs on the
+same hardware, filesystem, and power state.
+
 ## Explicit coverage limits
 
 This is one extensible scorecard, not proof of every database property. Version 1
 does not measure power-loss recovery, network latency/bandwidth, process-level
 writer contention, live SQL latency during checkpoint/compaction, realistic board
-requests, independent history-depth scaling, secondary indexes, or external
-MySQL/Dolt baselines. Crash/fault correctness remains in the existing test suite.
+requests, or independent history-depth scaling. Crash/fault correctness remains
+in the existing test suite.
 Add future dimensions here and to the same runner, rather than introducing another
 milestone-specific headline benchmark. Change the suite version when workload
 semantics change, and never compare different suite versions as matched results.
 
 ## Initial harness verification
 
-The 100-row, 1/4-client, two-request smoke runs on the 2026-09-13 working checkout
-exposed failures beyond the existing passing test suite: journal mode rejects a
-second divergent merge or conflict-resolution cycle with `transaction base changed`,
-and native-Git contended increments have produced a final counter below the number
-of acknowledged increments. These are observed failures requiring engine investigation,
-not benchmark exclusions or performance reference results. The runner preserves
-the failed results and exits nonzero. No engine behavior was changed to make this
-scorecard pass.
+The 100-row, 1/4-client, two-request smoke runs on the initial 2026-09-13 working
+checkout exposed two failures beyond the existing passing test suite:
+
+1. **Journal divergent merge** (`transaction base changed`): after sync advances
+   the Git head, journal replay rejected the next transaction because its base
+   commit differed from the checkpoint's. Fixed by allowing a clean journal's base
+   to advance during replay when an external operation (sync) changed the Git head
+   between a checkpoint and the subsequent transaction.
+
+2. **Native-Git contended increment** (counter below acknowledged increments):
+   when two concurrent writers produced identical Git commits (same tree, parents,
+   and second-resolution timestamp), `resolvePublication` falsely reported the
+   second writer's CAS failure as committed because the ref pointed at the same
+   hash. Fixed by treating any ref advancement past the expected head as a conflict,
+   regardless of whether the current ref equals the candidate commit.
+
+Both fixes preserve the existing test suite, race tests, and the documented
+outcome-recovery contract. The smoke runs now pass in both modes.

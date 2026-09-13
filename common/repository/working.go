@@ -585,7 +585,17 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				return workingView{}, fmt.Errorf("%w: non-monotonic generation", ErrWorkingCorrupt)
 			}
 			if prepare.BaseCommit != view.baseCommit {
-				return workingView{}, fmt.Errorf("%w: transaction base changed", ErrWorkingCorrupt)
+				if view.dirty {
+					return workingView{}, fmt.Errorf("%w: transaction base changed while dirty", ErrWorkingCorrupt)
+				}
+				// Clean journal: an external operation (sync) advanced the
+				// Git head between the last checkpoint and this transaction.
+				newBase, err := w.repo.SnapshotCommit(ctx, prepare.BaseCommit)
+				if err != nil {
+					return workingView{}, fmt.Errorf("load advanced base %s: %w", prepare.BaseCommit, err)
+				}
+				newBase.generation = view.generation
+				view.snapshot, view.baseCommit = newBase, prepare.BaseCommit
 			}
 			available := make(map[storage.Hash]struct{}, len(prepare.Manifest.Objects))
 			for _, hash := range prepare.Manifest.Objects {
