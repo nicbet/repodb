@@ -53,14 +53,15 @@ func TestJournalSQLSurvivesRestartWithoutAdvancingGit(t *testing.T) {
 		t.Fatalf("recovered rows = %#v, %v", result.Rows, err)
 	}
 
-	native, err := engine.Open(ctx, root)
+	if _, err := engine.Open(ctx, root); !errors.Is(err, repository.ErrWorkingStateDirty) {
+		t.Fatalf("native engine with dirty journal = %v", err)
+	}
+	committed, err := repo.Current(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer native.Close()
-	nativeSession, _ := native.NewSession()
-	if _, err := nativeSession.Query(ctx, "SELECT title FROM issues"); err == nil {
-		t.Fatal("native-Git control observed uncheckpointed table")
+	if _, exists := committed.Manifest.Tables["issues"]; exists {
+		t.Fatal("committed Git snapshot contains uncheckpointed table")
 	}
 }
 
@@ -148,6 +149,15 @@ func TestJournalRejectsStaleWriterAndIgnoresIncompleteTail(t *testing.T) {
 	_ = file.Close()
 	if _, err := working.Current(ctx); err != nil {
 		t.Fatalf("incomplete tail prevented recovery: %v", err)
+	}
+	writer, _ := eng.NewSession()
+	if err := writer.Exec(ctx, "INSERT INTO issues VALUES (3, 'after-tail')"); err != nil {
+		t.Fatalf("append after incomplete tail: %v", err)
+	}
+	verified, err := repository.OpenWorkingState(repo)
+	if err != nil { t.Fatal(err) }
+	if _, err := verified.Current(ctx); err != nil {
+		t.Fatalf("journal after tail repair: %v", err)
 	}
 }
 
@@ -301,5 +311,73 @@ func TestSeparateJournalEnginesObserveProgressAndRejectStaleWriter(t *testing.T)
 	result, err := reader.Query(ctx, "SELECT title FROM shared_rows")
 	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "winner" {
 		t.Fatalf("cross-engine rows = %#v, %v", result.Rows, err)
+	}
+}
+
+func TestJournalCacheUsesVerifiedOffsetAndDetectsReplacement(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	a, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	sa, _ := a.NewSession()
+	if err := sa.Exec(ctx, "CREATE TABLE cached_rows (id BIGINT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	working := a.WorkingState()
+	working.ResetMetrics()
+	if _, err := working.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := working.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	metrics := working.Metrics()
+	if metrics.CacheHits < 2 || metrics.LoadBytes != 0 || metrics.FullReplays != 0 {
+		t.Fatalf("cached metrics = %#v", metrics)
+	}
+
+	b, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := b.NewSession()
+	if err := sb.Exec(ctx, "INSERT INTO cached_rows VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.Close()
+	working.ResetMetrics()
+	status, err := working.Status(ctx)
+	if err != nil || status.Generation != 2 {
+		t.Fatalf("incremental status = %#v, %v", status, err)
+	}
+	metrics = working.Metrics()
+	if metrics.IncrementalReplays != 1 || metrics.LoadFrames != 2 || metrics.LoadBytes == 0 || metrics.FullReplays != 0 {
+		t.Fatalf("incremental metrics = %#v", metrics)
+	}
+
+	data, err := os.ReadFile(working.JournalPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := working.JournalPath() + ".replacement"
+	if err := os.WriteFile(replacement, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, working.JournalPath()); err != nil {
+		t.Fatal(err)
+	}
+	working.ResetMetrics()
+	if _, err := working.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	metrics = working.Metrics()
+	if metrics.FullReplays != 1 || metrics.LoadFrames != 4 {
+		t.Fatalf("replacement metrics = %#v", metrics)
 	}
 }

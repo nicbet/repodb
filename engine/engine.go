@@ -89,6 +89,19 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 	var err error
 	switch mode {
 	case PersistenceNativeGit:
+		workingCheck, workingErr := repository.OpenWorkingState(repo)
+		if workingErr != nil {
+			return nil, workingErr
+		}
+		if workingCheck.Exists() {
+			status, statusErr := workingCheck.Status(context.Background())
+			if statusErr != nil {
+				return nil, statusErr
+			}
+			if status.Dirty {
+				return nil, fmt.Errorf("%w; open with journal persistence or checkpoint it first", repository.ErrWorkingStateDirty)
+			}
+		}
 		snapshot, err = repo.Current(context.Background())
 	case PersistenceJournal:
 		working, err = repository.OpenWorkingState(repo)
@@ -174,6 +187,25 @@ func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]stora
 func (e *Engine) Repository() *repository.Repository     { return e.repo }
 func (e *Engine) WorkingState() *repository.WorkingState { return e.working }
 func (e *Engine) SQLEngine() *sqle.Engine                { return e.sql }
+
+// Checkpoint publishes the journal's durable working generation to Git and
+// refreshes this engine's validated snapshot. It is unavailable in native-Git
+// persistence mode, where every SQL transaction already publishes a snapshot.
+func (e *Engine) Checkpoint(ctx context.Context, message string) (repository.CommitResult, error) {
+	if e.working == nil {
+		return repository.CommitResult{Outcome: repository.OutcomeRejected}, errors.New("checkpoint requires journal persistence")
+	}
+	result, err := e.working.Checkpoint(ctx, message)
+	if result.Snapshot != nil {
+		if validateErr := ValidateSnapshot(ctx, result.Snapshot); validateErr != nil {
+			return result, errors.Join(err, validateErr)
+		}
+		e.database.mu.Lock()
+		e.database.snapshot = result.Snapshot
+		e.database.mu.Unlock()
+	}
+	return result, err
+}
 
 func (e *Engine) Close() error {
 	if e.closed.Swap(true) {

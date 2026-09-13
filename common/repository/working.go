@@ -15,6 +15,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nicbet/repodb/common/storage"
@@ -26,6 +28,7 @@ const workingFormatVersion = 1
 var (
 	ErrWorkingCorrupt     = errors.New("corrupt RepoDB working journal")
 	ErrWorkingBaseChanged = errors.New("RepoDB committed head changed while working state is dirty")
+	ErrWorkingStateDirty  = errors.New("RepoDB durable working state is dirty")
 )
 
 type WorkingFaultPoint string
@@ -40,8 +43,31 @@ const (
 // WorkingState is the opt-in M4.3 durable journal prototype. Its files are
 // authoritative and live beneath the repository's common Git directory.
 type WorkingState struct {
-	repo  *Repository
-	fault func(WorkingFaultPoint) error
+	repo    *Repository
+	fault   func(WorkingFaultPoint) error
+	mu      sync.Mutex
+	cache   *workingCache
+	metrics workingMetricCounters
+}
+
+type WorkingMetrics struct {
+	LoadNanos, LoadBytes, LoadFrames, CacheHits uint64
+	FullReplays, IncrementalReplays             uint64
+	PrepareNanos, PreparedBytes                 uint64
+	EncodeNanos, EncodedBytes                   uint64
+	AppendNanos, FlushNanos                     uint64
+}
+
+type workingMetricCounters struct {
+	loadNanos, loadBytes, loadFrames, cacheHits, fullReplays atomic.Uint64
+	incrementalReplays, prepareNanos, preparedBytes          atomic.Uint64
+	encodeNanos, encodedBytes, appendNanos, flushNanos       atomic.Uint64
+}
+
+type workingCache struct {
+	view   workingView
+	info   os.FileInfo
+	offset int64
 }
 
 type WorkingStatus struct {
@@ -91,6 +117,15 @@ type workingView struct {
 	baseCommit string
 }
 
+type journalFrame struct {
+	record journalRecord
+	end    int64
+}
+
+type journalWriteMetrics struct {
+	encodeNanos, encodedBytes, appendNanos, flushNanos uint64
+}
+
 func OpenWorkingState(repo *Repository) (*WorkingState, error) {
 	if repo == nil {
 		return nil, errors.New("repository is required")
@@ -99,6 +134,30 @@ func OpenWorkingState(repo *Repository) (*WorkingState, error) {
 }
 
 func (w *WorkingState) SetFaultInjector(inject func(WorkingFaultPoint) error) { w.fault = inject }
+
+func (w *WorkingState) Metrics() WorkingMetrics {
+	return WorkingMetrics{
+		LoadNanos: w.metrics.loadNanos.Load(), LoadBytes: w.metrics.loadBytes.Load(), LoadFrames: w.metrics.loadFrames.Load(), CacheHits: w.metrics.cacheHits.Load(),
+		FullReplays: w.metrics.fullReplays.Load(), IncrementalReplays: w.metrics.incrementalReplays.Load(),
+		PrepareNanos: w.metrics.prepareNanos.Load(), PreparedBytes: w.metrics.preparedBytes.Load(),
+		EncodeNanos: w.metrics.encodeNanos.Load(), EncodedBytes: w.metrics.encodedBytes.Load(), AppendNanos: w.metrics.appendNanos.Load(), FlushNanos: w.metrics.flushNanos.Load(),
+	}
+}
+
+func (w *WorkingState) ResetMetrics() {
+	w.metrics.loadNanos.Store(0)
+	w.metrics.loadBytes.Store(0)
+	w.metrics.loadFrames.Store(0)
+	w.metrics.cacheHits.Store(0)
+	w.metrics.fullReplays.Store(0)
+	w.metrics.incrementalReplays.Store(0)
+	w.metrics.prepareNanos.Store(0)
+	w.metrics.preparedBytes.Store(0)
+	w.metrics.encodeNanos.Store(0)
+	w.metrics.encodedBytes.Store(0)
+	w.metrics.appendNanos.Store(0)
+	w.metrics.flushNanos.Store(0)
+}
 
 func (w *WorkingState) Dir() string {
 	return filepath.Join(w.repo.CommonDir, "repodb", "working", "v1")
@@ -199,9 +258,14 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 	if writer.base.Generation() != view.generation || writer.base.Commit != view.snapshot.Commit {
 		return nil, "", ErrConflict
 	}
+	prepareStarted := time.Now()
 	manifest, available, objects, err := takeWorkingWriter(writer, manifest)
 	if err != nil {
 		return nil, "", err
+	}
+	w.metrics.prepareNanos.Add(uint64(time.Since(prepareStarted)))
+	for _, data := range objects {
+		w.metrics.preparedBytes.Add(uint64(len(data)))
 	}
 	txid, err := randomID()
 	if err != nil {
@@ -215,16 +279,35 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 			return nil, txid, &WorkingCommitError{Outcome: OutcomeRejected, TransactionID: txid, Err: err}
 		}
 	}
-	if err := w.appendRecords(prepare, marker); err != nil {
+	if err := w.truncateIncompleteTail(); err != nil {
+		return nil, txid, &WorkingCommitError{Outcome: OutcomeUnknown, TransactionID: txid, Err: err}
+	}
+	writeMetrics, err := w.appendRecords(prepare, marker)
+	w.recordWriteMetrics(writeMetrics)
+	if err != nil {
 		return nil, txid, &WorkingCommitError{Outcome: OutcomeUnknown, TransactionID: txid, Err: err}
 	}
 	snapshot := workingSnapshot(writer.base, manifest, available, objects, generation)
+	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
+		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit}, info: info, offset: info.Size()}
+	}
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
 			return snapshot, txid, &WorkingCommitError{Outcome: OutcomeCommitted, TransactionID: txid, Err: err}
 		}
 	}
 	return snapshot, txid, nil
+}
+
+func (w *WorkingState) truncateIncompleteTail() error {
+	if w.cache == nil || w.cache.info == nil {
+		return nil
+	}
+	info, err := os.Stat(w.JournalPath())
+	if err != nil || !os.SameFile(info, w.cache.info) || info.Size() <= w.cache.offset {
+		return err
+	}
+	return os.Truncate(w.JournalPath(), w.cache.offset)
 }
 
 // RecoverTransaction resolves the durable outcome of a journal transaction ID.
@@ -309,8 +392,22 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 		}
 	}
 	marker := journalRecord{Version: workingFormatVersion, Kind: "checkpoint", Generation: view.generation, BaseCommit: view.baseCommit, GitCommit: result.Commit}
-	if appendErr := w.appendRecords(marker); appendErr != nil {
+	writeMetrics, appendErr := w.appendRecords(marker)
+	w.recordWriteMetrics(writeMetrics)
+	if appendErr != nil {
+		w.cache = nil
 		return result, errors.Join(err, fmt.Errorf("checkpoint %s published but journal bookkeeping failed: %w", result.Commit, appendErr))
+	}
+	checkpointSnapshot := result.Snapshot
+	if checkpointSnapshot == nil {
+		checkpointSnapshot, appendErr = w.repo.SnapshotCommit(ctx, result.Commit)
+		if appendErr != nil {
+			return result, errors.Join(err, appendErr)
+		}
+	}
+	checkpointSnapshot.generation = view.generation
+	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
+		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
 	}
 	return result, err
 }
@@ -389,31 +486,85 @@ func workingSnapshot(base *Snapshot, manifest Manifest, available map[storage.Ha
 }
 
 func (w *WorkingState) load(ctx context.Context) (workingView, error) {
-	head, err := w.repo.Head(ctx)
+	started := time.Now()
+	defer func() { w.metrics.loadNanos.Add(uint64(time.Since(started))) }()
+	info, statErr := os.Stat(w.JournalPath())
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return workingView{}, statErr
+	}
+	start := int64(0)
+	cached := w.cache
+	cacheUsable := cached != nil && ((info == nil && cached.info == nil) || (info != nil && cached.info != nil && os.SameFile(info, cached.info) && info.Size() >= cached.offset))
+	if cacheUsable {
+		start = cached.offset
+	} else {
+		cached = nil
+	}
+	frames, bytesRead, err := readJournalFrames(w.JournalPath(), start)
 	if err != nil {
 		return workingView{}, err
 	}
-	if head == "" {
-		return workingView{}, ErrNotInitialized
+	w.metrics.loadBytes.Add(uint64(bytesRead))
+	w.metrics.loadFrames.Add(uint64(len(frames)))
+	if cached == nil {
+		w.metrics.fullReplays.Add(1)
+	} else {
+		w.metrics.incrementalReplays.Add(1)
+		if len(frames) == 0 {
+			w.metrics.cacheHits.Add(1)
+		}
 	}
-	records, err := readJournal(w.JournalPath())
-	if err != nil {
-		return workingView{}, err
+	if cached != nil && len(frames) == 0 {
+		if cached.view.dirty {
+			return cached.view, nil
+		}
+		head, err := w.repo.Head(ctx)
+		if err != nil {
+			return workingView{}, err
+		}
+		view, err := w.reconcileHead(ctx, cached.view, head)
+		if err == nil {
+			cached.view = view
+		}
+		return view, err
+	}
+	head := ""
+	headKnown := false
+	if cached == nil {
+		head, err = w.repo.Head(ctx)
+		if err != nil {
+			return workingView{}, err
+		}
+		if head == "" {
+			return workingView{}, ErrNotInitialized
+		}
+		headKnown = true
 	}
 	initial := head
-	for _, record := range records {
+	if cached != nil {
+		initial = cached.view.baseCommit
+	}
+	for _, frame := range frames {
+		record := frame.record
 		if record.Kind == "prepare" && record.BaseCommit != "" {
 			initial = record.BaseCommit
 			break
 		}
 	}
-	base, err := w.repo.SnapshotCommit(ctx, initial)
-	if err != nil {
-		return workingView{}, err
+	var view workingView
+	if cached != nil {
+		view = cached.view
+	} else {
+		base, err := w.repo.SnapshotCommit(ctx, initial)
+		if err != nil {
+			return workingView{}, err
+		}
+		view = workingView{snapshot: base, baseCommit: initial}
 	}
-	view := workingView{snapshot: base, baseCommit: initial}
 	pending := make(map[string]journalRecord)
-	for _, record := range records {
+	safeOffset := start
+	for _, frame := range frames {
+		record := frame.record
 		switch record.Kind {
 		case "prepare":
 			if record.Manifest == nil || record.TxID == "" {
@@ -446,121 +597,170 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 			view.snapshot = workingSnapshot(view.snapshot, *prepare.Manifest, available, prepare.Objects, prepare.Generation)
 			view.generation, view.dirty = prepare.Generation, true
 			delete(pending, record.TxID)
+			safeOffset = frame.end
 		case "checkpoint":
+			if len(pending) != 0 {
+				return workingView{}, fmt.Errorf("%w: checkpoint after incomplete transaction", ErrWorkingCorrupt)
+			}
 			if record.Generation != view.generation {
 				return workingView{}, fmt.Errorf("%w: checkpoint generation differs", ErrWorkingCorrupt)
 			}
-			base, err = w.repo.SnapshotCommit(ctx, record.GitCommit)
+			base, err := w.repo.SnapshotCommit(ctx, record.GitCommit)
 			if err != nil {
 				return workingView{}, err
 			}
 			base.generation = view.generation
 			view.snapshot, view.baseCommit, view.dirty = base, record.GitCommit, false
+			safeOffset = frame.end
 		default:
 			return workingView{}, fmt.Errorf("%w: unknown record kind %q", ErrWorkingCorrupt, record.Kind)
 		}
 	}
-	if view.dirty && view.baseCommit != head {
-		current, err := w.repo.SnapshotCommit(ctx, head)
+	if !view.dirty && !headKnown {
+		head, err = w.repo.Head(ctx)
 		if err != nil {
 			return workingView{}, err
 		}
-		if !reflect.DeepEqual(current.Manifest, view.snapshot.Manifest) {
-			return workingView{}, ErrWorkingBaseChanged
-		}
-		current.generation = view.generation
-		view.snapshot, view.baseCommit, view.dirty = current, head, false
-	} else if !view.dirty && view.baseCommit != head {
-		current, err := w.repo.SnapshotCommit(ctx, head)
-		if err != nil {
-			return workingView{}, err
-		}
-		current.generation = view.generation
-		view.snapshot, view.baseCommit = current, head
+	} else if view.dirty && !headKnown {
+		head = view.baseCommit
 	}
+	view, err = w.reconcileHead(ctx, view, head)
+	if err != nil {
+		return workingView{}, err
+	}
+	w.cache = &workingCache{view: view, info: info, offset: safeOffset}
+	return view, nil
+}
+
+func (w *WorkingState) reconcileHead(ctx context.Context, view workingView, head string) (workingView, error) {
+	if view.baseCommit == head {
+		return view, nil
+	}
+	current, err := w.repo.SnapshotCommit(ctx, head)
+	if err != nil {
+		return workingView{}, err
+	}
+	if view.dirty && !reflect.DeepEqual(current.Manifest, view.snapshot.Manifest) {
+		return workingView{}, ErrWorkingBaseChanged
+	}
+	current.generation = view.generation
+	view.snapshot, view.baseCommit, view.dirty = current, head, false
 	return view, nil
 }
 
 var journalCRC = crc32.MakeTable(crc32.Castagnoli)
 
-func (w *WorkingState) appendRecords(records ...journalRecord) error {
+func (w *WorkingState) appendRecords(records ...journalRecord) (journalWriteMetrics, error) {
+	var metrics journalWriteMetrics
 	if err := os.MkdirAll(w.Dir(), 0o700); err != nil {
-		return err
+		return metrics, err
 	}
 	file, err := os.OpenFile(w.JournalPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return metrics, err
 	}
 	defer file.Close()
 	for _, record := range records {
+		started := time.Now()
 		data, err := json.Marshal(record)
 		if err != nil {
-			return err
+			return metrics, err
 		}
+		metrics.encodeNanos += uint64(time.Since(started))
+		metrics.encodedBytes += uint64(len(data))
 		header := make([]byte, 12)
 		copy(header[:4], "RDBJ")
 		binary.BigEndian.PutUint32(header[4:8], uint32(len(data)))
 		binary.BigEndian.PutUint32(header[8:12], crc32.Checksum(data, journalCRC))
+		started = time.Now()
 		if _, err := file.Write(append(header, data...)); err != nil {
-			return err
+			return metrics, err
 		}
+		metrics.appendNanos += uint64(time.Since(started))
 	}
 	if w.fault != nil {
 		if err := w.fault(BeforeJournalFlush); err != nil {
-			return err
+			return metrics, err
 		}
 	}
-	return file.Sync()
+	started := time.Now()
+	err = file.Sync()
+	metrics.flushNanos += uint64(time.Since(started))
+	return metrics, err
+}
+
+func (w *WorkingState) recordWriteMetrics(metrics journalWriteMetrics) {
+	w.metrics.encodeNanos.Add(metrics.encodeNanos)
+	w.metrics.encodedBytes.Add(metrics.encodedBytes)
+	w.metrics.appendNanos.Add(metrics.appendNanos)
+	w.metrics.flushNanos.Add(metrics.flushNanos)
 }
 
 func readJournal(path string) ([]journalRecord, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	frames, _, err := readJournalFrames(path, 0)
 	if err != nil {
 		return nil, err
 	}
+	records := make([]journalRecord, len(frames))
+	for i, frame := range frames {
+		records[i] = frame.record
+	}
+	return records, nil
+}
+
+func readJournalFrames(path string, start int64) ([]journalFrame, int64, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
 	defer file.Close()
-	var records []journalRecord
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return nil, 0, err
+	}
+	var frames []journalFrame
+	offset := start
 	for {
 		header := make([]byte, 12)
 		_, err := io.ReadFull(file, header)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return records, nil
+			return frames, offset - start, nil
 		}
 		if err != nil {
-			return nil, err
+			return nil, offset - start, err
 		}
 		if string(header[:4]) != "RDBJ" {
-			return nil, fmt.Errorf("%w: invalid frame magic", ErrWorkingCorrupt)
+			return nil, offset - start, fmt.Errorf("%w: invalid frame magic", ErrWorkingCorrupt)
 		}
 		length := binary.BigEndian.Uint32(header[4:8])
 		if length == 0 || length > 1<<30 {
-			return nil, fmt.Errorf("%w: invalid frame length", ErrWorkingCorrupt)
+			return nil, offset - start, fmt.Errorf("%w: invalid frame length", ErrWorkingCorrupt)
 		}
 		data := make([]byte, length)
 		if _, err := io.ReadFull(file, data); errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return records, nil
+			return frames, offset - start, nil
 		} else if err != nil {
-			return nil, err
+			return nil, offset - start, err
 		}
 		if crc32.Checksum(data, journalCRC) != binary.BigEndian.Uint32(header[8:12]) {
-			return nil, fmt.Errorf("%w: checksum mismatch", ErrWorkingCorrupt)
+			return nil, offset - start, fmt.Errorf("%w: checksum mismatch", ErrWorkingCorrupt)
 		}
 		var record journalRecord
 		decoder := json.NewDecoder(strings.NewReader(string(data)))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&record); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrWorkingCorrupt, err)
+			return nil, offset - start, fmt.Errorf("%w: %v", ErrWorkingCorrupt, err)
 		}
 		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("%w: trailing frame content", ErrWorkingCorrupt)
+			return nil, offset - start, fmt.Errorf("%w: trailing frame content", ErrWorkingCorrupt)
 		}
 		if record.Version != workingFormatVersion {
-			return nil, fmt.Errorf("unsupported working journal format %d", record.Version)
+			return nil, offset - start, fmt.Errorf("unsupported working journal format %d", record.Version)
 		}
-		records = append(records, record)
+		offset += int64(len(header)) + int64(length)
+		frames = append(frames, journalFrame{record: record, end: offset})
 	}
 }
 
@@ -573,26 +773,31 @@ func randomID() (string, error) {
 }
 
 func (w *WorkingState) lock(ctx context.Context) (func(), error) {
+	w.mu.Lock()
 	lockDir := filepath.Join(w.repo.CommonDir, "repodb", "locks")
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		w.mu.Unlock()
 		return nil, err
 	}
 	file, err := os.OpenFile(filepath.Join(lockDir, "working.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
+		w.mu.Unlock()
 		return nil, err
 	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
-			return func() { _ = unix.Flock(int(file.Fd()), unix.LOCK_UN); _ = file.Close() }, nil
+			return func() { _ = unix.Flock(int(file.Fd()), unix.LOCK_UN); _ = file.Close(); w.mu.Unlock() }, nil
 		} else if !errors.Is(err, unix.EWOULDBLOCK) {
 			file.Close()
+			w.mu.Unlock()
 			return nil, err
 		}
 		select {
 		case <-ctx.Done():
 			file.Close()
+			w.mu.Unlock()
 			return nil, ctx.Err()
 		case <-ticker.C:
 		}

@@ -117,7 +117,15 @@ git diff --check
 The test suite covers persistent SQL, embedded/MySQL interoperability, transaction
 outcome recovery, concurrent writers, Git transport, and merge conflicts.
 
-Two repeatable experiments support storage and performance work:
+Run the [database scorecard](docs/benchmark.md) for a consolidated report from the
+current checkout. Both persistence modes execute the same workloads:
+
+```sh
+make bench                        # Native Git persistence
+make bench BENCH_MODE=journal      # Journal persistence
+```
+
+Additional experiments support focused storage and performance work:
 
 ```sh
 make m0        # Git storage and transport experiment

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/repository"
@@ -39,22 +40,36 @@ func BenchmarkM43DurableSave(b *testing.B) {
 							beforeBytes = info.Size()
 						}
 					}
+					engine.ResetPerformanceCounters()
+					if eng.WorkingState() != nil {
+						eng.WorkingState().ResetMetrics()
+					}
+					latencies := make([]time.Duration, 0, b.N)
+					var beginNanos, sqlMutationNanos, commitNanos uint64
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := range b.N {
+						started := time.Now()
+						phase := time.Now()
 						tx, err := session.Begin(ctx)
 						if err != nil {
 							b.Fatal(err)
 						}
+						beginNanos += uint64(time.Since(phase))
+						phase = time.Now()
 						for offset := range batch {
 							key := 1 + (i*batch+offset)%rows
 							if err := tx.Exec(ctx, "UPDATE bench SET value = ? WHERE id = ?", fmt.Sprintf("m43-%08d-%03d", i, offset), key); err != nil {
 								b.Fatal(err)
 							}
 						}
+						sqlMutationNanos += uint64(time.Since(phase))
+						phase = time.Now()
 						if err := tx.Commit(ctx); err != nil {
 							b.Fatal(err)
 						}
+						commitNanos += uint64(time.Since(phase))
+						latencies = append(latencies, time.Since(started))
 					}
 					b.StopTimer()
 					afterHead, _ := repo.Head(ctx)
@@ -67,6 +82,28 @@ func BenchmarkM43DurableSave(b *testing.B) {
 							b.Fatal(err)
 						}
 						b.ReportMetric(float64(info.Size()-beforeBytes)/float64(b.N), "journal-bytes/op")
+						metrics := eng.WorkingState().Metrics()
+						b.ReportMetric(float64(metrics.LoadNanos)/float64(b.N), "prior-state-ns/op")
+						b.ReportMetric(float64(metrics.LoadBytes)/float64(b.N), "replay-bytes/op")
+						b.ReportMetric(float64(metrics.LoadFrames)/float64(b.N), "replay-frames/op")
+						b.ReportMetric(float64(metrics.PrepareNanos)/float64(b.N), "object-copy-ns/op")
+						b.ReportMetric(float64(metrics.PreparedBytes)/float64(b.N), "object-bytes/op")
+						b.ReportMetric(float64(metrics.EncodeNanos)/float64(b.N), "encode-ns/op")
+						b.ReportMetric(float64(metrics.AppendNanos)/float64(b.N), "append-ns/op")
+						b.ReportMetric(float64(metrics.FlushNanos)/float64(b.N), "flush-ns/op")
+					}
+					counters := engine.ReadPerformanceCounters()
+					b.ReportMetric(float64(beginNanos)/float64(b.N), "begin-ns/op")
+					b.ReportMetric(float64(sqlMutationNanos)/float64(b.N), "sql-mutation-ns/op")
+					b.ReportMetric(float64(commitNanos)/float64(b.N), "commit-ns/op")
+					b.ReportMetric(float64(counters.SnapshotBuildNanos)/float64(b.N), "snapshot-build-ns/op")
+					b.ReportMetric(float64(counters.TreeMutationNanos)/float64(b.N), "tree-mutation-ns/op")
+					b.ReportMetric(float64(counters.ReachabilityNanos)/float64(b.N), "reachability-ns/op")
+					sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+					if len(latencies) > 0 {
+						b.ReportMetric(float64(latencies[len(latencies)/2]), "request-p50-ns")
+						b.ReportMetric(float64(latencies[(len(latencies)*95-1)/100]), "request-p95-ns")
+						b.ReportMetric(float64(latencies[len(latencies)-1]), "request-max-ns")
 					}
 				})
 			}
@@ -101,6 +138,95 @@ func BenchmarkM43JournalCheckpoint(b *testing.B) {
 				}
 				b.StopTimer()
 				_ = eng.Close()
+			}
+		})
+	}
+}
+
+func BenchmarkM43JournalReplayGrowth(b *testing.B) {
+	for _, generations := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("generations=%d", generations), func(b *testing.B) {
+			eng, repo := sqlBenchmarkEngineWithRepository(b, 1_000, 64, 1)
+			_ = eng.Close()
+			eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceJournal})
+			if err != nil {
+				b.Fatal(err)
+			}
+			session, _ := eng.NewSession()
+			for generation := range generations {
+				if err := session.Exec(context.Background(), "UPDATE bench SET value = ? WHERE id = ?", fmt.Sprintf("growth-%08d", generation), 1+generation%1_000); err != nil {
+					b.Fatal(err)
+				}
+			}
+			working := eng.WorkingState()
+			want, err := working.Current(context.Background())
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Run("full-replay", func(b *testing.B) {
+				b.ReportAllocs()
+				for range b.N {
+					fresh, err := repository.OpenWorkingState(repo)
+					if err != nil {
+						b.Fatal(err)
+					}
+					snapshot, err := fresh.Current(context.Background())
+					if err != nil || snapshot.Generation() != want.Generation() {
+						b.Fatalf("full replay generation = %d, %v", snapshot.Generation(), err)
+					}
+				}
+			})
+			b.Run("cached", func(b *testing.B) {
+				working.ResetMetrics()
+				b.ReportAllocs()
+				for range b.N {
+					snapshot, err := working.Current(context.Background())
+					if err != nil || snapshot.Generation() != want.Generation() {
+						b.Fatalf("cached load generation = %d, %v", snapshot.Generation(), err)
+					}
+				}
+				metrics := working.Metrics()
+				b.ReportMetric(float64(metrics.LoadBytes)/float64(b.N), "replay-bytes/op")
+				b.ReportMetric(float64(metrics.LoadFrames)/float64(b.N), "replay-frames/op")
+			})
+			_ = eng.Close()
+		})
+	}
+}
+
+func BenchmarkM43JournalFirstSaveAfterCheckpoint(b *testing.B) {
+	for _, rows := range []int{1_000, 10_000, 50_000} {
+		b.Run(fmt.Sprintf("rows=%d", rows), func(b *testing.B) {
+			b.StopTimer()
+			eng, repo := sqlBenchmarkEngineWithRepository(b, rows, 64, 1)
+			_ = eng.Close()
+			eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceJournal})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer eng.Close()
+			session, _ := eng.NewSession()
+			latencies := make([]time.Duration, 0, b.N)
+			b.ReportAllocs()
+			for iteration := range b.N {
+				if iteration > 0 {
+					if _, err := eng.Checkpoint(context.Background(), "reset clean benchmark state"); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StartTimer()
+				started := time.Now()
+				if err := session.Exec(context.Background(), "UPDATE bench SET value = ? WHERE id = ?", fmt.Sprintf("first-%08d", iteration), 1+iteration%rows); err != nil {
+					b.Fatal(err)
+				}
+				latencies = append(latencies, time.Since(started))
+				b.StopTimer()
+			}
+			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+			if len(latencies) > 0 {
+				b.ReportMetric(float64(latencies[len(latencies)/2]), "request-p50-ns")
+				b.ReportMetric(float64(latencies[(len(latencies)*95-1)/100]), "request-p95-ns")
+				b.ReportMetric(float64(latencies[len(latencies)-1]), "request-max-ns")
 			}
 		})
 	}

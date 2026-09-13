@@ -1,4 +1,11 @@
-.PHONY: build test fmt m0 m2-bench m4.2-bench m4.3-bench
+.PHONY: build test fmt bench m0 m2-bench m4.2-bench m4.3-bench
+.DEFAULT_GOAL := build
+
+BENCH_MODE ?= native-git
+BENCH_ARGS ?=
+
+bench:
+	go run ./experiments/dbbench -mode $(BENCH_MODE) $(BENCH_ARGS)
 
 build:
 	go build -o bin/repodb ./cmd/repodb
@@ -21,5 +28,7 @@ m4.2-bench:
 	go test ./integration -run '^$$' -bench '^(BenchmarkSyncUpToDateWarm|BenchmarkSyncDivergent)$$' -benchmem -benchtime=1x -count=1
 
 m4.3-bench:
-	go test ./engine -run '^$$' -bench '^BenchmarkM43DurableSave$$' -benchmem -benchtime=30x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkM43(DurableSave|JournalReplayGrowth)$$' -benchmem -benchtime=30x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkM43JournalFirstSaveAfterCheckpoint$$' -benchmem -benchtime=10x -count=5
 	go test ./engine -run '^$$' -bench '^BenchmarkM43JournalCheckpoint$$' -benchmem -benchtime=1x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkM43TypedEdit(Journal|Checkpoint)$$' -benchmem -benchtime=30x -count=5

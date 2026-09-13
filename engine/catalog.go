@@ -174,6 +174,7 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 	if !tx.dirty {
 		return nil
 	}
+	buildStarted := time.Now()
 	manifest := repository.Manifest{DefaultDatabase: s.db.name, Tables: make(map[string]repository.Table, len(tx.tables))}
 	reachable := make(map[storage.Hash]struct{})
 	for name, state := range tx.tables {
@@ -218,14 +219,16 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 			if err != nil {
 				return err
 			}
-			phaseStarted = time.Now()
-			hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
-			performanceCounters.reachabilityNanos.Add(uint64(time.Since(phaseStarted)))
-			if err != nil {
-				return err
-			}
-			for _, hash := range hashes {
-				reachable[hash] = struct{}{}
+			if s.db.working == nil {
+				phaseStarted = time.Now()
+				hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
+				performanceCounters.reachabilityNanos.Add(uint64(time.Since(phaseStarted)))
+				if err != nil {
+					return err
+				}
+				for _, hash := range hashes {
+					reachable[hash] = struct{}{}
+				}
 			}
 			reachable[state.manifest.SchemaRoot] = struct{}{}
 			manifest.Tables[name] = repository.Table{SchemaRoot: state.manifest.SchemaRoot, DataRoot: tree.Root()}
@@ -252,14 +255,24 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 		if err != nil {
 			return err
 		}
-		hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
-		if err != nil {
-			return err
-		}
-		for _, hash := range hashes {
-			reachable[hash] = struct{}{}
+		if s.db.working == nil {
+			hashes, err := prolly.Reachable(ctx, tx.writer, tree.Root())
+			if err != nil {
+				return err
+			}
+			for _, hash := range hashes {
+				reachable[hash] = struct{}{}
+			}
 		}
 		manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+	}
+	if s.db.working != nil {
+		for _, hash := range tx.writer.BaseSnapshot().Manifest.Objects {
+			reachable[hash] = struct{}{}
+		}
+		for _, hash := range tx.writer.PendingHashes() {
+			reachable[hash] = struct{}{}
+		}
 	}
 	hashes := make([]storage.Hash, 0, len(reachable))
 	for hash := range reachable {
@@ -268,6 +281,7 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 	if err := tx.writer.RetainOnly(hashes); err != nil {
 		return err
 	}
+	performanceCounters.snapshotBuildNanos.Add(uint64(time.Since(buildStarted)))
 	var snapshot *repository.Snapshot
 	var err error
 	if s.db.working != nil {

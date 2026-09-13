@@ -47,9 +47,13 @@ ignored; invalid framing, checksums, generation order, or markers within complet
 history are corruption and fail open.
 
 The journal, not Git export, is sufficient to recover acknowledged SQL writes.
-The prototype currently replays the complete file and retains reachable object
-bytes in memory. Bounded replay, rotation, directory hardening on first creation,
-and online compaction are rollout work, not properties of this prototype.
+A fresh process replays the complete file. A long-lived process caches the last
+verified working snapshot, byte offset, and journal file identity; it reads only
+new frames and advances the offset only through matched commit/checkpoint records.
+A replaced or shortened file invalidates the cache and forces verified full
+replay. An incomplete tail is truncated under the writer lock before another
+transaction appends. Bounded cold replay, rotation, directory hardening on first
+creation, and online compaction remain rollout work.
 Compaction must write and fsync a replacement, fsync its directory rename, and
 retain all data reachable by pinned readers before retiring an old segment.
 
@@ -67,6 +71,11 @@ and committed base. A stale writer receives `repository.ErrConflict`; RepoDB doe
 not replay application SQL. Each transaction boundary reloads journal progress,
 so another process can advance working state without changing the Git ref. The
 embedded and MySQL paths both call the same engine transaction implementation.
+
+Native-Git engines refuse to open while journal state is dirty. This prevents two
+persistence modes in one repository from silently publishing incompatible heads
+and lets a dirty cached journal treat its committed base as stable. Clean state
+still checks the Git head so checkpoint and sync transitions are discovered.
 
 Linked worktrees share the lock and journal. The initial checkpoint implementation
 holds `working.lock` while exporting to Git, serializing writers and making the
@@ -125,6 +134,14 @@ checkpoint. Adoption is gated on the published M4.3 matrix and these corrections
 - one lock-order protocol shared by working saves, checkpoint, sync, and GC;
 - row-level diff plus migration/rollback tooling;
 - process-kill, fault, linked-worktree, MySQL, and fresh-clone reconstruction tests.
+
+The first attribution run removed full-history replay from steady-state saves and
+showed exact reachability traversal dominating larger catalogs. Journal saves now
+retain a conservative object inventory and defer pruning rather than walking the
+whole Prolly graph. Checkpoints currently preserve that safe superset; exact
+checkpoint pruning should be added with compaction. With traversal removed,
+Prolly chunk mutation plus durable flush still exceeds 10 ms at 10k/50k rows,
+providing the evidence gate for a typed row/schema edit journal experiment.
 
 This decision preserves the working-state product contract while avoiding a
 premature default change based on an incomplete durability implementation.

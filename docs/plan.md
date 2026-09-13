@@ -543,8 +543,9 @@ to M5 to validate these assumptions with real applications.
 
 ### M4.3 — Design and benchmark durable working state and intentional data commits
 
-**Status: in progress (2026-09-13).** The design, opt-in journal/checkpoint
-prototype, and paired save/checkpoint harness are implemented; the full benchmark,
+**Status: in progress (2026-09-13).** The design, opt-in chunk-journal/checkpoint
+prototype, incremental replay, phase attribution, and typed-edit lower-bound
+experiment are implemented; a production typed-edit overlay, full benchmark,
 realistic fixture, and hardening matrix remain pending. Continue comparing
 journal-backed SQL with M4.2's native-Git publication path. Use the
 results to make an explicit adoption decision before changing defaults. This
