@@ -1,8 +1,9 @@
 # RepoDB implementation plan
 
-Status: M0 through M4.1 complete; M4.2 database performance baseline and targeted
-improvements is next, before M5. Updated 2026-09-12 after the
-[M4.1 implementation and measurements](m4-bench.md). Later milestones remain pending.
+Status: M0 through M4.1 complete; M4.2's bounded investigation is closed with
+explicit follow-ups. M4.3 durable working state and intentional data commits is
+next, before M5. Updated 2026-09-12. M4.3 describes target behavior, not features
+already implemented.
 
 ## Product goal
 
@@ -19,10 +20,15 @@ Code and database share a repository and remote, with independent histories.
   an optional MySQL wire-protocol server for existing drivers and tools.
 - Support direct, in-process use as a Go module. The embedded engine must not
   require a server process, TCP connection, or automatic background service.
-- Keep authoritative schema and data in Git objects reachable from dedicated
-  RepoDB refs. Local caches and indexes may be rebuilt from repository state.
+- Keep committed schema/data versions in Git objects reachable from dedicated
+  RepoDB refs. M4.3 adds a durable local journal over a committed Git snapshot for
+  current SQL working state. The journal is authoritative until checkpointed;
+  it is not a disposable cache.
 - Persist successful SQL transactions automatically. Users need not stage files,
   export tables, or manually create Git snapshots for ordinary persistence.
+- Separate SQL transaction commits from intentional data-history commits.
+  `repodb commit` records a shareable version; `repodb sync` exchanges committed
+  history. Uncheckpointed SQL changes survive restart without either command.
 - Keep database changes out of the source worktree, index, and code branch history.
 - Support multiple applications and independent clones, including offline writes
   and synchronization without silent data loss.
@@ -32,7 +38,7 @@ Code and database share a repository and remote, with independent histories.
 - Offer `repodb start` for users who want a standalone MySQL server. Embedded
   applications own the lifecycle of their engine instances.
 
-User-facing workflow:
+Target workflow after M4.3 (`commit` and `diff` are not yet implemented):
 
 ```sh
 # Regular git clone
@@ -45,7 +51,12 @@ repodb enable --remote origin
 # Optional: start the MySQL server; embedded applications open the engine directly
 repodb start
 
-# Explicitly synchronize database changes with the selected remote
+# Review and checkpoint locally durable SQL changes when ready
+repodb status
+repodb diff
+repodb commit -m "Triage issues"
+
+# Explicitly synchronize committed data history with the selected remote
 repodb sync --remote origin
 ```
 
@@ -57,8 +68,10 @@ M0 established an explicit transport contract: enable adds a fetch refspec into
 `refs/repodb/remotes/<remote>/data`, preserves existing configuration, and installs
 neither push refspecs nor hooks. Ordinary `git push` does not publish database
 changes; `repodb sync` is the guaranteed database network operation. Engine open
-and new transaction boundaries inspect already fetched state without implicit
-network I/O. See [the accepted command matrix](git-integration.md).
+and transaction boundaries inspect local state without implicit network I/O.
+M4.3 may add an opt-in pre-commit diagnostic; hooks remain outside durability
+and sync correctness. The current [command matrix](git-integration.md) must be
+updated when M4.3 is delivered.
 
 ## What exists today
 
@@ -66,12 +79,12 @@ network I/O. See [the accepted command matrix](git-integration.md).
 | --- | --- | --- |
 | `server/` | MySQL listener routed through the persistent shared engine | Broaden compatibility after merge correctness |
 | `client/` | MySQL driver wrapper | Retain as optional network client |
-| `common/prolly/` | Deterministic bulk and sorted streaming construction, lazy iteration, lookup, and graph validation | Measure SQL adoption and changed-subtree operations; incremental mutation later |
+| `common/prolly/` | Deterministic bulk/streaming construction, canonical incremental mutation, lazy iteration, lookup, and graph validation | Reuse typed roots and incremental mutation in the working-state prototype |
 | `common/storage/` | SHA-256-addressed store interface and memory/filesystem implementations | Retain interface; repository snapshots and writers provide Git-backed stores |
-| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, two-parent merge candidates, and legacy import | Reuse validated snapshots and existing roots while preserving publication guarantees |
+| `common/repository/` | Versioned snapshots, outcome recovery, graph validation, shared publication lock/CAS, immutable-object reuse, two-parent merge candidates, and legacy import | Define journal authority and recoverable Git checkpoint publication |
 | `common/git/` | Batched blob reads/writes, classified expected-head updates, fsync, remote transport, and exact-candidate pushes | Attribute process, temporary-file, object I/O, and durability costs |
-| `engine/` and `integration/` | Persistent SQL, streaming merging, root reuse, validation cache, explicit sync, and durable conflicts | Reduce SQL materialization/rebuilds and network-induced writer stalls |
-| CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `conflicts`, `resolve`, `start`, and network `sql` | Broaden compatibility after merge correctness |
+| `engine/` and `integration/` | Persistent SQL with edit overlays, streaming merging, root reuse, validation cache, explicit sync, and durable conflicts | Separate durable SQL saves from data commits and define clean-state sync |
+| CLI | `init`, `status`, `import-legacy`, `enable`, `sync`, `conflicts`, `resolve`, `start`, and network `sql` | Design explicit data commits and working-state inspection |
 
 Existing tests cover tree determinism and validation, persistent embedded and
 MySQL SQL, restart recovery, publication outcomes through both interfaces,
@@ -79,7 +92,7 @@ separate-process and linked-worktree contention, injected failures, Git
 SHA-1/SHA-256 formats, legacy import, enable/sync idempotence, fast-forward
 transport, pinned transactions, disjoint offline merging, durable row/schema
 conflicts, explicit resolution, and repeat-sync idempotence. `make test` passes.
-Broader compatibility and incremental tree mutation remain pending.
+Broader compatibility and the M4.3 working-state model remain pending.
 
 The later M4 benchmark passed engine and integration tests, but its restricted
 environment could not bind a loopback socket for the full MySQL wire suite. Its
@@ -87,8 +100,9 @@ results establish merge costs, not an additional full-suite validation or a
 larger supported workload. Keep the subsequent M4.1 acceptance record separate
 from M4.2 performance measurements and validation.
 
-The original tracked-directory/manual-snapshot design is superseded by this plan.
-Its reusable storage and SQL pieces are a starting point, not the target contract.
+The tracked-directory design remains superseded. M4.3 restores intentional
+data-history commits over automatically durable SQL state; it does not restore
+tracked `.repodb/` files or require snapshots to save work.
 
 ## Architecture and remaining design work
 
@@ -122,19 +136,23 @@ transport and garbage collection cannot preserve the database. Avoid depending
 on loose object files or a warm local cache. Publish through Git plumbing without
 checking out the data tree or modifying the user's index.
 
-Accepted baseline for M2: each successful write transaction creates one
+Implemented baseline through M4.2: each successful write transaction creates one
 internal data commit and atomically advances the data ref using its expected old
 value. Autocommit statements follow the same path. Explicit rollback publishes
 nothing. Unchanged transactions need not create new commits. This deliberately
 replaces the prototype's rule against automatic Git commits; these commits live
-in independent database history.
+in independent database history. M4.3 deliberately supersedes this coupling:
+SQL commits advance durable local working state, while explicit data commits
+advance Git history. Existing storage documentation describes the implemented
+baseline until the new model is delivered.
 
 Persist objects before publishing the ref and acknowledge success only after the
 required durability steps. An interrupted write leaves either the previous state
 or a complete new state. Record filesystem/fsync and Git-version assumptions;
 atomic ref replacement alone is not a complete power-loss durability guarantee.
-Benchmark this baseline before introducing batching or a write-ahead log, which
-would change the relationship between acknowledged writes and Git-owned state.
+M4.2 measured this baseline and identified object/tree hardening as a dominant
+cost. M4.3 now evaluates the explicitly accepted separation of acknowledged
+local writes from Git-owned committed versions.
 
 M2 distinguishes definite rejection, successful publication, and unknown commit
 outcomes, including recovery through embedded and MySQL interfaces. Preserve this
@@ -144,11 +162,11 @@ imply rollback or authorize automatic replay.
 M2 derives inventories from reachable catalog objects, batches Git reads, and
 reuses existing Git object IDs. Historical commits retain older snapshots.
 M4.1 adds merge root reuse, streaming reconciliation, reuse of loaded snapshots,
-a bounded SQL validation cache, and batched object writes. SQL transactions still
-materialize tables, clone rows for statement rollback, and rebuild all tables on
-a dirty commit. Snapshot reads and publication also retain/copy object inventories.
-M4.2 measures these remaining costs while preserving the data format, merge
-policy, explicit sync contract, and acknowledged-write durability model.
+a bounded SQL validation cache, and batched object writes. M4.2 adds point lookup,
+edit overlays, incremental mutation, publication reuse, and shorter sync locks.
+Remaining chunk/tree amplification is measured in [performance.md](performance.md).
+M4.3 preserves automatic SQL durability and committed snapshot reachability while
+changing the local persistence mechanism.
 
 ### Local concurrency and remote concurrency
 
@@ -158,6 +176,11 @@ identity. Readers pin immutable snapshots; publication is serialized across
 processes and checked against the expected data head. A stale writer must receive
 a defined retryable conflict or pass explicit validation, never overwrite a newer
 head. Do not transparently replay arbitrary application transactions.
+
+M4.3 SQL writers must compare durable working generations, not just Git heads:
+multiple transactions can change the journal without making a data commit.
+Linked worktrees initially share one repository-wide working database. Data
+commits and sync coordinate both the journal state and the committed Git head.
 
 Independent clones do not share locks. Fetch remote heads into a separate tracking
 namespace (`refs/repodb/remotes/<remote>/data`, established by M0) rather than replacing
@@ -401,11 +424,13 @@ a documented change; a 50,000-row merge microbenchmark alone does not broaden it
 
 ### M4.2 — Establish database performance and remove the largest avoidable costs
 
-**Status: in progress.** The reproducible SQL/sync runner, initial baseline, and
-first bounded optimization pass are documented in [docs/performance.md](performance.md).
-Complete the remaining matrix below before M5. Produce a bounded
-round of improvements before M5. This does not require every workload to become
-fast or authorize a general storage rewrite.
+**Status: closed as a bounded investigation (2026-09-12).** Results, incremental
+writes, and the paired Git hardening audit are in [performance.md](performance.md).
+This is an explicit scope disposition, not a claim that the full matrix ran.
+M4.3 takes durable-save, realistic-read, and recovery comparisons; M5 takes
+application/wire/CLI and contention coverage; M6 takes broader payload, history,
+packing, network, and memory characterization. The matrix and original exit
+criteria below remain as the historical scope.
 
 The focused exact-key experiment is complete: transaction overlays and canonical
 incremental Prolly mutation eliminate unrelated row decoding, and publication
@@ -516,23 +541,135 @@ and latency expectations. Rank remaining ideas by evidence, benefit, and risk fo
 M5/M6 instead of opening an unbounded series of performance milestones. Proceed
 to M5 to validate these assumptions with real applications.
 
+### M4.3 — Design and benchmark durable working state and intentional data commits
+
+**Status: next; pending.** Deliver a design and executable, opt-in prototype
+comparing journal-backed SQL with M4.2's native-Git publication path. Use the
+results to make an explicit adoption decision before changing defaults. This
+milestone plans and tests the new persistence model; it does not assume its
+latency or production readiness.
+
+**Target product contract:**
+
+| Operation | Meaning |
+| --- | --- |
+| SQL autocommit / `COMMIT` | Durably save the transaction in the local journal and publish its working generation |
+| SQL `ROLLBACK` | Discard that transaction's edits, preserving previous durable working changes |
+| `repodb status` / `diff` | Inspect changes since the last data commit, separately from incoming/outgoing committed history |
+| `repodb commit -m "..."` | Capture a consistent durable working generation as a Git snapshot and conditionally advance `refs/repodb/data` |
+| `repodb sync --remote ...` | Exchange committed history without silently committing or overwriting working changes |
+| Optional pre-commit diagnostic | Report pending data changes and how to commit them; warn or refuse the code commit according to explicit policy |
+
+SQL saves require no checkpoint, hook, network, or background service. Data
+commits initially capture the whole catalog, not individual staged rows. They
+record selected versions rather than every intermediate SQL transaction in Git.
+Row staging, stash/reapply, and separate per-worktree databases are follow-ups.
+
+**Design deliverable:** `docs/working-state.md`, covering:
+
+1. **State and authority.** Distinguish committed Git head, durable working
+   generation/root, and transaction-local edits. Keep journal and recovery metadata
+   beneath the common Git directory, outside source files and the index. Reuse
+   existing typed encodings and Prolly roots where practical. A clone reconstructs
+   committed data; newer local changes require the journal as well. Specify
+   consistent backup, read-only open, initial enable, format versioning, and
+   adoption of existing Git-only repositories without discarding data. Distinguish
+   rebuildable caches from authoritative journal files in all cleanup APIs.
+2. **Durability and recovery.** Specify versioned, framed, checksummed chunk/root
+   or equivalent transaction records, monotonic generations, and stable transaction
+   IDs. Write all required data and a commit marker before durable flush and
+   acknowledgment. Include file/directory hardening for creation and rotation.
+   Recover to the last complete valid committed transaction; distinguish incomplete
+   tails from corruption inside acknowledged history. Define bounded replay and
+   safe compaction. Git export must never be required to recover an acknowledged
+   SQL write.
+3. **Concurrency and outcomes.** Retain pinned readers, process-safe coordination,
+   and stale-writer detection against the working generation. Specify how other
+   processes discover journal progress; the unchanged Git head is insufficient.
+   Embedded and MySQL paths use the same persistence logic. Preserve rejected,
+   committed, and unknown outcomes: SQL recovery uses journal transaction IDs,
+   checkpoint recovery uses Git candidate IDs. Define compatible recovery APIs and
+   avoid reporting failures after durable journal commit as definite rollback.
+4. **Checkpoint protocol.** Capture one durable generation, materialize and harden
+   its reachable Git graph, then conditionally publish the data ref. Durably record
+   the checkpoint association before retiring journal data. Define interruption
+   recovery between ref publication and journal bookkeeping, with stable checkpoint
+   identity/generation metadata so retries do not duplicate successful commits.
+   Choose writer serialization or a pinned checkpoint with concurrent later writes;
+   later generations must remain dirty. Initial serialization is acceptable if its
+   pause is measured. Protect active readers and unpublished chunks during journal
+   compaction and Git GC. Unchanged checkpoints should create no new history.
+5. **Sync and hooks.** Initially require clean working state for synchronization
+   and reconciliation, returning an actionable error when dirty. Recheck cleanliness
+   under coordination before any local transition; tracking fetches alone may
+   advance independently. Update the clean journal base and Git head recoverably,
+   preserving pinned readers and stale-writer detection. Hooks are opt-in, compose
+   with existing hooks/managers, and never provide durability. Start with a
+   noninteractive warning/refusal. A combined code/data action remains two separate
+   commits: account for code-commit failure after a successful data checkpoint.
+
+**Prototype and benchmarks:** retain the native-Git path as the paired control.
+Use identical SQL semantics, fixtures, mutation sequences, and declared durability
+assumptions. Keep required flushes enabled; a memory-only journal is not a valid
+comparison. Publish raw samples, settings, exact revision, machine/filesystem,
+commands, and limitations in `docs/m4.3-bench.md`.
+
+- Repeat exact-key updates, inserts, and deletes at 1k / 10k / 50k rows with varied
+  keys and payloads. Assert that every timed mutation changes durable state and
+  verify its result. Measure acknowledgment latency, p50/p95 with adequate samples,
+  allocations, live/peak memory, bytes appended, flushes, and lock wait/hold.
+- Add a realistic fixture: 1,000 issues, 100 authors, 10,000 comments, and 50,000
+  events with documented distributions. Measure a 30–50-issue board including
+  authors and comment summaries, issue detail, state changes, and comment creation.
+  Use actual supported SQL and include required scans/joins rather than assuming
+  secondary indexes or range pushdown. Exercise embedded and persistent MySQL
+  clients with transaction boundaries included.
+- Compare batches of 1/10/100 changes. Separate SQL save, data checkpoint, checkpoint
+  writer pause, and full-sync time; also report total save + checkpoint + sync cost.
+  Prove SQL saves do not create Git snapshots or advance the data ref, then verify
+  a checkpoint reconstructs identical schemas/rows in a fresh clone. Moving cost
+  off the save path must remain visible in checkpoint measurements.
+- Measure reopen/replay with growing journals, clean checkpoint reopen, and reads
+  after another process advances working state. Cover two process writers, linked
+  worktrees, and writes overlapping checkpoints/sync. Separate startup/recovery
+  from warm-operation timings and account for checkpoint/compaction stalls.
+- Evaluate approximately **10 ms for a durable small save** and **50 ms for a warm
+  board request** as product targets on the declared reference environment, not
+  existing guarantees. Include full acknowledgment/result delivery. Do not use
+  an in-transaction point lookup to represent an entire board request. Report
+  missed targets, bottlenecks, and separate cold-start/checkpoint expectations.
+
+**Correctness and exit:** publish the design, executable prototype, paired results,
+and an adopt/revise decision with migration/rollout work assigned. Demonstrate
+recovery of acknowledged SQL writes after process termination without a data
+commit; rollback and failed statements expose no partial edits. Inject failures
+around append, flush, ref publication, checkpoint bookkeeping, journal rotation,
+and compaction. Verify outcome recovery, dirty-sync refusal, cross-process
+conflicts, and checkpoint reconstruction after cache deletion/GC. Run full and
+race tests plus build/diff checks; process-kill tests do not establish power-loss
+behavior on every filesystem. Prototype completion does not imply target latency
+or production readiness. Update storage, SQL, sync, recovery, and user docs before
+switching defaults; M5 takes the selected rollout and application work.
+
 ### M5 — Complete the accepted integration and prove the tool-author experience
 
-- Build on the M4.2 database baseline and workload bounds; use the examples to
-  validate or revise its assumptions.
+- Complete adoption/migration work selected by M4.3, then build examples around
+  durable SQL saves, intentional data commits, and explicit sync.
 - Connect M4 reconciliation to the Git integration established in M0/M3, with no
   long-running RepoDB service required just to transport refs.
 - Build a small embedded issue-tracker example and a second namespace for agent
   events, plus a MySQL client example against the same engine.
 - Validate worktree switching, concurrent embedded/server use, read-only clones,
   missing executables, hook failures, network failures, and partial synchronization.
-- Document the enable/embedded/start workflows and supported Git command matrix.
+- Document enable/embedded/start, status/diff/data-commit, journal backup/recovery,
+  sync, and any optional hook policy.
   Keep explicit `repodb sync` visible in examples; ordinary source pushes do not
   publish database changes under the accepted contract.
 
 **Exit:** two users clone and enable a project, use different SQL-backed tools
-offline, then synchronize and see both users' changes. Neither tool implements
-Git object storage or merging; neither user manages database snapshots.
+offline, checkpoint data directly or through tooling, then synchronize and see
+both users' committed changes. Uncheckpointed work survives restart. Neither
+tool implements journal persistence, Git storage, or merging.
 
 ### M6 — Broaden compatibility and scale from measured workloads
 
@@ -551,16 +688,18 @@ Full MySQL parity and unrestricted OLTP performance are not initial release clai
 
 ## Immediate next deliverable
 
-Complete M4.2 before M5: characterize SQL reads/writes, transactions, complete
-sync, contention, memory, and repository aging. Attribute the dominant costs and
-implement two or three bounded fixes, prioritizing work that scales with unrelated
-data or holds local publication behind network I/O. Publish the workload envelope
-and ranked backlog, then proceed to M5. Preserve explicit sync and durability.
+Deliver M4.3's working-state design and paired journal/native-Git prototype
+benchmark. Separate durable SQL saves from intentional data commits; evaluate
+the 10 ms save / 50 ms warm board targets on a realistic fixture. Record the
+adoption and migration decision before M5. Deferred M4.2 characterization remains
+explicitly assigned to M5/M6 rather than blocking this focused experiment.
 
 ## References
 
 - [Go profiling and tracing](https://go.dev/doc/diagnostics)
 - [Git Trace2 performance instrumentation](https://git-scm.com/docs/api-trace2)
+- [Dolt journal persistence design](https://www.dolthub.com/blog/2023-01-04-acid-transactions/)
+- [Dolt SQL commits versus history commits](https://www.dolthub.com/docs/other/faq/#whats-the-difference-between-commit-and-dolt_commit)
 - [Git clone behavior](https://git-scm.com/docs/git-clone)
 - [Git push and refspec selection](https://git-scm.com/docs/git-push)
 - [Git hooks and their execution points](https://git-scm.com/docs/githooks)
