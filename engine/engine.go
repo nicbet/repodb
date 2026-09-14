@@ -405,6 +405,13 @@ func (s *Session) Query(ctx context.Context, statement string, args ...any) (Res
 			_ = iter.Close(sqlCtx)
 			return Result{}, nextErr
 		}
+		for j, val := range row {
+			if idx, ok := val.(uint16); ok {
+				if et, ok := schema[j].Type.(sql.EnumType); ok {
+					row[j], _ = et.At(int(idx))
+				}
+			}
+		}
 		result.Rows = append(result.Rows, append([]any(nil), row...))
 	}
 	if err := iter.Close(sqlCtx); err != nil {

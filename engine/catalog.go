@@ -826,9 +826,17 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 	}
 	typeChanged := !t.state.schema.Schema[colIdx].Type.Equals(column.Type)
 	if typeChanged {
+		oldEnum, oldIsEnum := t.state.schema.Schema[colIdx].Type.(sql.EnumType)
 		for key, row := range t.state.rows {
 			if row[colIdx] != nil {
-				converted, inRange, err := column.Type.Convert(ctx, row[colIdx])
+				val := row[colIdx]
+				if oldIsEnum {
+					if idx, ok := val.(uint16); ok {
+						str, _ := oldEnum.At(int(idx))
+						val = str
+					}
+				}
+				converted, inRange, err := column.Type.Convert(ctx, val)
 				if err != nil {
 					return fmt.Errorf("cannot convert column %s value: %w", columnName, err)
 				}
@@ -1158,15 +1166,16 @@ type schemaDisk struct {
 	Checks  []checkDisk  `json:"checks,omitempty"`
 }
 type columnDisk struct {
-	Name         string `json:"name"`
-	Type         int32  `json:"type"`
-	Length       int64  `json:"length,omitempty"`
-	Precision    int    `json:"precision,omitempty"`
-	Scale        int    `json:"scale,omitempty"`
-	Nullable     bool   `json:"nullable"`
-	Default      string `json:"default,omitempty"`
-	DefaultLit   bool   `json:"default_literal,omitempty"`
-	DefaultParen bool   `json:"default_paren,omitempty"`
+	Name         string   `json:"name"`
+	Type         int32    `json:"type"`
+	Length       int64    `json:"length,omitempty"`
+	Precision    int      `json:"precision,omitempty"`
+	Scale        int      `json:"scale,omitempty"`
+	EnumValues   []string `json:"enum_values,omitempty"`
+	Nullable     bool     `json:"nullable"`
+	Default      string   `json:"default,omitempty"`
+	DefaultLit   bool     `json:"default_literal,omitempty"`
+	DefaultParen bool     `json:"default_paren,omitempty"`
 }
 
 func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]byte, error) {
@@ -1182,6 +1191,9 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]
 		if dec, ok := col.Type.(sql.DecimalType); ok {
 			cd.Precision = int(dec.Precision())
 			cd.Scale = int(dec.Scale())
+		}
+		if et, ok := col.Type.(sql.EnumType); ok {
+			cd.EnumValues = et.Values()
 		}
 		if col.Default != nil {
 			cd.Default = col.Default.String()
@@ -1203,7 +1215,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	}
 	cols := make(sql.Schema, len(d.Columns))
 	for i, cd := range d.Columns {
-		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision, cd.Scale)
+		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision, cd.Scale, cd.EnumValues)
 		if err != nil {
 			return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
@@ -1226,7 +1238,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 // decodeType maps a querypb.Type to a go-mysql-server sql.Type.
 // Future cleanup: these per-type switches (decodeType, rawValue, decodeRow)
 // could be collapsed into a type registry keyed by querypb.Type.
-func decodeType(t querypb.Type, length int64, precision int, scale int) (sql.Type, error) {
+func decodeType(t querypb.Type, length int64, precision int, scale int, enumValues []string) (sql.Type, error) {
 	switch t {
 	case querypb.Type_INT8:
 		return types.Int8, nil
@@ -1274,6 +1286,8 @@ func decodeType(t querypb.Type, length int64, precision int, scale int) (sql.Typ
 			p = 10
 		}
 		return types.CreateColumnDecimalType(p, s)
+	case querypb.Type_ENUM:
+		return types.CreateEnumType(enumValues, sql.Collation_Default)
 	default:
 		return nil, fmt.Errorf("unsupported M2 SQL type %s", t.String())
 	}
@@ -1297,7 +1311,14 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 			precision = int(dec.Precision())
 			scale = int(dec.Scale())
 		}
-		if _, err := decodeType(col.Type.Type(), length, precision, scale); err != nil {
+		var enumValues []string
+		if et, ok := col.Type.(sql.EnumType); ok {
+			enumValues = et.Values()
+			if et.Collation() != sql.Collation_Default {
+				return fmt.Errorf("column %s: non-default collation on ENUM is not supported", col.Name)
+			}
+		}
+		if _, err := decodeType(col.Type.Type(), length, precision, scale, enumValues); err != nil {
 			return err
 		}
 	}
@@ -1403,6 +1424,15 @@ func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
 			if err != nil {
 				return nil, err
 			}
+		case querypb.Type_ENUM:
+			v, err := strconv.ParseUint(string(raw), 10, 16)
+			if err != nil {
+				return nil, err
+			}
+			row[i], _, err = schema[i].Type.Convert(context.Background(), v)
+			if err != nil {
+				return nil, err
+			}
 		default:
 			row[i] = string(raw)
 		}
@@ -1471,6 +1501,12 @@ func rawValue(typ querypb.Type, value any) ([]byte, error) {
 			return nil, fmt.Errorf("decimal value has type %T", value)
 		}
 		return []byte(d.String()), nil
+	case querypb.Type_ENUM:
+		v, ok := value.(uint16)
+		if !ok {
+			return nil, fmt.Errorf("enum value has type %T", value)
+		}
+		return []byte(strconv.FormatUint(uint64(v), 10)), nil
 	default:
 		value, ok := value.(string)
 		if !ok {

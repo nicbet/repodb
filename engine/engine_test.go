@@ -2256,6 +2256,217 @@ func TestDecimalDefault(t *testing.T) {
 	}
 }
 
+func TestEnumDDL(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue'))"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SHOW CREATE TABLE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := strings.ToLower(result.Rows[0][1].(string))
+	if !strings.Contains(ddl, "enum") {
+		t.Errorf("SHOW CREATE TABLE missing enum, got: %s", ddl)
+	}
+}
+
+func TestEnumInsertSelectRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue'))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'red')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'green')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 'blue')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, color FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(result.Rows))
+	}
+	expected := []string{"red", "green", "blue"}
+	for i, want := range expected {
+		got := fmt.Sprint(result.Rows[i][1])
+		if got != want {
+			t.Errorf("row %d color = %v, want %v", i+1, got, want)
+		}
+	}
+}
+
+func TestEnumInvalidRejected(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue'))"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'yellow')")
+	if err == nil {
+		t.Fatal("expected error inserting invalid enum value")
+	}
+}
+
+func TestEnumNullable(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue'))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT color FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != nil {
+		t.Errorf("color = %v, want nil", result.Rows[0][0])
+	}
+}
+
+func TestEnumDefault(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue') DEFAULT 'green')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT color FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "green" {
+		t.Errorf("default color = %v, want green", got)
+	}
+}
+
+func TestEnumOrderBy(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, size ENUM('small','medium','large'))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'large')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'small')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 'medium')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id FROM t ORDER BY size")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, len(result.Rows))
+	for i, row := range result.Rows {
+		ids[i] = row[0].(int64)
+	}
+	if ids[0] != 2 || ids[1] != 3 || ids[2] != 1 {
+		t.Errorf("ORDER BY size = %v, want [2 3 1] (definition order)", ids)
+	}
+}
+
+func TestEnumAlterReorderPreservesValues(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue'))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'red')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'blue')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN color ENUM('blue','green','red')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, color FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][1]); got != "red" {
+		t.Errorf("row 1 color after reorder = %v, want red", got)
+	}
+	if got := fmt.Sprint(result.Rows[1][1]); got != "blue" {
+		t.Errorf("row 2 color after reorder = %v, want blue", got)
+	}
+}
+
+func TestEnumPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue'))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'red')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'blue')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT id, color FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows after reopen, want 2", len(result.Rows))
+	}
+	if got := fmt.Sprint(result.Rows[0][1]); got != "red" {
+		t.Errorf("color after reopen = %v, want red", got)
+	}
+	if got := fmt.Sprint(result.Rows[1][1]); got != "blue" {
+		t.Errorf("color after reopen = %v, want blue", got)
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()
