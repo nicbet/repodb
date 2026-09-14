@@ -65,6 +65,58 @@ func TestPersistentEmbeddedSQLCommitRollbackAndParameters(t *testing.T) {
 	}
 }
 
+func TestStringParameterBackslashRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id INT PRIMARY KEY, data TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"bare backslash", `a\b`},
+		{"escaped quote", `hello \"world\"`},
+		{"double backslash", `a\\b`},
+		{"newline escape", `line1\nline2`},
+		{"tab escape", `col1\tcol2`},
+		{"json payload", `{"msg":"hello \"world\"","path":"C:\\Users\\test","nl":"a\nb"}`},
+		{"single quote and backslash", `it's a \path`},
+	}
+
+	for i, tc := range cases {
+		if err := s.Exec(ctx, "INSERT INTO t (id, data) VALUES (?, ?)", i, tc.input); err != nil {
+			t.Fatalf("%s: insert: %v", tc.name, err)
+		}
+	}
+
+	result, err := s.Query(ctx, "SELECT id, data FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != len(cases) {
+		t.Fatalf("got %d rows, want %d", len(result.Rows), len(cases))
+	}
+	for i, tc := range cases {
+		got := result.Rows[i][1].(string)
+		if got != tc.input {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.input)
+		}
+	}
+}
+
 func TestStaleEmbeddedTransactionIsRejected(t *testing.T) {
 	ctx := context.Background()
 	root := gitRepository(t)

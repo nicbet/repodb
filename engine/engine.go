@@ -527,7 +527,9 @@ func sqlLiteral(value any) (string, error) {
 	case float64:
 		return fmt.Sprintf("%g", value), nil
 	case string:
-		return "'" + strings.ReplaceAll(value, "'", "''") + "'", nil
+		s := strings.ReplaceAll(value, `\`, `\\`)
+		s = strings.ReplaceAll(s, "'", "''")
+		return "'" + s + "'", nil
 	case []byte:
 		return "X'" + fmt.Sprintf("%x", value) + "'", nil
 	default:
