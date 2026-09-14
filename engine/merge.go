@@ -134,7 +134,7 @@ func MergeSnapshots(ctx context.Context, writer *repository.Writer, base, local,
 		if err != nil {
 			return manifest, nil, nil, err
 		}
-		schema, err := decodeSchema(schemaData)
+		schema, _, err := decodeSchema(schemaData)
 		if err != nil {
 			return manifest, nil, nil, err
 		}
@@ -409,7 +409,7 @@ func validateEntries(schemaData []byte, entries []prolly.Entry) error {
 }
 
 func decodeAndValidateSchema(schemaData []byte) (sql.PrimaryKeySchema, error) {
-	schema, err := decodeSchema(schemaData)
+	schema, _, err := decodeSchema(schemaData)
 	if err != nil {
 		return sql.PrimaryKeySchema{}, err
 	}

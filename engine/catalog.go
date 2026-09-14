@@ -60,6 +60,7 @@ type database struct {
 
 type cachedTableMeta struct {
 	schema   sql.PrimaryKeySchema
+	checks   []sql.CheckDefinition
 	manifest repository.Table
 }
 
@@ -169,7 +170,7 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 	if cacheHit {
 		performanceCounters.metadataCacheHits.Add(1)
 		for name, meta := range cached {
-			tx.tables[name] = &tableState{schema: meta.schema, manifest: meta.manifest, store: snapshot.Store()}
+			tx.tables[name] = &tableState{schema: meta.schema, checks: copyChecks(meta.checks), manifest: meta.manifest, store: snapshot.Store()}
 		}
 	} else {
 		performanceCounters.metadataCacheMisses.Add(1)
@@ -180,7 +181,7 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 				return nil, fmt.Errorf("load table %s: %w", name, err)
 			}
 			tx.tables[name] = state
-			newCache[name] = cachedTableMeta{schema: state.schema, manifest: state.manifest}
+			newCache[name] = cachedTableMeta{schema: state.schema, checks: copyChecks(state.checks), manifest: state.manifest}
 		}
 		s.db.mu.Lock()
 		s.db.metadataCache = newCache
@@ -292,7 +293,7 @@ func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
 		}
 		te := repository.TypedTableEdit{Table: name}
 		if !state.manifest.SchemaRoot.Valid() || state.schemaDirty {
-			schemaData, err := encodeSchema(state.schema)
+			schemaData, err := encodeSchema(state.schema, state.checks)
 			if err != nil {
 				return err
 			}
@@ -381,7 +382,7 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 			}
 			schemaRoot := state.manifest.SchemaRoot
 			if state.schemaDirty {
-				sd, err := encodeSchema(state.schema)
+				sd, err := encodeSchema(state.schema, state.checks)
 				if err != nil {
 					return err
 				}
@@ -394,7 +395,7 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 			manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
 			continue
 		}
-		schemaData, err := encodeSchema(state.schema)
+		schemaData, err := encodeSchema(state.schema, state.checks)
 		if err != nil {
 			return err
 		}
@@ -471,6 +472,7 @@ func transactionFrom(ctx *sql.Context) (*transaction, error) {
 
 type tableState struct {
 	schema      sql.PrimaryKeySchema
+	checks      []sql.CheckDefinition
 	rows        map[string]sql.Row
 	manifest    repository.Table
 	store       storage.Store
@@ -897,6 +899,67 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 	return nil
 }
 
+func (t *table) GetChecks(_ *sql.Context) ([]sql.CheckDefinition, error) {
+	return t.state.checks, nil
+}
+
+func (t *table) CreateCheck(ctx *sql.Context, check *sql.CheckDefinition) error {
+	tx, err := transactionFrom(ctx)
+	if err != nil {
+		return err
+	}
+	chk := *check
+	if chk.Name == "" {
+		chk.Name = t.generateCheckName()
+	} else {
+		for _, existing := range t.state.checks {
+			if strings.EqualFold(existing.Name, chk.Name) {
+				return fmt.Errorf("duplicate check constraint name '%s'", chk.Name)
+			}
+		}
+	}
+	t.state.checks = append(copyChecks(t.state.checks), chk)
+	t.state.dirty = true
+	t.state.schemaDirty = true
+	tx.dirty = true
+	return nil
+}
+
+func (t *table) generateCheckName() string {
+	max := 0
+	prefix := strings.ToLower(t.name) + "_chk_"
+	for _, chk := range t.state.checks {
+		lower := strings.ToLower(chk.Name)
+		if strings.HasPrefix(lower, prefix) {
+			var v int
+			if n, _ := fmt.Sscanf(lower[len(prefix):], "%d", &v); n == 1 && v > max {
+				max = v
+			}
+		}
+	}
+	return fmt.Sprintf("%s%d", prefix, max+1)
+}
+
+func (t *table) DropCheck(ctx *sql.Context, chName string) error {
+	tx, err := transactionFrom(ctx)
+	if err != nil {
+		return err
+	}
+	for i, chk := range t.state.checks {
+		if strings.EqualFold(chk.Name, chName) {
+			newChecks := make([]sql.CheckDefinition, 0, len(t.state.checks)-1)
+			newChecks = append(newChecks, t.state.checks[:i]...)
+			newChecks = append(newChecks, t.state.checks[i+1:]...)
+			t.state.checks = newChecks
+			t.state.dirty = true
+			t.state.schemaDirty = true
+			tx.dirty = true
+			return nil
+		}
+	}
+	return fmt.Errorf("check constraint %s not found", chName)
+}
+
 type singlePartition struct{}
 type pointPartition struct{ keys []string }
 
@@ -1083,9 +1146,15 @@ func (e *editor) remember(key string, row sql.Row, present bool) {
 	performanceCounters.undoRowsCaptured.Add(1)
 }
 
+type checkDisk struct {
+	Name       string `json:"name"`
+	Expression string `json:"expression"`
+	Enforced   bool   `json:"enforced"`
+}
 type schemaDisk struct {
 	Columns []columnDisk `json:"columns"`
 	PK      []int        `json:"primary_key"`
+	Checks  []checkDisk  `json:"checks,omitempty"`
 }
 type columnDisk struct {
 	Name         string `json:"name"`
@@ -1097,7 +1166,7 @@ type columnDisk struct {
 	DefaultParen bool   `json:"default_paren,omitempty"`
 }
 
-func encodeSchema(schema sql.PrimaryKeySchema) ([]byte, error) {
+func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]byte, error) {
 	d := schemaDisk{PK: append([]int(nil), schema.PkOrdinals...)}
 	for _, col := range schema.Schema {
 		cd := columnDisk{Name: col.Name, Type: int32(col.Type.Type()), Nullable: col.Nullable}
@@ -1111,19 +1180,22 @@ func encodeSchema(schema sql.PrimaryKeySchema) ([]byte, error) {
 		}
 		d.Columns = append(d.Columns, cd)
 	}
+	for _, chk := range checks {
+		d.Checks = append(d.Checks, checkDisk{Name: chk.Name, Expression: chk.CheckExpression, Enforced: chk.Enforced})
+	}
 	return json.Marshal(d)
 }
 
-func decodeSchema(data []byte) (sql.PrimaryKeySchema, error) {
+func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, error) {
 	var d schemaDisk
 	if err := json.Unmarshal(data, &d); err != nil {
-		return sql.PrimaryKeySchema{}, err
+		return sql.PrimaryKeySchema{}, nil, err
 	}
 	cols := make(sql.Schema, len(d.Columns))
 	for i, cd := range d.Columns {
 		typ, err := decodeType(querypb.Type(cd.Type), cd.Length)
 		if err != nil {
-			return sql.PrimaryKeySchema{}, fmt.Errorf("column %s: %w", cd.Name, err)
+			return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
 		col := &sql.Column{Name: cd.Name, Type: typ, Nullable: cd.Nullable, PrimaryKey: contains(d.PK, i)}
 		if cd.Default != "" {
@@ -1134,7 +1206,11 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, error) {
 		}
 		cols[i] = col
 	}
-	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, nil
+	var checks []sql.CheckDefinition
+	for _, cd := range d.Checks {
+		checks = append(checks, sql.CheckDefinition{Name: cd.Name, CheckExpression: cd.Expression, Enforced: cd.Enforced})
+	}
+	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, checks, nil
 }
 
 func decodeType(t querypb.Type, length int64) (sql.Type, error) {
@@ -1319,11 +1395,11 @@ func loadTableMetadata(ctx context.Context, store storage.Store, manifest reposi
 	if err != nil {
 		return nil, err
 	}
-	schema, err := decodeSchema(schemaData)
+	schema, checks, err := decodeSchema(schemaData)
 	if err != nil {
 		return nil, err
 	}
-	return &tableState{schema: schema, manifest: manifest, store: store}, nil
+	return &tableState{schema: schema, checks: checks, manifest: manifest, store: store}, nil
 }
 
 func loadTable(ctx context.Context, store storage.Store, manifest repository.Table) (*tableState, error) {
@@ -1352,6 +1428,14 @@ func copySchema(s sql.PrimaryKeySchema) sql.PrimaryKeySchema {
 	}
 	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: append([]int(nil), s.PkOrdinals...)}
 }
+func copyChecks(checks []sql.CheckDefinition) []sql.CheckDefinition {
+	if checks == nil {
+		return nil
+	}
+	out := make([]sql.CheckDefinition, len(checks))
+	copy(out, checks)
+	return out
+}
 func cloneRow(row sql.Row) sql.Row { return append(sql.Row(nil), row...) }
 func cloneRows(rows map[string]sql.Row) map[string]sql.Row {
 	out := make(map[string]sql.Row, len(rows))
@@ -1371,4 +1455,6 @@ var _ sql.InsertableTable = (*table)(nil)
 var _ sql.UpdatableTable = (*table)(nil)
 var _ sql.DeletableTable = (*table)(nil)
 var _ sql.AlterableTable = (*table)(nil)
+var _ sql.CheckTable = (*table)(nil)
+var _ sql.CheckAlterableTable = (*table)(nil)
 var _ sql.TransactionSession = (*session)(nil)

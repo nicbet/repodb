@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/nicbet/repodb/common/repository"
@@ -1162,6 +1163,283 @@ func TestDefaultPersistsNativeGit(t *testing.T) {
 	}
 	if result.Rows[1][1] != int64(42) {
 		t.Errorf("row 2 score = %v, want 42", result.Rows[1][1])
+	}
+}
+
+func TestCheckConstraintOnCreateTable(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, age BIGINT, CHECK (age >= 0))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 25)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (2, -1)")
+	if err == nil {
+		t.Fatal("expected check constraint violation")
+	}
+	result, err := s.Query(ctx, "SELECT COUNT(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != int64(1) {
+		t.Errorf("count = %v, want 1", result.Rows[0][0])
+	}
+	// Unnamed checks get a generated name like t_chk_1
+	ddl, err := s.Query(ctx, "SHOW CREATE TABLE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := ddl.Rows[0][1].(string)
+	if !strings.Contains(create, "t_chk_1") {
+		t.Errorf("expected generated check name t_chk_1 in SHOW CREATE TABLE, got: %s", create)
+	}
+	// Generated name is droppable
+	if err := s.Exec(ctx, "ALTER TABLE t DROP CONSTRAINT t_chk_1"); err != nil {
+		t.Fatal("failed to drop unnamed check by generated name:", err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, -1)"); err != nil {
+		t.Fatal("should succeed after dropping check:", err)
+	}
+}
+
+func TestCheckConstraintNamed(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT, CONSTRAINT score_positive CHECK (score > 0))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (2, 0)")
+	if err == nil {
+		t.Fatal("expected check constraint violation for score_positive")
+	}
+}
+
+func TestCheckConstraintOnUpdate(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, age BIGINT, CHECK (age >= 0))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 25)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "UPDATE t SET age = -5 WHERE id = 1")
+	if err == nil {
+		t.Fatal("expected check constraint violation on UPDATE")
+	}
+	result, err := s.Query(ctx, "SELECT age FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != int64(25) {
+		t.Errorf("age = %v, want 25 (should not have changed)", result.Rows[0][0])
+	}
+}
+
+func TestAlterTableAddCheck(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t ADD CONSTRAINT val_positive CHECK (val > 0)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (2, -1)")
+	if err == nil {
+		t.Fatal("expected check constraint violation after ALTER TABLE ADD CHECK")
+	}
+}
+
+func TestAlterTableAddCheckRejectsExistingViolations(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, -5)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "ALTER TABLE t ADD CHECK (val >= 0)")
+	if err == nil {
+		t.Fatal("expected error: existing rows violate the check constraint")
+	}
+}
+
+func TestAlterTableDropCheck(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT, CONSTRAINT val_chk CHECK (val > 0))"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (1, -1)")
+	if err == nil {
+		t.Fatal("expected check violation before drop")
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t DROP CHECK val_chk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, -1)"); err != nil {
+		t.Fatal("should succeed after dropping check:", err)
+	}
+}
+
+func TestCheckConstraintPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, age BIGINT, CHECK (age >= 0))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 25)"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	if err := s2.Exec(ctx, "INSERT INTO t VALUES (2, 30)"); err != nil {
+		t.Fatal(err)
+	}
+	err = s2.Exec(ctx, "INSERT INTO t VALUES (3, -1)")
+	if err == nil {
+		t.Fatal("expected check constraint violation after reopen")
+	}
+}
+
+func TestCheckConstraintPersistsNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	nativeGit := engine.Options{Persistence: engine.PersistenceNativeGit}
+	eng, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT, CONSTRAINT pos CHECK (val > 0))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 42)"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	err = s2.Exec(ctx, "INSERT INTO t VALUES (2, -1)")
+	if err == nil {
+		t.Fatal("expected check constraint violation after native-git reopen")
+	}
+	if err := s2.Exec(ctx, "INSERT INTO t VALUES (2, 100)"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDropCheckDoesNotCorruptCache(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, CONSTRAINT chk_a CHECK (a > 0), CONSTRAINT chk_b CHECK (b > 0))"); err != nil {
+		t.Fatal(err)
+	}
+	// Insert a valid row to ensure the table is committed
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 20)"); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the first check — must not corrupt the second
+	if err := s.Exec(ctx, "ALTER TABLE t DROP CONSTRAINT chk_a"); err != nil {
+		t.Fatal(err)
+	}
+	// chk_b should still be enforced
+	err := s.Exec(ctx, "INSERT INTO t VALUES (2, -1, -1)")
+	if err == nil {
+		t.Fatal("expected chk_b violation after dropping chk_a")
+	}
+	// chk_a should no longer be enforced
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, -1, 5)"); err != nil {
+		t.Fatal("chk_a should be gone:", err)
+	}
+}
+
+func TestShowCreateTableIncludesCheck(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT, CONSTRAINT val_range CHECK (val BETWEEN 1 AND 100))"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SHOW CREATE TABLE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := result.Rows[0][1].(string)
+	if !strings.Contains(ddl, "val_range") {
+		t.Errorf("SHOW CREATE TABLE missing check name, got: %s", ddl)
+	}
+}
+
+func TestNotNullOnNonPKColumn(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (2, NULL)")
+	if err == nil {
+		t.Fatal("expected NOT NULL violation")
 	}
 }
 
