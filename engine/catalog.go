@@ -682,8 +682,8 @@ func (t *table) AddColumn(ctx *sql.Context, column *sql.Column, order *sql.Colum
 	if err := t.state.ensureRows(ctx); err != nil {
 		return err
 	}
-	if !column.Nullable && len(t.state.rows) > 0 {
-		return fmt.Errorf("cannot add NOT NULL column %s to table with existing rows (no DEFAULT support)", column.Name)
+	if !column.Nullable && column.Default == nil && len(t.state.rows) > 0 {
+		return fmt.Errorf("cannot add NOT NULL column %s to table with existing rows without a DEFAULT", column.Name)
 	}
 	newSchema := make(sql.Schema, len(t.state.schema.Schema)+1)
 	insertAt := len(t.state.schema.Schema)
@@ -1088,10 +1088,13 @@ type schemaDisk struct {
 	PK      []int        `json:"primary_key"`
 }
 type columnDisk struct {
-	Name     string `json:"name"`
-	Type     int32  `json:"type"`
-	Length   int64  `json:"length,omitempty"`
-	Nullable bool   `json:"nullable"`
+	Name         string `json:"name"`
+	Type         int32  `json:"type"`
+	Length       int64  `json:"length,omitempty"`
+	Nullable     bool   `json:"nullable"`
+	Default      string `json:"default,omitempty"`
+	DefaultLit   bool   `json:"default_literal,omitempty"`
+	DefaultParen bool   `json:"default_paren,omitempty"`
 }
 
 func encodeSchema(schema sql.PrimaryKeySchema) ([]byte, error) {
@@ -1100,6 +1103,11 @@ func encodeSchema(schema sql.PrimaryKeySchema) ([]byte, error) {
 		cd := columnDisk{Name: col.Name, Type: int32(col.Type.Type()), Nullable: col.Nullable}
 		if st, ok := col.Type.(sql.StringType); ok {
 			cd.Length = st.Length()
+		}
+		if col.Default != nil {
+			cd.Default = col.Default.String()
+			cd.DefaultLit = col.Default.IsLiteral()
+			cd.DefaultParen = col.Default.IsParenthesized()
 		}
 		d.Columns = append(d.Columns, cd)
 	}
@@ -1117,7 +1125,14 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, error) {
 		if err != nil {
 			return sql.PrimaryKeySchema{}, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
-		cols[i] = &sql.Column{Name: cd.Name, Type: typ, Nullable: cd.Nullable, PrimaryKey: contains(d.PK, i)}
+		col := &sql.Column{Name: cd.Name, Type: typ, Nullable: cd.Nullable, PrimaryKey: contains(d.PK, i)}
+		if cd.Default != "" {
+			defVal := sql.NewUnresolvedColumnDefaultValue(cd.Default)
+			defVal.Literal = cd.DefaultLit
+			defVal.Parenthesized = cd.DefaultParen
+			col.Default = defVal
+		}
+		cols[i] = col
 	}
 	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, nil
 }
@@ -1165,7 +1180,7 @@ func decodeType(t querypb.Type, length int64) (sql.Type, error) {
 
 func validateSchema(schema sql.PrimaryKeySchema) error {
 	for _, col := range schema.Schema {
-		if col.AutoIncrement || col.Default != nil || col.Generated != nil {
+		if col.AutoIncrement || col.Generated != nil {
 			return fmt.Errorf("column %s uses unsupported M2 schema behavior", col.Name)
 		}
 		if _, err := decodeType(col.Type.Type(), func() int64 {

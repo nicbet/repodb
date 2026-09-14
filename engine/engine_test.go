@@ -895,6 +895,276 @@ func TestMetadataCacheHitsOnRepeatedReads(t *testing.T) {
 	}
 }
 
+func TestCreateTableWithDefaultLiteral(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) DEFAULT 'unknown', score BIGINT DEFAULT 0)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id, name) VALUES (2, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, name, score FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][1] != "unknown" {
+		t.Errorf("row 1 name = %v, want 'unknown'", result.Rows[0][1])
+	}
+	if result.Rows[0][2] != int64(0) {
+		t.Errorf("row 1 score = %v, want 0", result.Rows[0][2])
+	}
+	if result.Rows[1][1] != "alice" {
+		t.Errorf("row 2 name = %v, want 'alice'", result.Rows[1][1])
+	}
+	if result.Rows[1][2] != int64(0) {
+		t.Errorf("row 2 score = %v, want 0", result.Rows[1][2])
+	}
+}
+
+func TestCreateTableWithDefaultExpression(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT DEFAULT (1 + 1))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, val FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(result.Rows))
+	}
+	if result.Rows[0][1] != int64(2) {
+		t.Errorf("val = %v, want 2", result.Rows[0][1])
+	}
+}
+
+func TestExpressionDefaultRoundTripThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT DEFAULT ((2+2)/2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT val FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != int64(2) {
+		t.Fatalf("before reopen: val = %v, want 2", result.Rows[0][0])
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	if err := s2.Exec(ctx, "INSERT INTO t (id) VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err = s2.Query(ctx, "SELECT val FROM t WHERE id = 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != int64(2) {
+		t.Errorf("after reopen: val = %v, want 2 — expression default lost grouping during round-trip", result.Rows[0][0])
+	}
+}
+
+func TestInsertExplicitDefaultKeyword(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) DEFAULT 'fallback')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, DEFAULT)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT name FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "fallback" {
+		t.Errorf("name = %v, want 'fallback'", result.Rows[0][0])
+	}
+}
+
+func TestAlterTableAddNotNullWithDefault(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t ADD COLUMN score BIGINT NOT NULL DEFAULT 0"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, name, score FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][2] != int64(0) {
+		t.Errorf("row 1 score = %v, want 0", result.Rows[0][2])
+	}
+	if result.Rows[1][2] != int64(0) {
+		t.Errorf("row 2 score = %v, want 0", result.Rows[1][2])
+	}
+}
+
+func TestAlterTableAddNotNullNoDefaultStillRejected(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "ALTER TABLE t ADD COLUMN name TEXT NOT NULL")
+	if err == nil {
+		t.Fatal("expected error adding NOT NULL column without DEFAULT to table with rows")
+	}
+}
+
+func TestDefaultPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) DEFAULT 'unknown')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	if err := s2.Exec(ctx, "INSERT INTO t (id) VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s2.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][1] != "unknown" {
+		t.Errorf("row 1 name = %v, want 'unknown'", result.Rows[0][1])
+	}
+	if result.Rows[1][1] != "unknown" {
+		t.Errorf("row 2 name = %v, want 'unknown'", result.Rows[1][1])
+	}
+}
+
+func TestDefaultPersistsNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	nativeGit := engine.Options{Persistence: engine.PersistenceNativeGit}
+	eng, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, score BIGINT DEFAULT 42)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	if err := s2.Exec(ctx, "INSERT INTO t (id) VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s2.Query(ctx, "SELECT id, score FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][1] != int64(42) {
+		t.Errorf("row 1 score = %v, want 42", result.Rows[0][1])
+	}
+	if result.Rows[1][1] != int64(42) {
+		t.Errorf("row 2 score = %v, want 42", result.Rows[1][1])
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()
