@@ -1217,6 +1217,9 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, checks, nil
 }
 
+// decodeType maps a querypb.Type to a go-mysql-server sql.Type.
+// Future cleanup: these per-type switches (decodeType, rawValue, decodeRow)
+// could be collapsed into a type registry keyed by querypb.Type.
 func decodeType(t querypb.Type, length int64, precision int) (sql.Type, error) {
 	switch t {
 	case querypb.Type_INT8:
@@ -1257,6 +1260,8 @@ func decodeType(t querypb.Type, length int64, precision int) (sql.Type, error) {
 		return types.CreateDatetimeType(t, precision)
 	case querypb.Type_TIME:
 		return types.Time, nil
+	case querypb.Type_JSON:
+		return types.JSON, nil
 	default:
 		return nil, fmt.Errorf("unsupported M2 SQL type %s", t.String())
 	}
@@ -1367,6 +1372,11 @@ func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
 				return nil, err
 			}
 			row[i] = types.Timespan(v)
+		case querypb.Type_JSON:
+			row[i], _, err = types.JSON.Convert(context.Background(), string(raw))
+			if err != nil {
+				return nil, err
+			}
 		default:
 			row[i] = string(raw)
 		}
@@ -1419,6 +1429,16 @@ func rawValue(typ querypb.Type, value any) ([]byte, error) {
 			return nil, fmt.Errorf("time value has type %T", value)
 		}
 		return []byte(strconv.FormatInt(int64(ts), 10)), nil
+	case querypb.Type_JSON:
+		jw, ok := value.(sql.JSONWrapper)
+		if !ok {
+			return nil, fmt.Errorf("json value has type %T", value)
+		}
+		s, err := types.JsonToMySqlString(jw)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(s), nil
 	default:
 		value, ok := value.(string)
 		if !ok {

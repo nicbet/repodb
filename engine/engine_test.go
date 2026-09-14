@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -1821,6 +1822,189 @@ func TestTemporalDefault(t *testing.T) {
 	d := result.Rows[0][0].(time.Time)
 	if d.Format("2006-01-02") != "2024-01-01" {
 		t.Errorf("default date = %v, want 2024-01-01", d)
+	}
+}
+
+func TestJSONTypeDDL(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SHOW CREATE TABLE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := result.Rows[0][1].(string)
+	if !strings.Contains(strings.ToLower(ddl), "json") {
+		t.Errorf("SHOW CREATE TABLE missing json, got: %s", ddl)
+	}
+}
+
+func TestJSONInsertSelectRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, `INSERT INTO t VALUES (1, '{"name":"alice","age":30}')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, `INSERT INTO t VALUES (2, '[1, 2, 3]')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, `INSERT INTO t VALUES (3, '"just a string"')`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, data FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(result.Rows))
+	}
+	obj := fmt.Sprint(result.Rows[0][1])
+	if obj != `{"age": 30, "name": "alice"}` {
+		t.Errorf("row 1 JSON object = %v, want exact {\"age\": 30, \"name\": \"alice\"}", obj)
+	}
+	arr := fmt.Sprint(result.Rows[1][1])
+	if arr != `[1, 2, 3]` {
+		t.Errorf("row 2 JSON array = %v, want exact [1, 2, 3]", arr)
+	}
+	scalar := fmt.Sprint(result.Rows[2][1])
+	if scalar != `"just a string"` {
+		t.Errorf("row 3 JSON scalar = %v, want exact \"just a string\"", scalar)
+	}
+}
+
+func TestJSONExtractFunction(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, `INSERT INTO t VALUES (1, '{"name":"alice","score":95}')`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, `SELECT JSON_UNQUOTE(JSON_EXTRACT(data, '$.name')) FROM t WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(result.Rows))
+	}
+	got := result.Rows[0][0]
+	if got != "alice" {
+		t.Errorf("JSON_EXTRACT name = %v (%T), want 'alice'", got, got)
+	}
+}
+
+func TestJSONObjectFunction(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, `INSERT INTO t VALUES (1, JSON_OBJECT('key', 'value'))`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, `SELECT JSON_UNQUOTE(JSON_EXTRACT(data, '$.key')) FROM t WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(result.Rows))
+	}
+	got := result.Rows[0][0]
+	if got != "value" {
+		t.Errorf("JSON_OBJECT key = %v (%T), want 'value'", got, got)
+	}
+}
+
+func TestJSONInvalidRejected(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, `INSERT INTO t VALUES (1, '{not valid json}')`)
+	if err == nil {
+		t.Fatal("expected error inserting invalid JSON")
+	}
+}
+
+func TestJSONNullable(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT data FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != nil {
+		t.Errorf("data = %v, want nil", result.Rows[0][0])
+	}
+}
+
+func TestJSONPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, data JSON)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, `INSERT INTO t VALUES (1, '{"key":"value","nested":{"a":1}}')`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, `SELECT JSON_UNQUOTE(JSON_EXTRACT(data, '$.key')), JSON_EXTRACT(data, '$.nested.a') FROM t WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows after reopen, want 1", len(result.Rows))
+	}
+	if result.Rows[0][0] != "value" {
+		t.Errorf("key after reopen = %v, want 'value'", result.Rows[0][0])
+	}
+	nested := fmt.Sprint(result.Rows[0][1])
+	if nested != "1" {
+		t.Errorf("nested.a after reopen = %v, want 1", nested)
 	}
 }
 
