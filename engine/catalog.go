@@ -21,6 +21,7 @@ import (
 	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
+	"github.com/shopspring/decimal"
 )
 
 type provider struct{ db *database }
@@ -1161,6 +1162,7 @@ type columnDisk struct {
 	Type         int32  `json:"type"`
 	Length       int64  `json:"length,omitempty"`
 	Precision    int    `json:"precision,omitempty"`
+	Scale        int    `json:"scale,omitempty"`
 	Nullable     bool   `json:"nullable"`
 	Default      string `json:"default,omitempty"`
 	DefaultLit   bool   `json:"default_literal,omitempty"`
@@ -1176,6 +1178,10 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]
 		}
 		if dt, ok := col.Type.(sql.DatetimeType); ok {
 			cd.Precision = dt.Precision()
+		}
+		if dec, ok := col.Type.(sql.DecimalType); ok {
+			cd.Precision = int(dec.Precision())
+			cd.Scale = int(dec.Scale())
 		}
 		if col.Default != nil {
 			cd.Default = col.Default.String()
@@ -1197,7 +1203,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	}
 	cols := make(sql.Schema, len(d.Columns))
 	for i, cd := range d.Columns {
-		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision)
+		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision, cd.Scale)
 		if err != nil {
 			return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
@@ -1220,7 +1226,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 // decodeType maps a querypb.Type to a go-mysql-server sql.Type.
 // Future cleanup: these per-type switches (decodeType, rawValue, decodeRow)
 // could be collapsed into a type registry keyed by querypb.Type.
-func decodeType(t querypb.Type, length int64, precision int) (sql.Type, error) {
+func decodeType(t querypb.Type, length int64, precision int, scale int) (sql.Type, error) {
 	switch t {
 	case querypb.Type_INT8:
 		return types.Int8, nil
@@ -1262,6 +1268,12 @@ func decodeType(t querypb.Type, length int64, precision int) (sql.Type, error) {
 		return types.Time, nil
 	case querypb.Type_JSON:
 		return types.JSON, nil
+	case querypb.Type_DECIMAL:
+		p, s := uint8(precision), uint8(scale)
+		if p == 0 {
+			p = 10
+		}
+		return types.CreateColumnDecimalType(p, s)
 	default:
 		return nil, fmt.Errorf("unsupported M2 SQL type %s", t.String())
 	}
@@ -1280,7 +1292,12 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 		if dt, ok := col.Type.(sql.DatetimeType); ok {
 			precision = dt.Precision()
 		}
-		if _, err := decodeType(col.Type.Type(), length, precision); err != nil {
+		var scale int
+		if dec, ok := col.Type.(sql.DecimalType); ok {
+			precision = int(dec.Precision())
+			scale = int(dec.Scale())
+		}
+		if _, err := decodeType(col.Type.Type(), length, precision, scale); err != nil {
 			return err
 		}
 	}
@@ -1377,6 +1394,15 @@ func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
 			if err != nil {
 				return nil, err
 			}
+		case querypb.Type_DECIMAL:
+			d, err := decimal.NewFromString(string(raw))
+			if err != nil {
+				return nil, err
+			}
+			row[i], _, err = schema[i].Type.Convert(context.Background(), d)
+			if err != nil {
+				return nil, err
+			}
 		default:
 			row[i] = string(raw)
 		}
@@ -1439,6 +1465,12 @@ func rawValue(typ querypb.Type, value any) ([]byte, error) {
 			return nil, err
 		}
 		return []byte(s), nil
+	case querypb.Type_DECIMAL:
+		d, ok := value.(decimal.Decimal)
+		if !ok {
+			return nil, fmt.Errorf("decimal value has type %T", value)
+		}
+		return []byte(d.String()), nil
 	default:
 		value, ok := value.(string)
 		if !ok {

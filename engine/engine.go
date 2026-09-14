@@ -21,6 +21,7 @@ import (
 	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
+	"github.com/shopspring/decimal"
 )
 
 const snapshotValidationVersion = 1
@@ -535,6 +536,8 @@ func sqlLiteral(value any) (string, error) {
 		return "X'" + fmt.Sprintf("%x", value) + "'", nil
 	case time.Time:
 		return "'" + value.UTC().Format("2006-01-02 15:04:05.999999") + "'", nil
+	case decimal.Decimal:
+		return value.String(), nil
 	default:
 		return "", fmt.Errorf("unsupported SQL parameter type %T", value)
 	}

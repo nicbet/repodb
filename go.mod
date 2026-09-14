@@ -6,6 +6,7 @@ require (
 	github.com/dolthub/go-mysql-server v0.20.0
 	github.com/dolthub/vitess v0.0.0-20250512224608-8fb9c6ea092c
 	github.com/go-sql-driver/mysql v1.10.1
+	github.com/shopspring/decimal v1.3.1
 	golang.org/x/sys v0.12.0
 )
 
@@ -22,7 +23,6 @@ require (
 	github.com/lestrrat-go/strftime v1.0.4 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/shopspring/decimal v1.3.1 // indirect
 	github.com/sirupsen/logrus v1.8.1 // indirect
 	github.com/tetratelabs/wazero v1.8.2 // indirect
 	go.opentelemetry.io/otel v1.31.0 // indirect

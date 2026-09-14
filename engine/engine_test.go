@@ -2008,6 +2008,254 @@ func TestJSONPersistsThroughReopen(t *testing.T) {
 	}
 }
 
+func TestDecimalDDL(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, price DECIMAL(10,2), quantity NUMERIC(5,3))"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SHOW CREATE TABLE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := strings.ToLower(result.Rows[0][1].(string))
+	if !strings.Contains(ddl, "decimal") {
+		t.Errorf("SHOW CREATE TABLE missing decimal, got: %s", ddl)
+	}
+}
+
+func TestDecimalBareType(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val DECIMAL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 1234567890)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT val FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmt.Sprint(result.Rows[0][0])
+	if got != "1234567890" {
+		t.Errorf("bare DECIMAL = %v, want 1234567890", got)
+	}
+}
+
+func TestDecimalRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, price DECIMAL(10,2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 99.99)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 0.10)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 12345678.50)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, price FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(result.Rows))
+	}
+	expected := []string{"99.99", "0.1", "12345678.5"}
+	for i, want := range expected {
+		got := fmt.Sprint(result.Rows[i][1])
+		if got != want {
+			t.Errorf("row %d price = %v, want %v", i+1, got, want)
+		}
+	}
+}
+
+func TestDecimalPrecisionOverflow(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val DECIMAL(5,2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 999.99)"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES (2, 1000.00)")
+	if err == nil {
+		t.Fatal("expected error inserting value exceeding DECIMAL(5,2) precision")
+	}
+}
+
+func TestDecimalScaleRounding(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val DECIMAL(5,2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 1.999)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT val FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmt.Sprint(result.Rows[0][0])
+	if got != "2" && got != "2.00" {
+		t.Errorf("DECIMAL(5,2) of 1.999 = %v, want 2.00 (rounded)", got)
+	}
+}
+
+func TestDecimalArithmetic(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, price DECIMAL(10,2), qty DECIMAL(10,3))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 19.99, 3.000)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT price * qty FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fmt.Sprint(result.Rows[0][0])
+	if got != "59.97" && got != "59.970" && got != "59.97000" {
+		t.Errorf("price * qty = %v, want 59.97", got)
+	}
+}
+
+func TestDecimalOrderBy(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val DECIMAL(10,2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10.50)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 1.25)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 100.00)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id FROM t ORDER BY val")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, len(result.Rows))
+	for i, row := range result.Rows {
+		ids[i] = row[0].(int64)
+	}
+	if ids[0] != 2 || ids[1] != 1 || ids[2] != 3 {
+		t.Errorf("ORDER BY val = %v, want [2 1 3]", ids)
+	}
+}
+
+func TestDecimalNullable(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val DECIMAL(10,2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT val FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][0] != nil {
+		t.Errorf("val = %v, want nil", result.Rows[0][0])
+	}
+}
+
+func TestDecimalPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, price DECIMAL(10,2))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 99.99)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 0.01)"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT id, price FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows after reopen, want 2", len(result.Rows))
+	}
+	if got := fmt.Sprint(result.Rows[0][1]); got != "99.99" {
+		t.Errorf("price after reopen = %v, want 99.99", got)
+	}
+	if got := fmt.Sprint(result.Rows[1][1]); got != "0.01" {
+		t.Errorf("price after reopen = %v, want 0.01", got)
+	}
+}
+
+func TestDecimalDefault(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, price DECIMAL(10,2) DEFAULT 9.99)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT price FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "9.99" {
+		t.Errorf("default price = %v, want 9.99", got)
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()
