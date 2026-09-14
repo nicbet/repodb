@@ -291,7 +291,7 @@ func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
 			continue
 		}
 		te := repository.TypedTableEdit{Table: name}
-		if !state.manifest.DataRoot.Valid() && !state.manifest.SchemaRoot.Valid() {
+		if !state.manifest.SchemaRoot.Valid() || state.schemaDirty {
 			schemaData, err := encodeSchema(state.schema)
 			if err != nil {
 				return err
@@ -379,8 +379,19 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 			for _, hash := range hashes {
 				reachable[hash] = struct{}{}
 			}
-			reachable[state.manifest.SchemaRoot] = struct{}{}
-			manifest.Tables[name] = repository.Table{SchemaRoot: state.manifest.SchemaRoot, DataRoot: tree.Root()}
+			schemaRoot := state.manifest.SchemaRoot
+			if state.schemaDirty {
+				sd, err := encodeSchema(state.schema)
+				if err != nil {
+					return err
+				}
+				schemaRoot, err = tx.writer.Put(ctx, sd)
+				if err != nil {
+					return err
+				}
+			}
+			reachable[schemaRoot] = struct{}{}
+			manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
 			continue
 		}
 		schemaData, err := encodeSchema(state.schema)
@@ -459,12 +470,13 @@ func transactionFrom(ctx *sql.Context) (*transaction, error) {
 }
 
 type tableState struct {
-	schema   sql.PrimaryKeySchema
-	rows     map[string]sql.Row
-	manifest repository.Table
-	store    storage.Store
-	edits    map[string]rowEdit
-	dirty    bool
+	schema      sql.PrimaryKeySchema
+	rows        map[string]sql.Row
+	manifest    repository.Table
+	store       storage.Store
+	edits       map[string]rowEdit
+	dirty       bool
+	schemaDirty bool
 }
 
 type rowEdit struct {
@@ -655,6 +667,235 @@ func (t *table) partitionRows(ctx context.Context, partition sql.Partition) (sql
 func (t *table) Inserter(*sql.Context) sql.RowInserter { return &editor{table: t} }
 func (t *table) Updater(*sql.Context) sql.RowUpdater   { return &editor{table: t} }
 func (t *table) Deleter(*sql.Context) sql.RowDeleter   { return &editor{table: t} }
+
+func (t *table) AddColumn(ctx *sql.Context, column *sql.Column, order *sql.ColumnOrder) error {
+	tx, err := transactionFrom(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateSchema(sql.PrimaryKeySchema{Schema: sql.Schema{column}}); err != nil {
+		return err
+	}
+	if column.PrimaryKey {
+		return fmt.Errorf("cannot add primary key column %s via ALTER TABLE", column.Name)
+	}
+	if err := t.state.ensureRows(ctx); err != nil {
+		return err
+	}
+	if !column.Nullable && len(t.state.rows) > 0 {
+		return fmt.Errorf("cannot add NOT NULL column %s to table with existing rows (no DEFAULT support)", column.Name)
+	}
+	newSchema := make(sql.Schema, len(t.state.schema.Schema)+1)
+	insertAt := len(t.state.schema.Schema)
+	if order != nil {
+		if order.First {
+			insertAt = 0
+		} else if order.AfterColumn != "" {
+			found := false
+			for i, col := range t.state.schema.Schema {
+				if strings.EqualFold(col.Name, order.AfterColumn) {
+					insertAt = i + 1
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("column %s not found", order.AfterColumn)
+			}
+		}
+	}
+	copy(newSchema, t.state.schema.Schema[:insertAt])
+	newSchema[insertAt] = column
+	copy(newSchema[insertAt+1:], t.state.schema.Schema[insertAt:])
+	newPK := make([]int, len(t.state.schema.PkOrdinals))
+	for i, ord := range t.state.schema.PkOrdinals {
+		if ord >= insertAt {
+			newPK[i] = ord + 1
+		} else {
+			newPK[i] = ord
+		}
+	}
+	newRows := make(map[string]sql.Row, len(t.state.rows))
+	for key, row := range t.state.rows {
+		newRow := make(sql.Row, len(row)+1)
+		copy(newRow, row[:insertAt])
+		newRow[insertAt] = nil
+		copy(newRow[insertAt+1:], row[insertAt:])
+		newRows[key] = newRow
+	}
+	t.state.schema = sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
+	t.state.rows = newRows
+	t.state.edits = make(map[string]rowEdit)
+	for key, row := range newRows {
+		t.state.edits[key] = rowEdit{row: cloneRow(row)}
+	}
+	t.state.dirty = true
+	t.state.schemaDirty = true
+	tx.dirty = true
+	return nil
+}
+
+func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
+	tx, err := transactionFrom(ctx)
+	if err != nil {
+		return err
+	}
+	dropIdx := -1
+	for i, col := range t.state.schema.Schema {
+		if strings.EqualFold(col.Name, columnName) {
+			dropIdx = i
+			break
+		}
+	}
+	if dropIdx < 0 {
+		return fmt.Errorf("column %s not found", columnName)
+	}
+	for _, ord := range t.state.schema.PkOrdinals {
+		if ord == dropIdx {
+			return fmt.Errorf("cannot drop primary key column %s", columnName)
+		}
+	}
+	if err := t.state.ensureRows(ctx); err != nil {
+		return err
+	}
+	newSchema := make(sql.Schema, 0, len(t.state.schema.Schema)-1)
+	newSchema = append(newSchema, t.state.schema.Schema[:dropIdx]...)
+	newSchema = append(newSchema, t.state.schema.Schema[dropIdx+1:]...)
+	newPK := make([]int, len(t.state.schema.PkOrdinals))
+	for i, ord := range t.state.schema.PkOrdinals {
+		if ord > dropIdx {
+			newPK[i] = ord - 1
+		} else {
+			newPK[i] = ord
+		}
+	}
+	newRows := make(map[string]sql.Row, len(t.state.rows))
+	for key, row := range t.state.rows {
+		newRow := make(sql.Row, len(row)-1)
+		copy(newRow, row[:dropIdx])
+		copy(newRow[dropIdx:], row[dropIdx+1:])
+		newRows[key] = newRow
+	}
+	t.state.schema = sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
+	t.state.rows = newRows
+	t.state.edits = make(map[string]rowEdit)
+	for key, row := range newRows {
+		t.state.edits[key] = rowEdit{row: cloneRow(row)}
+	}
+	t.state.dirty = true
+	t.state.schemaDirty = true
+	tx.dirty = true
+	return nil
+}
+
+func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Column, order *sql.ColumnOrder) error {
+	tx, err := transactionFrom(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateSchema(sql.PrimaryKeySchema{Schema: sql.Schema{column}}); err != nil {
+		return err
+	}
+	colIdx := -1
+	for i, col := range t.state.schema.Schema {
+		if strings.EqualFold(col.Name, columnName) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return fmt.Errorf("column %s not found", columnName)
+	}
+	for _, ord := range t.state.schema.PkOrdinals {
+		if ord == colIdx && !t.state.schema.Schema[colIdx].Type.Equals(column.Type) {
+			return fmt.Errorf("cannot change type of primary key column %s", columnName)
+		}
+	}
+	if err := t.state.ensureRows(ctx); err != nil {
+		return err
+	}
+	if !column.Nullable && t.state.schema.Schema[colIdx].Nullable {
+		for _, row := range t.state.rows {
+			if row[colIdx] == nil {
+				return fmt.Errorf("cannot change column %s to NOT NULL: existing rows contain NULL values", columnName)
+			}
+		}
+	}
+	typeChanged := !t.state.schema.Schema[colIdx].Type.Equals(column.Type)
+	if typeChanged {
+		for key, row := range t.state.rows {
+			if row[colIdx] != nil {
+				converted, inRange, err := column.Type.Convert(ctx, row[colIdx])
+				if err != nil {
+					return fmt.Errorf("cannot convert column %s value: %w", columnName, err)
+				}
+				if !inRange {
+					return fmt.Errorf("value out of range for column %s new type", columnName)
+				}
+				row[colIdx] = converted
+				t.state.rows[key] = row
+			}
+		}
+	}
+	t.state.schema.Schema[colIdx] = column
+	if order != nil {
+		col := t.state.schema.Schema[colIdx]
+		reduced := make(sql.Schema, 0, len(t.state.schema.Schema)-1)
+		reduced = append(reduced, t.state.schema.Schema[:colIdx]...)
+		reduced = append(reduced, t.state.schema.Schema[colIdx+1:]...)
+		insertAt := len(reduced)
+		if order.First {
+			insertAt = 0
+		} else if order.AfterColumn != "" {
+			for i, c := range reduced {
+				if strings.EqualFold(c.Name, order.AfterColumn) {
+					insertAt = i + 1
+					break
+				}
+			}
+		}
+		final := make(sql.Schema, len(reduced)+1)
+		copy(final, reduced[:insertAt])
+		final[insertAt] = col
+		copy(final[insertAt+1:], reduced[insertAt:])
+		t.state.schema.Schema = final
+		oldPK := t.state.schema.PkOrdinals
+		newPK := make([]int, len(oldPK))
+		for i, ord := range oldPK {
+			r := ord
+			if ord > colIdx {
+				r = ord - 1
+			} else if ord == colIdx {
+				newPK[i] = insertAt
+				continue
+			}
+			if r >= insertAt {
+				r++
+			}
+			newPK[i] = r
+		}
+		t.state.schema.PkOrdinals = newPK
+		for key, row := range t.state.rows {
+			cell := row[colIdx]
+			reducedRow := make(sql.Row, len(row)-1)
+			copy(reducedRow, row[:colIdx])
+			copy(reducedRow[colIdx:], row[colIdx+1:])
+			newRow := make(sql.Row, len(reducedRow)+1)
+			copy(newRow, reducedRow[:insertAt])
+			newRow[insertAt] = cell
+			copy(newRow[insertAt+1:], reducedRow[insertAt:])
+			t.state.rows[key] = newRow
+		}
+	}
+	t.state.edits = make(map[string]rowEdit)
+	for key, row := range t.state.rows {
+		t.state.edits[key] = rowEdit{row: cloneRow(row)}
+	}
+	t.state.dirty = true
+	t.state.schemaDirty = true
+	tx.dirty = true
+	return nil
+}
 
 type singlePartition struct{}
 type pointPartition struct{ keys []string }
@@ -1114,4 +1355,5 @@ var _ sql.Index = (*primaryIndex)(nil)
 var _ sql.InsertableTable = (*table)(nil)
 var _ sql.UpdatableTable = (*table)(nil)
 var _ sql.DeletableTable = (*table)(nil)
+var _ sql.AlterableTable = (*table)(nil)
 var _ sql.TransactionSession = (*session)(nil)
