@@ -213,7 +213,7 @@ func TestEmbeddedCommitOutcomeAndRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			eng, _ := engine.New(repo)
+			eng, _ := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 			defer eng.Close()
 			session, _ := eng.NewSession()
 			if err := session.Exec(ctx, "CREATE TABLE outcomes (id BIGINT PRIMARY KEY)"); err != nil {

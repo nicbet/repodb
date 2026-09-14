@@ -129,7 +129,7 @@ func newSyncBenchmarkFixture(b *testing.B, rows, tables int, workload string) sy
 	if _, err := integration.Enable(ctx, a, "origin"); err != nil {
 		b.Fatal(err)
 	}
-	engA, err := engine.Open(ctx, a)
+	engA, err := engine.OpenWithOptions(ctx, a, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func newSyncBenchmarkFixture(b *testing.B, rows, tables int, workload string) sy
 		_ = engA.Close()
 		return syncBenchmarkFixture{remote: remote, local: local}
 	}
-	engB, err := engine.Open(ctx, local)
+	engB, err := engine.OpenWithOptions(ctx, local, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		b.Fatal(err)
 	}

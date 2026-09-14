@@ -53,7 +53,7 @@ func TestJournalSQLSurvivesRestartWithoutAdvancingGit(t *testing.T) {
 		t.Fatalf("recovered rows = %#v, %v", result.Rows, err)
 	}
 
-	if _, err := engine.Open(ctx, root); !errors.Is(err, repository.ErrWorkingStateDirty) {
+	if _, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit}); !errors.Is(err, repository.ErrWorkingStateDirty) {
 		t.Fatalf("native engine with dirty journal = %v", err)
 	}
 	committed, err := repo.Current(ctx)

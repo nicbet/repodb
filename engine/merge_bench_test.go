@@ -46,7 +46,7 @@ func benchmarkMergeFixture(b *testing.B, rows int) *mergeFixture {
 	if err != nil {
 		b.Fatal(err)
 	}
-	eng, err := engine.New(repo)
+	eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		b.Fatal(err)
 	}

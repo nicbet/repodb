@@ -415,7 +415,7 @@ func BenchmarkGitDurabilityStrategies(b *testing.B) {
 			if err != nil || clonedHead != seedHead {
 				b.Fatalf("cloned head = %q, want %q: %v", clonedHead, seedHead, err)
 			}
-			eng, err := engine.New(repo)
+			eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -559,7 +559,7 @@ func sqlBenchmarkEngineWithRepository(b *testing.B, rows, payloadBytes, tables i
 	if err != nil {
 		b.Fatal(err)
 	}
-	eng, err := engine.New(repo)
+	eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		b.Fatal(err)
 	}

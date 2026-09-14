@@ -106,7 +106,7 @@ func TestEmbeddedWriteIsReadableAfterServerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	embedded, err := engine.New(repo)
+	embedded, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestMySQLCommitOutcomeAndRecovery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			srv, err := server.New(server.Config{Address: "127.0.0.1:0", Repository: repo})
+			srv, err := server.New(server.Config{Address: "127.0.0.1:0", Repository: repo, Persistence: engine.PersistenceNativeGit})
 			if err != nil {
 				t.Fatal(err)
 			}

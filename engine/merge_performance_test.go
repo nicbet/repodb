@@ -17,7 +17,7 @@ func TestMergeRetainsSelectedRootsAndReusesLoadedSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eng, err := engine.New(repo)
+	eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestMergeRetainsSelectedRootsAndReusesLoadedSnapshots(t *testing.T) {
 	}
 	_ = session.Close()
 	_ = eng.Close()
-	reopened, err := engine.Open(ctx, root)
+	reopened, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestPointLookupAndDirtyTableWorkAreBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eng, err := engine.New(repo)
+	eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}

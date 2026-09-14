@@ -84,7 +84,7 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 	}
 	mode := options.Persistence
 	if mode == "" {
-		mode = PersistenceNativeGit
+		mode = PersistenceJournal
 	}
 	var working *repository.WorkingState
 	var snapshot *repository.Snapshot

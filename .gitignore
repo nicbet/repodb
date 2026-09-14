@@ -1,4 +1,6 @@
 /bin/
 *.test
 .DS_Store
+repodb-scorecard-*
+dbbench.json
 

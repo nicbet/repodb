@@ -60,7 +60,7 @@ func TestEnableSyncFastForwardMergeConflictAndResolution(t *testing.T) {
 		t.Fatalf("enable installed a hook: %v", err)
 	}
 
-	engA, err := engine.Open(ctx, a)
+	engA, err := engine.OpenWithOptions(ctx, a, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestEnableSyncFastForwardMergeConflictAndResolution(t *testing.T) {
 	if enableB.Action != "adopted-remote" {
 		t.Fatalf("clone enable action = %s", enableB.Action)
 	}
-	engB, err := engine.Open(ctx, b)
+	engB, err := engine.OpenWithOptions(ctx, b, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestEnableSyncFastForwardMergeConflictAndResolution(t *testing.T) {
 	if status, err := integration.Sync(ctx, a, "origin"); err != nil || status.Action != "fast-forwarded-local" {
 		t.Fatalf("pull resolution = %#v, %v", status, err)
 	}
-	afterMergeEngineA, err := engine.Open(ctx, a)
+	afterMergeEngineA, err := engine.OpenWithOptions(ctx, a, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestSyncDoesNotHoldPublicationLockDuringPush(t *testing.T) {
 	if _, err := integration.Enable(ctx, clone, "origin"); err != nil {
 		t.Fatal(err)
 	}
-	eng, err := engine.Open(ctx, clone)
+	eng, err := engine.OpenWithOptions(ctx, clone, engine.Options{Persistence: engine.PersistenceNativeGit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,9 +365,9 @@ func TestSyncReportsIncompatibleSchemaChanges(t *testing.T) {
 	if _, err := integration.Enable(ctx, b, "origin"); err != nil {
 		t.Fatal(err)
 	}
-	engA, _ := engine.Open(ctx, a)
+	engA, _ := engine.OpenWithOptions(ctx, a, engine.Options{Persistence: engine.PersistenceNativeGit})
 	defer engA.Close()
-	engB, _ := engine.Open(ctx, b)
+	engB, _ := engine.OpenWithOptions(ctx, b, engine.Options{Persistence: engine.PersistenceNativeGit})
 	defer engB.Close()
 	sa, _ := engA.NewSession()
 	sb, _ := engB.NewSession()
