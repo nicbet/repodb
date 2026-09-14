@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
@@ -260,9 +261,9 @@ func TestAlterTableAddUnsupportedTypeRejected(t *testing.T) {
 	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Exec(ctx, "ALTER TABLE t ADD COLUMN d DATE")
+	err := s.Exec(ctx, "ALTER TABLE t ADD COLUMN y YEAR")
 	if err == nil {
-		t.Fatal("expected error adding unsupported DATE column")
+		t.Fatal("expected error adding unsupported YEAR column")
 	}
 }
 
@@ -274,9 +275,9 @@ func TestAlterTableModifyToUnsupportedTypeRejected(t *testing.T) {
 	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val TEXT)"); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN val DATE")
+	err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN val YEAR")
 	if err == nil {
-		t.Fatal("expected error modifying to unsupported DATE type")
+		t.Fatal("expected error modifying to unsupported YEAR type")
 	}
 }
 
@@ -1440,6 +1441,386 @@ func TestNotNullOnNonPKColumn(t *testing.T) {
 	err := s.Exec(ctx, "INSERT INTO t VALUES (2, NULL)")
 	if err == nil {
 		t.Fatal("expected NOT NULL violation")
+	}
+}
+
+func TestTemporalTypeDDL(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE events (id BIGINT PRIMARY KEY, d DATE, t TIME, dt DATETIME, ts TIMESTAMP)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SHOW CREATE TABLE events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := result.Rows[0][1].(string)
+	for _, keyword := range []string{"date", "time", "datetime", "timestamp"} {
+		if !strings.Contains(strings.ToLower(ddl), keyword) {
+			t.Errorf("SHOW CREATE TABLE missing %s, got: %s", keyword, ddl)
+		}
+	}
+}
+
+func TestTemporalTypeDDLWithPrecision(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE events (id BIGINT PRIMARY KEY, dt DATETIME(3), ts TIMESTAMP(6))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO events VALUES (1, '2024-06-15 10:30:00.123', '2024-06-15 10:30:00.123456')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT dt, ts FROM events WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dt := result.Rows[0][0].(time.Time)
+	ts := result.Rows[0][1].(time.Time)
+	if dt.Nanosecond()/1000000 != 123 {
+		t.Errorf("DATETIME(3) milliseconds = %d, want 123", dt.Nanosecond()/1000000)
+	}
+	if ts.Nanosecond()/1000 != 123456 {
+		t.Errorf("TIMESTAMP(6) microseconds = %d, want 123456", ts.Nanosecond()/1000)
+	}
+}
+
+func TestDateInsertSelectRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '2024-06-15')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, '1999-12-31')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, d FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	d1 := result.Rows[0][1].(time.Time)
+	d2 := result.Rows[1][1].(time.Time)
+	if d1.Format("2006-01-02") != "2024-06-15" {
+		t.Errorf("row 1 date = %v, want 2024-06-15", d1)
+	}
+	if d2.Format("2006-01-02") != "1999-12-31" {
+		t.Errorf("row 2 date = %v, want 1999-12-31", d2)
+	}
+}
+
+func TestDatetimeInsertSelectRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, dt DATETIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '2024-06-15 14:30:45')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT dt FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dt := result.Rows[0][0].(time.Time)
+	if dt.Year() != 2024 || dt.Month() != 6 || dt.Day() != 15 || dt.Hour() != 14 || dt.Minute() != 30 || dt.Second() != 45 {
+		t.Errorf("datetime = %v, want 2024-06-15 14:30:45", dt)
+	}
+}
+
+func TestTimestampInsertSelectRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, ts TIMESTAMP)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '2024-06-15 14:30:45')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT ts FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := result.Rows[0][0].(time.Time)
+	if ts.Year() != 2024 || ts.Month() != 6 || ts.Day() != 15 {
+		t.Errorf("timestamp = %v, want 2024-06-15 14:30:45", ts)
+	}
+}
+
+func TestTimeInsertSelectRoundTrip(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, t TIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '14:30:45')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, '-01:15:00')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, t FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+}
+
+func TestTemporalOrderBy(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, dt DATETIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '2024-06-15 10:00:00')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, '2020-01-01 00:00:00')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, '2024-06-15 23:59:59')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id FROM t ORDER BY dt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, len(result.Rows))
+	for i, row := range result.Rows {
+		ids[i] = row[0].(int64)
+	}
+	if ids[0] != 2 || ids[1] != 1 || ids[2] != 3 {
+		t.Errorf("ORDER BY dt = %v, want [2 1 3]", ids)
+	}
+}
+
+func TestTemporalParameterBinding(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, dt DATETIME)"); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Date(2024, 6, 15, 14, 30, 45, 0, time.UTC)
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (?, ?)", int64(1), ts); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT dt FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Rows[0][0].(time.Time)
+	if !got.Equal(ts) {
+		t.Errorf("parameter binding: got %v, want %v", got, ts)
+	}
+}
+
+func TestTemporalParameterBindingNonUTC(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, dt DATETIME)"); err != nil {
+		t.Fatal(err)
+	}
+	eastern := time.FixedZone("EST", -5*3600)
+	ts := time.Date(2024, 6, 15, 14, 30, 45, 0, eastern)
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (?, ?)", int64(1), ts); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT dt FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Rows[0][0].(time.Time)
+	if !got.Equal(ts) {
+		t.Errorf("non-UTC parameter binding: got %v (unix %d), want %v (unix %d)", got, got.Unix(), ts, ts.Unix())
+	}
+}
+
+func TestTemporalNullable(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE, dt DATETIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, '2024-06-15', '2024-06-15 10:00:00')"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, d, dt FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0][1] != nil {
+		t.Errorf("row 1 d = %v, want nil", result.Rows[0][1])
+	}
+	if result.Rows[0][2] != nil {
+		t.Errorf("row 1 dt = %v, want nil", result.Rows[0][2])
+	}
+	if result.Rows[1][1] == nil {
+		t.Error("row 2 d = nil, want non-nil")
+	}
+}
+
+func TestTemporalPrimaryKey(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (ts DATETIME PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('2024-06-15 10:00:00', 'first')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('2024-06-15 11:00:00', 'second')"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "INSERT INTO t VALUES ('2024-06-15 10:00:00', 'duplicate')")
+	if err == nil {
+		t.Fatal("expected duplicate key error")
+	}
+	result, err := s.Query(ctx, "SELECT name FROM t WHERE ts = '2024-06-15 10:00:00'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "first" {
+		t.Fatalf("point lookup = %#v", result.Rows)
+	}
+}
+
+func TestTemporalPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP, t TIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '2024-06-15', '2024-06-15 14:30:45', '2024-06-15 14:30:45', '14:30:45')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT d, dt, ts, t FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := result.Rows[0][0].(time.Time)
+	if d.Format("2006-01-02") != "2024-06-15" {
+		t.Errorf("date after reopen = %v, want 2024-06-15", d)
+	}
+	dt := result.Rows[0][1].(time.Time)
+	if dt.Hour() != 14 || dt.Minute() != 30 || dt.Second() != 45 {
+		t.Errorf("datetime after reopen = %v", dt)
+	}
+}
+
+func TestTemporalPersistsNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	nativeGit := engine.Options{Persistence: engine.PersistenceNativeGit}
+	eng, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE, dt DATETIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '2024-06-15', '2024-06-15 14:30:45')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT d, dt FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := result.Rows[0][0].(time.Time)
+	if d.Format("2006-01-02") != "2024-06-15" {
+		t.Errorf("date after native-git reopen = %v", d)
+	}
+	dt := result.Rows[0][1].(time.Time)
+	if dt.Hour() != 14 || dt.Minute() != 30 || dt.Second() != 45 {
+		t.Errorf("datetime after native-git reopen = %v", dt)
+	}
+}
+
+func TestTemporalDefault(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, d DATE DEFAULT '2024-01-01')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT d FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := result.Rows[0][0].(time.Time)
+	if d.Format("2006-01-02") != "2024-01-01" {
+		t.Errorf("default date = %v, want 2024-01-01", d)
 	}
 }
 

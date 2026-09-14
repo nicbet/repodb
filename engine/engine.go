@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
@@ -532,6 +533,8 @@ func sqlLiteral(value any) (string, error) {
 		return "'" + s + "'", nil
 	case []byte:
 		return "X'" + fmt.Sprintf("%x", value) + "'", nil
+	case time.Time:
+		return "'" + value.UTC().Format("2006-01-02 15:04:05.999999") + "'", nil
 	default:
 		return "", fmt.Errorf("unsupported SQL parameter type %T", value)
 	}

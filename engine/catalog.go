@@ -1160,6 +1160,7 @@ type columnDisk struct {
 	Name         string `json:"name"`
 	Type         int32  `json:"type"`
 	Length       int64  `json:"length,omitempty"`
+	Precision    int    `json:"precision,omitempty"`
 	Nullable     bool   `json:"nullable"`
 	Default      string `json:"default,omitempty"`
 	DefaultLit   bool   `json:"default_literal,omitempty"`
@@ -1172,6 +1173,9 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]
 		cd := columnDisk{Name: col.Name, Type: int32(col.Type.Type()), Nullable: col.Nullable}
 		if st, ok := col.Type.(sql.StringType); ok {
 			cd.Length = st.Length()
+		}
+		if dt, ok := col.Type.(sql.DatetimeType); ok {
+			cd.Precision = dt.Precision()
 		}
 		if col.Default != nil {
 			cd.Default = col.Default.String()
@@ -1193,7 +1197,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	}
 	cols := make(sql.Schema, len(d.Columns))
 	for i, cd := range d.Columns {
-		typ, err := decodeType(querypb.Type(cd.Type), cd.Length)
+		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision)
 		if err != nil {
 			return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
@@ -1213,7 +1217,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, checks, nil
 }
 
-func decodeType(t querypb.Type, length int64) (sql.Type, error) {
+func decodeType(t querypb.Type, length int64, precision int) (sql.Type, error) {
 	switch t {
 	case querypb.Type_INT8:
 		return types.Int8, nil
@@ -1249,6 +1253,10 @@ func decodeType(t querypb.Type, length int64) (sql.Type, error) {
 			length = 65535
 		}
 		return types.CreateBinary(t, length)
+	case querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
+		return types.CreateDatetimeType(t, precision)
+	case querypb.Type_TIME:
+		return types.Time, nil
 	default:
 		return nil, fmt.Errorf("unsupported M2 SQL type %s", t.String())
 	}
@@ -1259,12 +1267,15 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 		if col.AutoIncrement || col.Generated != nil {
 			return fmt.Errorf("column %s uses unsupported M2 schema behavior", col.Name)
 		}
-		if _, err := decodeType(col.Type.Type(), func() int64 {
-			if st, ok := col.Type.(sql.StringType); ok {
-				return st.Length()
-			}
-			return 0
-		}()); err != nil {
+		var length int64
+		if st, ok := col.Type.(sql.StringType); ok {
+			length = st.Length()
+		}
+		var precision int
+		if dt, ok := col.Type.(sql.DatetimeType); ok {
+			precision = dt.Precision()
+		}
+		if _, err := decodeType(col.Type.Type(), length, precision); err != nil {
 			return err
 		}
 	}
@@ -1341,6 +1352,21 @@ func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
 			}
 		case querypb.Type_BLOB, querypb.Type_VARBINARY, querypb.Type_BINARY:
 			row[i] = append([]byte(nil), raw...)
+		case querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
+			t, err := time.Parse(time.RFC3339Nano, string(raw))
+			if err != nil {
+				return nil, err
+			}
+			row[i], _, err = schema[i].Type.Convert(context.Background(), t)
+			if err != nil {
+				return nil, err
+			}
+		case querypb.Type_TIME:
+			v, err := strconv.ParseInt(string(raw), 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			row[i] = types.Timespan(v)
 		default:
 			row[i] = string(raw)
 		}
@@ -1381,6 +1407,18 @@ func rawValue(typ querypb.Type, value any) ([]byte, error) {
 		querypb.Type_UINT8, querypb.Type_UINT16, querypb.Type_UINT24, querypb.Type_UINT32, querypb.Type_UINT64,
 		querypb.Type_FLOAT32, querypb.Type_FLOAT64:
 		return []byte(fmt.Sprint(value)), nil
+	case querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
+		t, ok := value.(time.Time)
+		if !ok {
+			return nil, fmt.Errorf("datetime value has type %T", value)
+		}
+		return []byte(t.UTC().Format(time.RFC3339Nano)), nil
+	case querypb.Type_TIME:
+		ts, ok := value.(types.Timespan)
+		if !ok {
+			return nil, fmt.Errorf("time value has type %T", value)
+		}
+		return []byte(strconv.FormatInt(int64(ts), 10)), nil
 	default:
 		value, ok := value.(string)
 		if !ok {
