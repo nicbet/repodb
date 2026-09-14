@@ -1,5 +1,7 @@
 # RepoDB
 
+![RepoDB Banner](docs/banner.png)
+
 RepoDB is an embedded SQL database for Go that stores and synchronizes
 application data in Git, with an optional MySQL-compatible server.
 
