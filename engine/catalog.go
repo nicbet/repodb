@@ -1171,6 +1171,7 @@ type columnDisk struct {
 	Length       int64    `json:"length,omitempty"`
 	Precision    int      `json:"precision,omitempty"`
 	Scale        int      `json:"scale,omitempty"`
+	Collation    string   `json:"collation,omitempty"`
 	EnumValues   []string `json:"enum_values,omitempty"`
 	Nullable     bool     `json:"nullable"`
 	Default      string   `json:"default,omitempty"`
@@ -1184,6 +1185,9 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]
 		cd := columnDisk{Name: col.Name, Type: int32(col.Type.Type()), Nullable: col.Nullable}
 		if st, ok := col.Type.(sql.StringType); ok {
 			cd.Length = st.Length()
+			if c := st.Collation(); c != sql.Collation_Default {
+				cd.Collation = c.Name()
+			}
 		}
 		if dt, ok := col.Type.(sql.DatetimeType); ok {
 			cd.Precision = dt.Precision()
@@ -1194,6 +1198,9 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]
 		}
 		if et, ok := col.Type.(sql.EnumType); ok {
 			cd.EnumValues = et.Values()
+			if c := et.Collation(); c != sql.Collation_Default {
+				cd.Collation = c.Name()
+			}
 		}
 		if col.Default != nil {
 			cd.Default = col.Default.String()
@@ -1215,7 +1222,15 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	}
 	cols := make(sql.Schema, len(d.Columns))
 	for i, cd := range d.Columns {
-		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision, cd.Scale, cd.EnumValues)
+		coll := sql.Collation_Default
+		if cd.Collation != "" {
+			var err error
+			coll, err = sql.ParseCollation("", cd.Collation, false)
+			if err != nil {
+				return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
+			}
+		}
+		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision, cd.Scale, cd.EnumValues, coll)
 		if err != nil {
 			return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
@@ -1238,7 +1253,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 // decodeType maps a querypb.Type to a go-mysql-server sql.Type.
 // Future cleanup: these per-type switches (decodeType, rawValue, decodeRow)
 // could be collapsed into a type registry keyed by querypb.Type.
-func decodeType(t querypb.Type, length int64, precision int, scale int, enumValues []string) (sql.Type, error) {
+func decodeType(t querypb.Type, length int64, precision int, scale int, enumValues []string, collation sql.CollationID) (sql.Type, error) {
 	switch t {
 	case querypb.Type_INT8:
 		return types.Int8, nil
@@ -1268,7 +1283,7 @@ func decodeType(t querypb.Type, length int64, precision int, scale int, enumValu
 		if length <= 0 {
 			length = 65535
 		}
-		return types.CreateString(t, length, sql.Collation_Default)
+		return types.CreateString(t, length, collation)
 	case querypb.Type_BLOB, querypb.Type_VARBINARY, querypb.Type_BINARY:
 		if length <= 0 {
 			length = 65535
@@ -1287,7 +1302,7 @@ func decodeType(t querypb.Type, length int64, precision int, scale int, enumValu
 		}
 		return types.CreateColumnDecimalType(p, s)
 	case querypb.Type_ENUM:
-		return types.CreateEnumType(enumValues, sql.Collation_Default)
+		return types.CreateEnumType(enumValues, collation)
 	default:
 		return nil, fmt.Errorf("unsupported M2 SQL type %s", t.String())
 	}
@@ -1299,8 +1314,10 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 			return fmt.Errorf("column %s uses unsupported M2 schema behavior", col.Name)
 		}
 		var length int64
+		collation := sql.Collation_Default
 		if st, ok := col.Type.(sql.StringType); ok {
 			length = st.Length()
+			collation = st.Collation()
 		}
 		var precision int
 		if dt, ok := col.Type.(sql.DatetimeType); ok {
@@ -1314,11 +1331,9 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 		var enumValues []string
 		if et, ok := col.Type.(sql.EnumType); ok {
 			enumValues = et.Values()
-			if et.Collation() != sql.Collation_Default {
-				return fmt.Errorf("column %s: non-default collation on ENUM is not supported", col.Name)
-			}
+			collation = et.Collation()
 		}
-		if _, err := decodeType(col.Type.Type(), length, precision, scale, enumValues); err != nil {
+		if _, err := decodeType(col.Type.Type(), length, precision, scale, enumValues, collation); err != nil {
 			return err
 		}
 	}
@@ -1449,6 +1464,15 @@ func encodeKey(schema sql.PrimaryKeySchema, row sql.Row) ([]byte, error) {
 		raw, err := rawValue(schema.Schema[ordinal].Type.Type(), row[ordinal])
 		if err != nil {
 			return nil, err
+		}
+		if st, ok := schema.Schema[ordinal].Type.(sql.StringType); ok {
+			if c := st.Collation(); c != sql.Collation_Default {
+				var buf bytes.Buffer
+				if err := c.WriteWeightString(&buf, string(raw)); err != nil {
+					return nil, fmt.Errorf("collation weight string: %w", err)
+				}
+				raw = buf.Bytes()
+			}
 		}
 		var size [4]byte
 		binary.BigEndian.PutUint32(size[:], uint32(len(raw)))

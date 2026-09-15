@@ -2467,6 +2467,331 @@ func TestEnumPersistsThroughReopen(t *testing.T) {
 	}
 }
 
+func TestCollationCaseInsensitiveWhere(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice'), (2, 'BOB'), (3, 'charlie')"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.Query(ctx, "SELECT id, name FROM t WHERE name = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(result.Rows))
+	}
+	if got := fmt.Sprint(result.Rows[0][1]); got != "Alice" {
+		t.Errorf("name = %v, want Alice", got)
+	}
+
+	result, err = s.Query(ctx, "SELECT id FROM t WHERE name = 'bob'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows for 'bob', want 1", len(result.Rows))
+	}
+}
+
+func TestCollationCaseInsensitiveOrderBy(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'charlie'), (2, 'Alice'), (3, 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.Query(ctx, "SELECT name FROM t ORDER BY name ASC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(result.Rows))
+	}
+	got := []string{
+		fmt.Sprint(result.Rows[0][0]),
+		fmt.Sprint(result.Rows[1][0]),
+		fmt.Sprint(result.Rows[2][0]),
+	}
+	want := []string{"Alice", "bob", "charlie"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d = %q, want %q (full order: %v)", i, got[i], want[i], got)
+			break
+		}
+	}
+}
+
+func TestCollationPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice'), (2, 'BOB')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT id FROM t WHERE name = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("case-insensitive WHERE failed after reopen: got %d rows, want 1", len(result.Rows))
+	}
+
+	ddl, err := s2.Query(ctx, "SHOW CREATE TABLE t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := fmt.Sprint(ddl.Rows[0][1])
+	if !strings.Contains(create, "utf8mb4_general_ci") {
+		t.Errorf("collation not preserved in DDL after reopen: %s", create)
+	}
+}
+
+func TestCollationDefaultBackwardsCompat(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT id FROM t WHERE name = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("default collation should be case-sensitive: got %d rows, want 0", len(result.Rows))
+	}
+
+	result, err = s2.Query(ctx, "SELECT id FROM t WHERE name = 'Alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("exact match failed: got %d rows, want 1", len(result.Rows))
+	}
+}
+
+func TestCollationStringPKUniqueness(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (name VARCHAR(100) COLLATE utf8mb4_general_ci PRIMARY KEY, val INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('Alice', 1)"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES ('alice', 2)")
+	if err == nil {
+		t.Fatal("expected duplicate key error for case-variant PK, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate") && !strings.Contains(err.Error(), "Duplicate") {
+		t.Fatalf("expected duplicate key error, got: %v", err)
+	}
+}
+
+func TestCollationStringPKLookup(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (name VARCHAR(100) COLLATE utf8mb4_general_ci PRIMARY KEY, val INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('Alice', 1), ('Bob', 2), ('Charlie', 3)"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := s.Query(ctx, "SELECT val FROM t WHERE name = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("PK lookup with case-variant: got %d rows, want 1", len(result.Rows))
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "1" {
+		t.Errorf("val = %v, want 1", got)
+	}
+}
+
+func TestCollationStringPKPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (name VARCHAR(100) COLLATE utf8mb4_general_ci PRIMARY KEY, val INT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('Alice', 1), ('Bob', 2)"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT val FROM t WHERE name = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("PK lookup after reopen: got %d rows, want 1", len(result.Rows))
+	}
+
+	err = s2.Exec(ctx, "INSERT INTO t VALUES ('bob', 3)")
+	if err == nil {
+		t.Fatal("expected duplicate key error after reopen, got nil")
+	}
+}
+
+func TestEnumWithCollation(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, color ENUM('red','green','blue') COLLATE utf8mb4_general_ci)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'RED'), (2, 'Green')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	result, err := s2.Query(ctx, "SELECT id, color FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows after reopen, want 2", len(result.Rows))
+	}
+	if got := fmt.Sprint(result.Rows[0][1]); got != "red" {
+		t.Errorf("color = %v, want red", got)
+	}
+	if got := fmt.Sprint(result.Rows[1][1]); got != "green" {
+		t.Errorf("color = %v, want green", got)
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()
