@@ -3512,6 +3512,394 @@ func TestUniqueJournalCheckpointWithDDL(t *testing.T) {
 	}
 }
 
+func TestSecondaryIndexDDL(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, category VARCHAR(50))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "CREATE INDEX idx_category ON t (category)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'books'), (2, 'books'), (3, 'toys')"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE category = 'books' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexDuplicatesAllowed(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, status VARCHAR(20), INDEX idx_status (status))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'active'), (2, 'active'), (3, 'active'), (4, 'inactive')"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE status = 'active' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexMaintainedOnDelete(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "DELETE FROM t WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].(int64) != 2 {
+		t.Fatalf("expected [(2)], got %v", res.Rows)
+	}
+}
+
+func TestSecondaryIndexMaintainedOnUpdate(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "UPDATE t SET tag = 'y' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'x' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].(int64) != 2 {
+		t.Fatalf("expected [(2)], got %v", res.Rows)
+	}
+	res, err = s.Query(ctx, "SELECT id FROM t WHERE tag = 'y' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows for tag=y, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexNullValues(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 'a')"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].(int64) != 3 {
+		t.Fatalf("expected [(3)], got %v", res.Rows)
+	}
+}
+
+func TestSecondaryIndexComposite(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(20), b VARCHAR(20), INDEX idx_ab (a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'x', 'y'), (2, 'x', 'y'), (3, 'x', 'z'), (4, 'a', 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE a = 'x' AND b = 'y' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexPersistence(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng, err = engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ = eng.NewSession()
+	defer s.Close()
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows after reopen, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexDropIndex(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "DROP INDEX idx_tag ON t"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row after drop index, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexAlterTableAdd(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "CREATE INDEX idx_tag ON t (tag)"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexNativeGitPersistence(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng, err = engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ = eng.NewSession()
+	defer s.Close()
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'a' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows after reopen, got %d", len(res.Rows))
+	}
+}
+
+func TestSecondaryIndexCoexistsWithUnique(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255) UNIQUE, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a@b.com', 'x'), (2, 'c@d.com', 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (3, 'a@b.com', 'y')")
+	if err == nil {
+		t.Fatal("expected unique constraint violation on email")
+	}
+	res, err := s.Query(ctx, "SELECT id FROM t WHERE tag = 'x' ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()

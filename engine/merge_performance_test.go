@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	repodbgit "github.com/nicbet/repodb/common/git"
+	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
 )
@@ -180,6 +181,116 @@ func TestPointLookupAndDirtyTableWorkAreBounded(t *testing.T) {
 	}
 	if unchanged.Commit != head || engine.ReadPerformanceCounters().TablesRebuilt != 0 {
 		t.Fatal("unchanged update published or rebuilt a table")
+	}
+}
+
+func TestMergeRebuildsNonUniqueIndexes(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	repo, err := repository.Init(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, tag VARCHAR(20), INDEX idx_tag (tag))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+	base, err := repo.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 'a')"); err != nil {
+		t.Fatal(err)
+	}
+	local, err := repo.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updateDataRef(t, root, base.Commit, local.Commit)
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (4, 'a')"); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := repo.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updateDataRef(t, root, local.Commit, remote.Commit)
+
+	remoteTree, err := prolly.Open(remote.Store(), remote.Manifest.Tables["t"].DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteEntries, err := remoteTree.Entries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remoteEntries) != 3 {
+		t.Fatalf("remote snapshot should have 3 rows (1,2,4), got %d", len(remoteEntries))
+	}
+
+	s.Close()
+	eng.Close()
+
+	for _, snap := range []*repository.Snapshot{base, local, remote} {
+		if err := engine.ValidateSnapshot(ctx, snap); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writer, err := repo.BeginMergeSnapshots(local, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, hashes, conflicts, err := engine.MergeSnapshots(ctx, writer, base, local, remote, nil)
+	if err != nil || len(conflicts) != 0 {
+		t.Fatalf("merge: err=%v conflicts=%v", err, conflicts)
+	}
+	if err := writer.RetainOnly(hashes); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := writer.Commit(ctx, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mergedTable := merged.Manifest.Tables["t"]
+	idxRoot, ok := mergedTable.Indexes["idx_tag"]
+	if !ok || !idxRoot.Valid() {
+		t.Fatal("merged table missing idx_tag index root")
+	}
+
+	mergedTree, err := prolly.Open(merged.Store(), mergedTable.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergedEntries, err := mergedTree.Entries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mergedEntries) != 4 {
+		t.Fatalf("merged snapshot should have 4 rows, got %d", len(mergedEntries))
+	}
+
+	idxTree, err := prolly.Open(merged.Store(), idxRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxEntries, err := idxTree.Entries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idxEntries) != 4 {
+		t.Fatalf("index tree should have 4 entries, got %d", len(idxEntries))
 	}
 }
 

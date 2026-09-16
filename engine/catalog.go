@@ -50,9 +50,9 @@ type database struct {
 
 	// decodedEdits caches the decoded pending edits for the current snapshot
 	// so StartTransaction doesn't re-decode them on every autocommit query.
-	decodedEditsGen     uint64
-	decodedEditsCommit  string
-	decodedEdits        map[string]map[string]rowEdit
+	decodedEditsGen    uint64
+	decodedEditsCommit string
+	decodedEdits       map[string]map[string]rowEdit
 
 	// lastStateSeq tracks the repo's StateSeq at the time the snapshot was
 	// last resolved. resolveSnapshot skips Current() when it hasn't changed.
@@ -548,7 +548,7 @@ func buildIndexTreeForDef(ctx context.Context, writer storage.Store, state *tabl
 	entries := make([]prolly.Entry, 0, len(state.rows))
 	for pkStr, row := range state.rows {
 		pk := []byte(pkStr)
-		idxKey, _, err := encodeIndexKey(state.schema, row, idx.Columns, pk)
+		idxKey, _, err := encodeIndexKey(state.schema, row, idx.Columns, pk, idx.Unique)
 		if err != nil {
 			return "", err
 		}
@@ -718,15 +718,12 @@ func (t *table) Partitions(*sql.Context) (sql.PartitionIter, error) {
 func (t *table) GetIndexes(*sql.Context) ([]sql.Index, error) {
 	indexes := []sql.Index{&primaryIndex{table: t}}
 	for i := range t.state.indexes {
-		indexes = append(indexes, &uniqueIndex{table: t, def: &t.state.indexes[i]})
+		indexes = append(indexes, &secondaryIndex{table: t, def: &t.state.indexes[i]})
 	}
 	return indexes, nil
 }
 
 func (t *table) CreateIndex(ctx *sql.Context, def sql.IndexDef) error {
-	if !def.IsUnique() {
-		return fmt.Errorf("RepoDB currently supports only UNIQUE indexes")
-	}
 	for _, existing := range t.state.indexes {
 		if existing.Name == def.Name {
 			return fmt.Errorf("index %s already exists", def.Name)
@@ -746,23 +743,25 @@ func (t *table) CreateIndex(ctx *sql.Context, def sql.IndexDef) error {
 			return fmt.Errorf("column %s not found", col.Name)
 		}
 	}
-	idx := indexDisk{Name: def.Name, Columns: ordinals, Unique: true}
-	if err := t.state.ensureRows(ctx); err != nil {
-		return err
-	}
-	seen := make(map[string]struct{})
-	for pkStr, row := range t.state.rows {
-		pk := []byte(pkStr)
-		idxKey, hasNull, err := encodeIndexKey(t.state.schema, row, ordinals, pk)
-		if err != nil {
+	idx := indexDisk{Name: def.Name, Columns: ordinals, Unique: def.IsUnique()}
+	if def.IsUnique() {
+		if err := t.state.ensureRows(ctx); err != nil {
 			return err
 		}
-		if !hasNull {
-			keyStr := string(idxKey)
-			if _, dup := seen[keyStr]; dup {
-				return sql.NewUniqueKeyErr(def.Name, false, row)
+		seen := make(map[string]struct{})
+		for pkStr, row := range t.state.rows {
+			pk := []byte(pkStr)
+			idxKey, hasNull, err := encodeIndexKey(t.state.schema, row, ordinals, pk, true)
+			if err != nil {
+				return err
 			}
-			seen[keyStr] = struct{}{}
+			if !hasNull {
+				keyStr := string(idxKey)
+				if _, dup := seen[keyStr]; dup {
+					return sql.NewUniqueKeyErr(def.Name, false, row)
+				}
+				seen[keyStr] = struct{}{}
+			}
 		}
 	}
 	t.state.indexes = append(t.state.indexes, idx)
@@ -828,8 +827,11 @@ func (t *table) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.
 	if _, isPrimary := lookup.Index.(*primaryIndex); isPrimary {
 		return t.lookupPrimaryPartitions(ctx, ranges)
 	}
-	if ui, isUnique := lookup.Index.(*uniqueIndex); isUnique {
-		return t.lookupUniquePartitions(ctx, ranges, ui.def)
+	if si, isSecondary := lookup.Index.(*secondaryIndex); isSecondary {
+		if si.def.Unique {
+			return t.lookupUniquePartitions(ctx, ranges, si.def)
+		}
+		return t.lookupSecondaryPartitions(ctx, ranges, si.def)
 	}
 	return nil, fmt.Errorf("unsupported index type %T", lookup.Index)
 }
@@ -884,7 +886,7 @@ func (t *table) lookupUniquePartitions(ctx *sql.Context, ranges sql.MySQLRangeCo
 			}
 			row[ordinal] = value
 		}
-		idxKey, _, err := encodeIndexKey(t.state.schema, row, def.Columns, nil)
+		idxKey, _, err := encodeIndexKey(t.state.schema, row, def.Columns, nil, true)
 		if err != nil {
 			return nil, err
 		}
@@ -898,6 +900,44 @@ func (t *table) lookupUniquePartitions(ctx *sql.Context, ranges sql.MySQLRangeCo
 	}
 	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
 }
+
+func (t *table) lookupSecondaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection, def *indexDisk) (sql.PartitionIter, error) {
+	if err := t.state.ensureIndexEdits(ctx); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0)
+	for _, indexRange := range ranges {
+		if len(indexRange) != len(def.Columns) {
+			return nil, errors.New("incomplete RepoDB secondary-index lookup")
+		}
+		row := make(sql.Row, len(t.state.schema.Schema))
+		for i, ordinal := range def.Columns {
+			lower, lok := indexRange[i].LowerBound.(sql.Below)
+			upper, uok := indexRange[i].UpperBound.(sql.Above)
+			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
+				return nil, errors.New("RepoDB secondary index received a non-point range")
+			}
+			value, _, err := t.state.schema.Schema[ordinal].Type.Convert(ctx, lower.Key)
+			if err != nil {
+				return nil, err
+			}
+			row[ordinal] = value
+		}
+		prefix, _, err := encodeIndexKey(t.state.schema, row, def.Columns, nil, true)
+		if err != nil {
+			return nil, err
+		}
+		pks, err := t.state.resolveIndexToPKs(ctx, def.Name, prefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, pk := range pks {
+			keys = append(keys, string(pk))
+		}
+	}
+	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
+}
+
 func (t *table) PartitionRows(ctx *sql.Context, partition sql.Partition) (sql.RowIter, error) {
 	return t.partitionRows(ctx, partition)
 }
@@ -1156,7 +1196,7 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 					if v, ok := convertedRows[pkStr]; ok {
 						candidateRow[colIdx] = v
 					}
-					idxKey, hasNull, err := encodeIndexKey(candidateSchema, candidateRow, idx.Columns, pk)
+					idxKey, hasNull, err := encodeIndexKey(candidateSchema, candidateRow, idx.Columns, pk, idx.Unique)
 					if err != nil {
 						return err
 					}
@@ -1383,38 +1423,38 @@ func (*primaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
 	return true
 }
 
-type uniqueIndex struct {
+type secondaryIndex struct {
 	table *table
 	def   *indexDisk
 }
 
-func (u *uniqueIndex) ID() string       { return u.def.Name }
-func (u *uniqueIndex) Database() string  { return u.table.db.name }
-func (u *uniqueIndex) Table() string     { return u.table.name }
-func (*uniqueIndex) IsUnique() bool      { return true }
-func (*uniqueIndex) IsSpatial() bool     { return false }
-func (*uniqueIndex) IsFullText() bool    { return false }
-func (*uniqueIndex) IsVector() bool      { return false }
-func (*uniqueIndex) Comment() string     { return "" }
-func (*uniqueIndex) IndexType() string   { return "BTREE" }
-func (*uniqueIndex) IsGenerated() bool   { return false }
-func (*uniqueIndex) PrefixLengths() []uint16               { return nil }
-func (*uniqueIndex) CanSupportOrderBy(sql.Expression) bool { return false }
-func (u *uniqueIndex) Expressions() []string {
-	exprs := make([]string, len(u.def.Columns))
-	for i, ordinal := range u.def.Columns {
-		exprs[i] = u.table.name + "." + u.table.state.schema.Schema[ordinal].Name
+func (s *secondaryIndex) ID() string                          { return s.def.Name }
+func (s *secondaryIndex) Database() string                    { return s.table.db.name }
+func (s *secondaryIndex) Table() string                       { return s.table.name }
+func (s *secondaryIndex) IsUnique() bool                      { return s.def.Unique }
+func (*secondaryIndex) IsSpatial() bool                       { return false }
+func (*secondaryIndex) IsFullText() bool                      { return false }
+func (*secondaryIndex) IsVector() bool                        { return false }
+func (*secondaryIndex) Comment() string                       { return "" }
+func (*secondaryIndex) IndexType() string                     { return "BTREE" }
+func (*secondaryIndex) IsGenerated() bool                     { return false }
+func (*secondaryIndex) PrefixLengths() []uint16               { return nil }
+func (*secondaryIndex) CanSupportOrderBy(sql.Expression) bool { return false }
+func (s *secondaryIndex) Expressions() []string {
+	exprs := make([]string, len(s.def.Columns))
+	for i, ordinal := range s.def.Columns {
+		exprs[i] = s.table.name + "." + s.table.state.schema.Schema[ordinal].Name
 	}
 	return exprs
 }
-func (u *uniqueIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
-	cets := make([]sql.ColumnExpressionType, len(u.def.Columns))
-	for i, ordinal := range u.def.Columns {
-		cets[i] = sql.ColumnExpressionType{Expression: u.Expressions()[i], Type: u.table.state.schema.Schema[ordinal].Type}
+func (s *secondaryIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
+	cets := make([]sql.ColumnExpressionType, len(s.def.Columns))
+	for i, ordinal := range s.def.Columns {
+		cets[i] = sql.ColumnExpressionType{Expression: s.Expressions()[i], Type: s.table.state.schema.Schema[ordinal].Type}
 	}
 	return cets
 }
-func (*uniqueIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
+func (*secondaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
 	for _, candidate := range ranges {
 		rangeValue, ok := candidate.(sql.MySQLRange)
 		if !ok || len(rangeValue) == 0 {
@@ -1515,14 +1555,11 @@ func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
 		return err
 	}
 	for _, idx := range e.table.state.indexes {
-		if !idx.Unique {
-			continue
-		}
-		idxKey, hasNull, err := encodeIndexKey(e.table.state.schema, row, idx.Columns, key)
+		idxKey, hasNull, err := encodeIndexKey(e.table.state.schema, row, idx.Columns, key, idx.Unique)
 		if err != nil {
 			return err
 		}
-		if !hasNull {
+		if idx.Unique && !hasNull {
 			found, err := e.table.state.lookupIndexKey(ctx, idx.Name, idxKey)
 			if err != nil {
 				return err
@@ -1556,7 +1593,7 @@ func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
 		return sql.ErrDeleteRowNotFound.New()
 	}
 	for _, idx := range e.table.state.indexes {
-		idxKey, _, err := encodeIndexKey(e.table.state.schema, existing, idx.Columns, key)
+		idxKey, _, err := encodeIndexKey(e.table.state.schema, existing, idx.Columns, key, idx.Unique)
 		if err != nil {
 			return err
 		}
@@ -1607,11 +1644,11 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 		e.table.state.setEdit(string(oldKey), rowEdit{delete: true})
 	}
 	for _, idx := range e.table.state.indexes {
-		oldIdxKey, _, err := encodeIndexKey(e.table.state.schema, existing, idx.Columns, oldKey)
+		oldIdxKey, _, err := encodeIndexKey(e.table.state.schema, existing, idx.Columns, oldKey, idx.Unique)
 		if err != nil {
 			return err
 		}
-		newIdxKey, hasNull, err := encodeIndexKey(e.table.state.schema, newRow, idx.Columns, newKey)
+		newIdxKey, hasNull, err := encodeIndexKey(e.table.state.schema, newRow, idx.Columns, newKey, idx.Unique)
 		if err != nil {
 			return err
 		}
@@ -1990,7 +2027,7 @@ func encodeKey(schema sql.PrimaryKeySchema, row sql.Row) ([]byte, error) {
 // NULL columns are encoded with a 0x00 marker; non-NULL with 0x01 + value.
 // When any column is NULL, pkKey is appended as a disambiguator so that
 // multiple NULLs produce distinct keys (MySQL semantics: NULL != NULL).
-func encodeIndexKey(schema sql.PrimaryKeySchema, row sql.Row, ordinals []int, pkKey []byte) ([]byte, bool, error) {
+func encodeIndexKey(schema sql.PrimaryKeySchema, row sql.Row, ordinals []int, pkKey []byte, unique bool) ([]byte, bool, error) {
 	var out []byte
 	hasNull := false
 	for _, ordinal := range ordinals {
@@ -2018,7 +2055,7 @@ func encodeIndexKey(schema sql.PrimaryKeySchema, row sql.Row, ordinals []int, pk
 		out = append(out, byte(schema.Schema[ordinal].Type.Type()>>8), byte(schema.Schema[ordinal].Type.Type()), size[0], size[1], size[2], size[3])
 		out = append(out, raw...)
 	}
-	if hasNull {
+	if hasNull || !unique {
 		out = append(out, pkKey...)
 	}
 	return out, hasNull, nil
@@ -2053,7 +2090,7 @@ func (s *tableState) ensureIndexEdits(ctx context.Context) error {
 			if ok && root.Valid() {
 				continue
 			}
-			idxKey, _, err := encodeIndexKey(s.schema, row, idx.Columns, pk)
+			idxKey, _, err := encodeIndexKey(s.schema, row, idx.Columns, pk, idx.Unique)
 			if err != nil {
 				return err
 			}
@@ -2116,6 +2153,52 @@ func (s *tableState) resolveIndexToPK(ctx context.Context, idxName string, idxKe
 		return nil, err
 	}
 	return value, nil
+}
+
+func (s *tableState) resolveIndexToPKs(ctx context.Context, idxName string, prefix []byte) ([][]byte, error) {
+	pksByFullKey := make(map[string][]byte)
+
+	root, ok := s.manifest.Indexes[idxName]
+	if ok && root.Valid() {
+		tree, err := prolly.Open(s.store, root)
+		if err != nil {
+			return nil, err
+		}
+		it, err := tree.IteratorFrom(ctx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		defer it.Close()
+		for {
+			entry, ok, err := it.Next()
+			if err != nil {
+				return nil, err
+			}
+			if !ok || !bytes.HasPrefix(entry.Key, prefix) {
+				break
+			}
+			pksByFullKey[string(entry.Key)] = entry.Value
+		}
+	}
+
+	if edits, ok := s.idxEdits[idxName]; ok {
+		for _, edit := range edits {
+			if !bytes.HasPrefix(edit.Key, prefix) {
+				continue
+			}
+			if edit.Delete {
+				delete(pksByFullKey, string(edit.Key))
+			} else {
+				pksByFullKey[string(edit.Key)] = edit.Value
+			}
+		}
+	}
+
+	pks := make([][]byte, 0, len(pksByFullKey))
+	for _, pk := range pksByFullKey {
+		pks = append(pks, pk)
+	}
+	return pks, nil
 }
 
 func (s *tableState) addIndexEdit(idxName string, edit prolly.Edit) {
@@ -2265,7 +2348,7 @@ var _ sql.PrimaryKeyTable = (*table)(nil)
 var _ sql.IndexAddressableTable = (*table)(nil)
 var _ sql.IndexedTable = (*table)(nil)
 var _ sql.Index = (*primaryIndex)(nil)
-var _ sql.Index = (*uniqueIndex)(nil)
+var _ sql.Index = (*secondaryIndex)(nil)
 var _ sql.IndexAlterableTable = (*table)(nil)
 var _ sql.InsertableTable = (*table)(nil)
 var _ sql.UpdatableTable = (*table)(nil)

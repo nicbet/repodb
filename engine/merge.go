@@ -480,7 +480,7 @@ func rebuildIndexesFromTree(ctx context.Context, writer storage.Store, schema sq
 			return nil, err
 		}
 		for _, idx := range indexes {
-			idxKey, _, err := encodeIndexKey(schema, row, idx.Columns, entry.Key)
+			idxKey, _, err := encodeIndexKey(schema, row, idx.Columns, entry.Key, idx.Unique)
 			if err != nil {
 				return nil, err
 			}
