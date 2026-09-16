@@ -134,7 +134,7 @@ func MergeSnapshots(ctx context.Context, writer *repository.Writer, base, local,
 		if err != nil {
 			return manifest, nil, nil, err
 		}
-		schema, _, err := decodeSchema(schemaData)
+		schema, _, mergeIndexDefs, err := decodeSchema(schemaData)
 		if err != nil {
 			return manifest, nil, nil, err
 		}
@@ -174,7 +174,26 @@ func MergeSnapshots(ctx context.Context, writer *repository.Writer, base, local,
 		for _, hash := range hashes {
 			reachable[hash] = struct{}{}
 		}
-		manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+		tbl := repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+		if len(mergeIndexDefs) > 0 {
+			idxRoots, err := rebuildIndexesFromTree(ctx, writer, schema, mergeIndexDefs, tree)
+			if err != nil {
+				return manifest, nil, nil, fmt.Errorf("rebuild indexes for merged table %s: %w", name, err)
+			}
+			if idxRoots != nil {
+				tbl.Indexes = idxRoots
+				for _, idxRoot := range idxRoots {
+					idxHashes, err := prolly.Reachable(ctx, writer, idxRoot)
+					if err != nil {
+						return manifest, nil, nil, err
+					}
+					for _, h := range idxHashes {
+						reachable[h] = struct{}{}
+					}
+				}
+			}
+		}
+		manifest.Tables[name] = tbl
 	}
 	if len(conflicts) != 0 {
 		return manifest, nil, conflicts, nil
@@ -193,7 +212,7 @@ func version(snapshot *repository.Snapshot, name string) tableVersion {
 }
 
 func equalVersion(a, b tableVersion) bool {
-	return a.present == b.present && (!a.present || a.table == b.table)
+	return a.present == b.present && (!a.present || a.table.Equal(b.table))
 }
 
 func schemaConflict(ctx context.Context, name string, b, l, r tableVersion) (MergeConflict, error) {
@@ -253,6 +272,13 @@ func copyTable(ctx context.Context, writer *repository.Writer, name string, sour
 			return err
 		}
 		objects = append([]storage.Hash{source.table.SchemaRoot}, hashes...)
+		for _, idxRoot := range source.table.Indexes {
+			idxHashes, err := prolly.Reachable(ctx, source.snapshot.Store(), idxRoot)
+			if err != nil {
+				return err
+			}
+			objects = append(objects, idxHashes...)
+		}
 	}
 	if err := writer.ImportObjects(ctx, source.snapshot, objects); err != nil {
 		return err
@@ -409,7 +435,7 @@ func validateEntries(schemaData []byte, entries []prolly.Entry) error {
 }
 
 func decodeAndValidateSchema(schemaData []byte) (sql.PrimaryKeySchema, error) {
-	schema, _, err := decodeSchema(schemaData)
+	schema, _, _, err := decodeSchema(schemaData)
 	if err != nil {
 		return sql.PrimaryKeySchema{}, err
 	}
@@ -437,4 +463,46 @@ func validateEntry(schema sql.PrimaryKeySchema, entry prolly.Entry) error {
 		return fmt.Errorf("stored row primary key does not match tree key")
 	}
 	return nil
+}
+
+func rebuildIndexesFromTree(ctx context.Context, writer storage.Store, schema sql.PrimaryKeySchema, indexes []indexDisk, dataTree *prolly.Tree) (map[string]storage.Hash, error) {
+	entries, err := dataTree.Entries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	idxEntries := make(map[string][]prolly.Entry, len(indexes))
+	for _, entry := range entries {
+		row, err := decodeRow(schema.Schema, entry.Value)
+		if err != nil {
+			return nil, err
+		}
+		for _, idx := range indexes {
+			idxKey, _, err := encodeIndexKey(schema, row, idx.Columns, entry.Key)
+			if err != nil {
+				return nil, err
+			}
+			idxEntries[idx.Name] = append(idxEntries[idx.Name], prolly.Entry{Key: idxKey, Value: entry.Key})
+		}
+	}
+	roots := make(map[string]storage.Hash, len(indexes))
+	for _, idx := range indexes {
+		ie := idxEntries[idx.Name]
+		sort.Slice(ie, func(i, j int) bool { return bytes.Compare(ie[i].Key, ie[j].Key) < 0 })
+		if idx.Unique {
+			for i := 1; i < len(ie); i++ {
+				if bytes.Equal(ie[i-1].Key, ie[i].Key) {
+					return nil, fmt.Errorf("unique index %s: merge produced duplicate key", idx.Name)
+				}
+			}
+		}
+		tree, err := prolly.Build(ctx, writer, ie, prolly.DefaultOptions)
+		if err != nil {
+			return nil, err
+		}
+		roots[idx.Name] = tree.Root()
+	}
+	return roots, nil
 }

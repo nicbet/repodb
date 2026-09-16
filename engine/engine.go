@@ -163,7 +163,15 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 		if err != nil {
 			return fmt.Errorf("validate SQL table %s reachability: %w", name, err)
 		}
-		tableObjects[name] = append([]storage.Hash{table.SchemaRoot}, hashes...)
+		objects := append([]storage.Hash{table.SchemaRoot}, hashes...)
+		for _, idxRoot := range table.Indexes {
+			idxHashes, err := prolly.Reachable(ctx, snapshot.Store(), idxRoot)
+			if err != nil {
+				return fmt.Errorf("validate SQL table %s index reachability: %w", name, err)
+			}
+			objects = append(objects, idxHashes...)
+		}
+		tableObjects[name] = objects
 	}
 	validatedSnapshots.Lock()
 	if element := validatedSnapshots.entries[key]; element != nil {
@@ -240,7 +248,9 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 	reachable := make(map[storage.Hash]struct{})
 	for name, table := range snapshot.Manifest.Tables {
 		rowEdits, hasPending := pending[name]
-		if !hasPending {
+		baseTable, basePresent := base.Manifest.Tables[name]
+		schemaChanged := !basePresent || baseTable.SchemaRoot != table.SchemaRoot
+		if !hasPending && !schemaChanged {
 			manifest.Tables[name] = table
 			objects, cached := validatedTableObjects(base, name)
 			if !cached {
@@ -255,8 +265,47 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 			}
 			continue
 		}
+		if !hasPending && schemaChanged {
+			if table.SchemaRoot.Valid() {
+				schemaData, err := snapshot.Store().Get(ctx, table.SchemaRoot)
+				if err != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, fmt.Errorf("checkpoint schema for %s: %w", name, err)
+				}
+				if _, putErr := writer.Put(ctx, schemaData); putErr != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, putErr
+				}
+				reachable[table.SchemaRoot] = struct{}{}
+			}
+			if table.DataRoot.Valid() {
+				hashes, err := prolly.Reachable(ctx, base.Store(), table.DataRoot)
+				if err != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+				}
+				for _, hash := range hashes {
+					reachable[hash] = struct{}{}
+				}
+			}
+			tbl := repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: table.DataRoot}
+			if table.DataRoot.Valid() {
+				dataTree, err := prolly.Open(base.Store(), table.DataRoot)
+				if err != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+				}
+				if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, dataTree); err != nil {
+					return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+				} else if idxRoots != nil {
+					tbl.Indexes = idxRoots
+					for _, h := range idxHashes {
+						reachable[h] = struct{}{}
+					}
+				}
+			}
+			manifest.Tables[name] = tbl
+			continue
+		}
 		if table.SchemaRoot.Valid() {
-			if _, present := base.Manifest.Tables[name]; !present {
+			baseTable, basePresent := base.Manifest.Tables[name]
+			if !basePresent || baseTable.SchemaRoot != table.SchemaRoot {
 				schemaData, err := snapshot.Store().Get(ctx, table.SchemaRoot)
 				if err != nil {
 					return repository.CommitResult{Outcome: repository.OutcomeRejected}, fmt.Errorf("checkpoint schema for %s: %w", name, err)
@@ -292,7 +341,16 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 			for _, hash := range hashes {
 				reachable[hash] = struct{}{}
 			}
-			manifest.Tables[name] = repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
+			tbl := repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
+			if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, tree); err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			} else if idxRoots != nil {
+				tbl.Indexes = idxRoots
+				for _, h := range idxHashes {
+					reachable[h] = struct{}{}
+				}
+			}
+			manifest.Tables[name] = tbl
 		} else {
 			entries := make([]prolly.Entry, 0, len(edits))
 			for _, edit := range edits {
@@ -311,7 +369,16 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 			for _, hash := range hashes {
 				reachable[hash] = struct{}{}
 			}
-			manifest.Tables[name] = repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
+			tbl := repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
+			if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, tree); err != nil {
+				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
+			} else if idxRoots != nil {
+				tbl.Indexes = idxRoots
+				for _, h := range idxHashes {
+					reachable[h] = struct{}{}
+				}
+			}
+			manifest.Tables[name] = tbl
 		}
 	}
 	hashes := make([]storage.Hash, 0, len(reachable))
@@ -322,6 +389,38 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 		return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
 	}
 	return e.working.CheckpointPrepared(ctx, message, writer, manifest)
+}
+
+// checkpointIndexTrees reads the schema from the store, and if the table
+// has index definitions, rebuilds index trees from the data tree.
+func checkpointIndexTrees(ctx context.Context, store storage.Store, table repository.Table, dataTree *prolly.Tree) (map[string]storage.Hash, []storage.Hash, error) {
+	if !table.SchemaRoot.Valid() {
+		return nil, nil, nil
+	}
+	schemaData, err := store.Get(ctx, table.SchemaRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	schema, _, indexes, err := decodeSchema(schemaData)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(indexes) == 0 {
+		return nil, nil, nil
+	}
+	idxRoots, err := rebuildIndexesFromTree(ctx, store, schema, indexes, dataTree)
+	if err != nil {
+		return nil, nil, err
+	}
+	var allHashes []storage.Hash
+	for _, root := range idxRoots {
+		hashes, err := prolly.Reachable(ctx, store, root)
+		if err != nil {
+			return nil, nil, err
+		}
+		allHashes = append(allHashes, hashes...)
+	}
+	return idxRoots, allHashes, nil
 }
 
 func (e *Engine) Close() error {

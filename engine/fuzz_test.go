@@ -224,11 +224,11 @@ func FuzzSchemaRoundTrip(f *testing.F) {
 				{Name: checkName, CheckExpression: checkExpr, Enforced: true},
 			}
 		}
-		data, err := encodeSchema(schema, checks)
+		data, err := encodeSchema(schema, checks, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		decoded, decodedChecks, err := decodeSchema(data)
+		decoded, decodedChecks, _, err := decodeSchema(data)
 		if err != nil {
 			t.Fatal(err)
 		}

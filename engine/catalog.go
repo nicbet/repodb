@@ -62,6 +62,7 @@ type database struct {
 type cachedTableMeta struct {
 	schema   sql.PrimaryKeySchema
 	checks   []sql.CheckDefinition
+	indexes  []indexDisk
 	manifest repository.Table
 }
 
@@ -171,7 +172,9 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 	if cacheHit {
 		performanceCounters.metadataCacheHits.Add(1)
 		for name, meta := range cached {
-			tx.tables[name] = &tableState{schema: meta.schema, checks: copyChecks(meta.checks), manifest: meta.manifest, store: snapshot.Store()}
+			m := meta.manifest
+			m.Indexes = copyManifestIndexes(meta.manifest.Indexes)
+			tx.tables[name] = &tableState{schema: copySchema(meta.schema), checks: copyChecks(meta.checks), indexes: copyIndexes(meta.indexes), manifest: m, store: snapshot.Store()}
 		}
 	} else {
 		performanceCounters.metadataCacheMisses.Add(1)
@@ -182,7 +185,9 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 				return nil, fmt.Errorf("load table %s: %w", name, err)
 			}
 			tx.tables[name] = state
-			newCache[name] = cachedTableMeta{schema: state.schema, checks: copyChecks(state.checks), manifest: state.manifest}
+			cm := state.manifest
+			cm.Indexes = copyManifestIndexes(state.manifest.Indexes)
+			newCache[name] = cachedTableMeta{schema: copySchema(state.schema), checks: copyChecks(state.checks), indexes: copyIndexes(state.indexes), manifest: cm}
 		}
 		s.db.mu.Lock()
 		s.db.metadataCache = newCache
@@ -294,7 +299,7 @@ func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
 		}
 		te := repository.TypedTableEdit{Table: name}
 		if !state.manifest.SchemaRoot.Valid() || state.schemaDirty {
-			schemaData, err := encodeSchema(state.schema, state.checks)
+			schemaData, err := encodeSchema(state.schema, state.checks, state.indexes)
 			if err != nil {
 				return err
 			}
@@ -341,6 +346,13 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 					return err
 				}
 				objects = append([]storage.Hash{state.manifest.SchemaRoot}, hashes...)
+				for _, idxRoot := range state.manifest.Indexes {
+					idxHashes, err := prolly.Reachable(ctx, tx.writer.BaseSnapshot().Store(), idxRoot)
+					if err != nil {
+						return err
+					}
+					objects = append(objects, idxHashes...)
+				}
 			}
 			for _, hash := range objects {
 				reachable[hash] = struct{}{}
@@ -383,7 +395,7 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 			}
 			schemaRoot := state.manifest.SchemaRoot
 			if state.schemaDirty {
-				sd, err := encodeSchema(state.schema, state.checks)
+				sd, err := encodeSchema(state.schema, state.checks, state.indexes)
 				if err != nil {
 					return err
 				}
@@ -393,10 +405,21 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 				}
 			}
 			reachable[schemaRoot] = struct{}{}
-			manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+			tbl := repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+			idxRoots, idxHashes, err := commitIndexTrees(ctx, tx.writer, state, tx.writer.BaseSnapshot().Store())
+			if err != nil {
+				return err
+			}
+			if idxRoots != nil {
+				tbl.Indexes = idxRoots
+				for _, h := range idxHashes {
+					reachable[h] = struct{}{}
+				}
+			}
+			manifest.Tables[name] = tbl
 			continue
 		}
-		schemaData, err := encodeSchema(state.schema, state.checks)
+		schemaData, err := encodeSchema(state.schema, state.checks, state.indexes)
 		if err != nil {
 			return err
 		}
@@ -424,7 +447,18 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 		for _, hash := range hashes {
 			reachable[hash] = struct{}{}
 		}
-		manifest.Tables[name] = repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+		tbl := repository.Table{SchemaRoot: schemaRoot, DataRoot: tree.Root()}
+		idxRoots, idxHashes, err := commitIndexTrees(ctx, tx.writer, state, tx.writer.BaseSnapshot().Store())
+		if err != nil {
+			return err
+		}
+		if idxRoots != nil {
+			tbl.Indexes = idxRoots
+			for _, h := range idxHashes {
+				reachable[h] = struct{}{}
+			}
+		}
+		manifest.Tables[name] = tbl
 	}
 	hashes := make([]storage.Hash, 0, len(reachable))
 	for hash := range reachable {
@@ -441,6 +475,91 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 		s.db.mu.Unlock()
 	}
 	return err
+}
+
+// commitIndexTrees builds or applies pending index edits for a dirty table,
+// returning the index root hashes and all reachable objects.
+// coalesceEdits deduplicates a slice of edits, keeping only the last edit per key,
+// then sorts by key. This handles sequences like delete(k)+insert(k) which are valid
+// transactions but would produce duplicate keys for prolly.Apply.
+func coalesceEdits(edits []prolly.Edit) []prolly.Edit {
+	last := make(map[string]prolly.Edit, len(edits))
+	for _, e := range edits {
+		last[string(e.Key)] = e
+	}
+	out := make([]prolly.Edit, 0, len(last))
+	for _, e := range last {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Key, out[j].Key) < 0 })
+	return out
+}
+
+func commitIndexTrees(ctx context.Context, writer storage.Store, state *tableState, baseStore storage.Store) (map[string]storage.Hash, []storage.Hash, error) {
+	if len(state.indexes) == 0 {
+		return nil, nil, nil
+	}
+	roots := make(map[string]storage.Hash, len(state.indexes))
+	var allHashes []storage.Hash
+	for _, idx := range state.indexes {
+		edits := coalesceEdits(state.idxEdits[idx.Name])
+		existingRoot, hasExisting := state.manifest.Indexes[idx.Name]
+		if hasExisting && existingRoot.Valid() && len(edits) > 0 {
+			baseTree, err := prolly.Open(baseStore, existingRoot)
+			if err != nil {
+				return nil, nil, err
+			}
+			tree, err := prolly.Apply(ctx, writer, baseTree, edits)
+			if err != nil {
+				return nil, nil, err
+			}
+			roots[idx.Name] = tree.Root()
+		} else if hasExisting && existingRoot.Valid() && len(edits) == 0 {
+			roots[idx.Name] = existingRoot
+		} else {
+			root, err := buildIndexTreeForDef(ctx, writer, state, idx)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !root.Valid() {
+				continue
+			}
+			roots[idx.Name] = root
+		}
+		if roots[idx.Name].Valid() {
+			hashes, err := prolly.Reachable(ctx, writer, roots[idx.Name])
+			if err != nil {
+				return nil, nil, err
+			}
+			allHashes = append(allHashes, hashes...)
+		}
+	}
+	return roots, allHashes, nil
+}
+
+// buildIndexTreeForDef builds a single index tree from scratch by scanning all rows.
+func buildIndexTreeForDef(ctx context.Context, writer storage.Store, state *tableState, idx indexDisk) (storage.Hash, error) {
+	if err := state.ensureRows(ctx); err != nil {
+		return "", err
+	}
+	if len(state.rows) == 0 {
+		return "", nil
+	}
+	entries := make([]prolly.Entry, 0, len(state.rows))
+	for pkStr, row := range state.rows {
+		pk := []byte(pkStr)
+		idxKey, _, err := encodeIndexKey(state.schema, row, idx.Columns, pk)
+		if err != nil {
+			return "", err
+		}
+		entries = append(entries, prolly.Entry{Key: idxKey, Value: pk})
+	}
+	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].Key, entries[j].Key) < 0 })
+	tree, err := prolly.Build(ctx, writer, entries, prolly.DefaultOptions)
+	if err != nil {
+		return "", err
+	}
+	return tree.Root(), nil
 }
 
 func (s *session) Rollback(*sql.Context, sql.Transaction) error { return nil }
@@ -471,9 +590,16 @@ func transactionFrom(ctx *sql.Context) (*transaction, error) {
 	return opaque.(*transaction), nil
 }
 
+type indexState struct {
+	def   indexDisk
+	edits []prolly.Edit
+}
+
 type tableState struct {
 	schema      sql.PrimaryKeySchema
 	checks      []sql.CheckDefinition
+	indexes     []indexDisk
+	idxEdits    map[string][]prolly.Edit
 	rows        map[string]sql.Row
 	manifest    repository.Table
 	store       storage.Store
@@ -590,7 +716,99 @@ func (t *table) Partitions(*sql.Context) (sql.PartitionIter, error) {
 }
 
 func (t *table) GetIndexes(*sql.Context) ([]sql.Index, error) {
-	return []sql.Index{&primaryIndex{table: t}}, nil
+	indexes := []sql.Index{&primaryIndex{table: t}}
+	for i := range t.state.indexes {
+		indexes = append(indexes, &uniqueIndex{table: t, def: &t.state.indexes[i]})
+	}
+	return indexes, nil
+}
+
+func (t *table) CreateIndex(ctx *sql.Context, def sql.IndexDef) error {
+	if !def.IsUnique() {
+		return fmt.Errorf("RepoDB currently supports only UNIQUE indexes")
+	}
+	for _, existing := range t.state.indexes {
+		if existing.Name == def.Name {
+			return fmt.Errorf("index %s already exists", def.Name)
+		}
+	}
+	ordinals := make([]int, len(def.Columns))
+	for i, col := range def.Columns {
+		found := false
+		for j, sc := range t.state.schema.Schema {
+			if strings.EqualFold(sc.Name, col.Name) {
+				ordinals[i] = j
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("column %s not found", col.Name)
+		}
+	}
+	idx := indexDisk{Name: def.Name, Columns: ordinals, Unique: true}
+	if err := t.state.ensureRows(ctx); err != nil {
+		return err
+	}
+	seen := make(map[string]struct{})
+	for pkStr, row := range t.state.rows {
+		pk := []byte(pkStr)
+		idxKey, hasNull, err := encodeIndexKey(t.state.schema, row, ordinals, pk)
+		if err != nil {
+			return err
+		}
+		if !hasNull {
+			keyStr := string(idxKey)
+			if _, dup := seen[keyStr]; dup {
+				return sql.NewUniqueKeyErr(def.Name, false, row)
+			}
+			seen[keyStr] = struct{}{}
+		}
+	}
+	t.state.indexes = append(t.state.indexes, idx)
+	t.state.schemaDirty = true
+	t.state.dirty = true
+	tx, _ := transactionFrom(ctx)
+	tx.dirty = true
+	return nil
+}
+
+func (t *table) DropIndex(ctx *sql.Context, indexName string) error {
+	found := false
+	for i, idx := range t.state.indexes {
+		if idx.Name == indexName {
+			t.state.indexes = append(t.state.indexes[:i], t.state.indexes[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("index %s not found", indexName)
+	}
+	delete(t.state.idxEdits, indexName)
+	t.state.schemaDirty = true
+	t.state.dirty = true
+	tx, _ := transactionFrom(ctx)
+	tx.dirty = true
+	return nil
+}
+
+func (t *table) RenameIndex(ctx *sql.Context, fromName string, toName string) error {
+	for i, idx := range t.state.indexes {
+		if idx.Name == fromName {
+			t.state.indexes[i].Name = toName
+			if edits, ok := t.state.idxEdits[fromName]; ok {
+				t.state.idxEdits[toName] = edits
+				delete(t.state.idxEdits, fromName)
+			}
+			t.state.schemaDirty = true
+			t.state.dirty = true
+			tx, _ := transactionFrom(ctx)
+			tx.dirty = true
+			return nil
+		}
+	}
+	return fmt.Errorf("index %s not found", fromName)
 }
 
 func (t *table) IndexedAccess(_ *sql.Context, lookup sql.IndexLookup) sql.IndexedTable {
@@ -605,8 +823,18 @@ func (t *table) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.
 	}
 	ranges, ok := lookup.Ranges.(sql.MySQLRangeCollection)
 	if !ok {
-		return nil, errors.New("RepoDB primary index supports point lookups only")
+		return nil, errors.New("RepoDB index supports point lookups only")
 	}
+	if _, isPrimary := lookup.Index.(*primaryIndex); isPrimary {
+		return t.lookupPrimaryPartitions(ctx, ranges)
+	}
+	if ui, isUnique := lookup.Index.(*uniqueIndex); isUnique {
+		return t.lookupUniquePartitions(ctx, ranges, ui.def)
+	}
+	return nil, fmt.Errorf("unsupported index type %T", lookup.Index)
+}
+
+func (t *table) lookupPrimaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection) (sql.PartitionIter, error) {
 	keys := make([]string, 0, len(ranges))
 	for _, indexRange := range ranges {
 		row := make(sql.Row, len(t.state.schema.Schema))
@@ -630,6 +858,43 @@ func (t *table) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.
 			return nil, err
 		}
 		keys = append(keys, string(key))
+	}
+	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
+}
+
+func (t *table) lookupUniquePartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection, def *indexDisk) (sql.PartitionIter, error) {
+	if err := t.state.ensureIndexEdits(ctx); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(ranges))
+	for _, indexRange := range ranges {
+		if len(indexRange) != len(def.Columns) {
+			return nil, errors.New("incomplete RepoDB unique-index lookup")
+		}
+		row := make(sql.Row, len(t.state.schema.Schema))
+		for i, ordinal := range def.Columns {
+			lower, lok := indexRange[i].LowerBound.(sql.Below)
+			upper, uok := indexRange[i].UpperBound.(sql.Above)
+			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
+				return nil, errors.New("RepoDB unique index received a non-point range")
+			}
+			value, _, err := t.state.schema.Schema[ordinal].Type.Convert(ctx, lower.Key)
+			if err != nil {
+				return nil, err
+			}
+			row[ordinal] = value
+		}
+		idxKey, _, err := encodeIndexKey(t.state.schema, row, def.Columns, nil)
+		if err != nil {
+			return nil, err
+		}
+		pkKey, err := t.state.resolveIndexToPK(ctx, def.Name, idxKey)
+		if err != nil {
+			return nil, err
+		}
+		if pkKey != nil {
+			keys = append(keys, string(pkKey))
+		}
 	}
 	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
 }
@@ -727,6 +992,14 @@ func (t *table) AddColumn(ctx *sql.Context, column *sql.Column, order *sql.Colum
 		newRows[key] = newRow
 	}
 	t.state.schema = sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
+	for i := range t.state.indexes {
+		for j, ord := range t.state.indexes[i].Columns {
+			if ord >= insertAt {
+				t.state.indexes[i].Columns[j] = ord + 1
+			}
+		}
+	}
+	t.state.idxEdits = nil
 	t.state.rows = newRows
 	t.state.edits = make(map[string]rowEdit)
 	for key, row := range newRows {
@@ -758,6 +1031,13 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 			return fmt.Errorf("cannot drop primary key column %s", columnName)
 		}
 	}
+	for _, idx := range t.state.indexes {
+		for _, ord := range idx.Columns {
+			if ord == dropIdx {
+				return fmt.Errorf("cannot drop column %s: used by index %s", columnName, idx.Name)
+			}
+		}
+	}
 	if err := t.state.ensureRows(ctx); err != nil {
 		return err
 	}
@@ -780,6 +1060,14 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 		newRows[key] = newRow
 	}
 	t.state.schema = sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
+	for i := range t.state.indexes {
+		for j, ord := range t.state.indexes[i].Columns {
+			if ord > dropIdx {
+				t.state.indexes[i].Columns[j] = ord - 1
+			}
+		}
+	}
+	t.state.idxEdits = nil
 	t.state.rows = newRows
 	t.state.edits = make(map[string]rowEdit)
 	for key, row := range newRows {
@@ -827,6 +1115,7 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 	typeChanged := !t.state.schema.Schema[colIdx].Type.Equals(column.Type)
 	if typeChanged {
 		oldEnum, oldIsEnum := t.state.schema.Schema[colIdx].Type.(sql.EnumType)
+		convertedRows := make(map[string]any, len(t.state.rows))
 		for key, row := range t.state.rows {
 			if row[colIdx] != nil {
 				val := row[colIdx]
@@ -843,8 +1132,56 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 				if !inRange {
 					return fmt.Errorf("value out of range for column %s new type", columnName)
 				}
-				row[colIdx] = converted
-				t.state.rows[key] = row
+				convertedRows[key] = converted
+			}
+		}
+		candidateSchema := copySchema(t.state.schema)
+		candidateSchema.Schema[colIdx] = column
+		for _, idx := range t.state.indexes {
+			affectsIdx := false
+			for _, ord := range idx.Columns {
+				if ord == colIdx {
+					affectsIdx = true
+					break
+				}
+			}
+			if !affectsIdx {
+				continue
+			}
+			if idx.Unique {
+				seen := make(map[string]struct{}, len(t.state.rows))
+				for pkStr, row := range t.state.rows {
+					pk := []byte(pkStr)
+					candidateRow := cloneRow(row)
+					if v, ok := convertedRows[pkStr]; ok {
+						candidateRow[colIdx] = v
+					}
+					idxKey, hasNull, err := encodeIndexKey(candidateSchema, candidateRow, idx.Columns, pk)
+					if err != nil {
+						return err
+					}
+					if !hasNull {
+						keyStr := string(idxKey)
+						if _, dup := seen[keyStr]; dup {
+							return fmt.Errorf("column type change on %s creates duplicate in unique index %s", columnName, idx.Name)
+						}
+						seen[keyStr] = struct{}{}
+					}
+				}
+			}
+		}
+		for key, converted := range convertedRows {
+			row := t.state.rows[key]
+			row[colIdx] = converted
+			t.state.rows[key] = row
+		}
+		t.state.idxEdits = nil
+		for _, idx := range t.state.indexes {
+			for _, ord := range idx.Columns {
+				if ord == colIdx {
+					delete(t.state.manifest.Indexes, idx.Name)
+					break
+				}
 			}
 		}
 	}
@@ -886,6 +1223,22 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 			newPK[i] = r
 		}
 		t.state.schema.PkOrdinals = newPK
+		for ii := range t.state.indexes {
+			for jj, ord := range t.state.indexes[ii].Columns {
+				r := ord
+				if ord > colIdx {
+					r = ord - 1
+				} else if ord == colIdx {
+					t.state.indexes[ii].Columns[jj] = insertAt
+					continue
+				}
+				if r >= insertAt {
+					r++
+				}
+				t.state.indexes[ii].Columns[jj] = r
+			}
+		}
+		t.state.idxEdits = nil
 		for key, row := range t.state.rows {
 			cell := row[colIdx]
 			reducedRow := make(sql.Row, len(row)-1)
@@ -1030,9 +1383,59 @@ func (*primaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
 	return true
 }
 
+type uniqueIndex struct {
+	table *table
+	def   *indexDisk
+}
+
+func (u *uniqueIndex) ID() string       { return u.def.Name }
+func (u *uniqueIndex) Database() string  { return u.table.db.name }
+func (u *uniqueIndex) Table() string     { return u.table.name }
+func (*uniqueIndex) IsUnique() bool      { return true }
+func (*uniqueIndex) IsSpatial() bool     { return false }
+func (*uniqueIndex) IsFullText() bool    { return false }
+func (*uniqueIndex) IsVector() bool      { return false }
+func (*uniqueIndex) Comment() string     { return "" }
+func (*uniqueIndex) IndexType() string   { return "BTREE" }
+func (*uniqueIndex) IsGenerated() bool   { return false }
+func (*uniqueIndex) PrefixLengths() []uint16               { return nil }
+func (*uniqueIndex) CanSupportOrderBy(sql.Expression) bool { return false }
+func (u *uniqueIndex) Expressions() []string {
+	exprs := make([]string, len(u.def.Columns))
+	for i, ordinal := range u.def.Columns {
+		exprs[i] = u.table.name + "." + u.table.state.schema.Schema[ordinal].Name
+	}
+	return exprs
+}
+func (u *uniqueIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
+	cets := make([]sql.ColumnExpressionType, len(u.def.Columns))
+	for i, ordinal := range u.def.Columns {
+		cets[i] = sql.ColumnExpressionType{Expression: u.Expressions()[i], Type: u.table.state.schema.Schema[ordinal].Type}
+	}
+	return cets
+}
+func (*uniqueIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
+	for _, candidate := range ranges {
+		rangeValue, ok := candidate.(sql.MySQLRange)
+		if !ok || len(rangeValue) == 0 {
+			return false
+		}
+		for _, column := range rangeValue {
+			lower, lok := column.LowerBound.(sql.Below)
+			upper, uok := column.UpperBound.(sql.Above)
+			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 type editor struct {
-	table  *table
-	before map[string]beforeRow
+	table       *table
+	before      map[string]beforeRow
+	idxSnapshot map[string][]prolly.Edit
+	idxInitErr  error
 }
 
 type beforeRow struct {
@@ -1042,9 +1445,26 @@ type beforeRow struct {
 	editPresent bool
 }
 
-func (e *editor) StatementBegin(*sql.Context) { e.before = make(map[string]beforeRow) }
+func (e *editor) StatementBegin(ctx *sql.Context) {
+	e.before = make(map[string]beforeRow)
+	e.idxInitErr = nil
+	e.idxSnapshot = nil
+	if len(e.table.state.indexes) > 0 {
+		if err := e.table.state.ensureIndexEdits(ctx); err != nil {
+			e.idxInitErr = err
+			return
+		}
+	}
+	e.idxSnapshot = make(map[string][]prolly.Edit, len(e.table.state.idxEdits))
+	for name, edits := range e.table.state.idxEdits {
+		snapshot := make([]prolly.Edit, len(edits))
+		copy(snapshot, edits)
+		e.idxSnapshot[name] = snapshot
+	}
+}
 func (e *editor) StatementComplete(*sql.Context) error {
 	e.before = nil
+	e.idxSnapshot = nil
 	return nil
 }
 func (e *editor) DiscardChanges(*sql.Context, error) error {
@@ -1063,11 +1483,23 @@ func (e *editor) DiscardChanges(*sql.Context, error) error {
 			delete(e.table.state.rows, key)
 		}
 	}
+	if e.idxSnapshot != nil {
+		e.table.state.idxEdits = make(map[string][]prolly.Edit, len(e.idxSnapshot))
+		for name, edits := range e.idxSnapshot {
+			restored := make([]prolly.Edit, len(edits))
+			copy(restored, edits)
+			e.table.state.idxEdits[name] = restored
+		}
+	}
 	e.before = nil
+	e.idxSnapshot = nil
 	return nil
 }
 func (e *editor) Close(*sql.Context) error { return nil }
 func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
+	if e.idxInitErr != nil {
+		return e.idxInitErr
+	}
 	key, err := encodeKey(e.table.state.schema, row)
 	if err != nil {
 		return err
@@ -1079,6 +1511,28 @@ func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
 	if ok {
 		return sql.NewUniqueKeyErr(base64.RawStdEncoding.EncodeToString(key), true, existing)
 	}
+	if err := e.table.state.ensureIndexEdits(ctx); err != nil {
+		return err
+	}
+	for _, idx := range e.table.state.indexes {
+		if !idx.Unique {
+			continue
+		}
+		idxKey, hasNull, err := encodeIndexKey(e.table.state.schema, row, idx.Columns, key)
+		if err != nil {
+			return err
+		}
+		if !hasNull {
+			found, err := e.table.state.lookupIndexKey(ctx, idx.Name, idxKey)
+			if err != nil {
+				return err
+			}
+			if found {
+				return sql.NewUniqueKeyErr(idx.Name, false, row)
+			}
+		}
+		e.table.state.addIndexEdit(idx.Name, prolly.Edit{Key: idxKey, Value: key})
+	}
 	e.remember(string(key), nil, false)
 	e.table.state.setEdit(string(key), rowEdit{row: row})
 	tx, _ := transactionFrom(ctx)
@@ -1087,6 +1541,9 @@ func (e *editor) Insert(ctx *sql.Context, row sql.Row) error {
 	return nil
 }
 func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
+	if e.idxInitErr != nil {
+		return e.idxInitErr
+	}
 	key, err := encodeKey(e.table.state.schema, row)
 	if err != nil {
 		return err
@@ -1098,6 +1555,13 @@ func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
 	if !ok {
 		return sql.ErrDeleteRowNotFound.New()
 	}
+	for _, idx := range e.table.state.indexes {
+		idxKey, _, err := encodeIndexKey(e.table.state.schema, existing, idx.Columns, key)
+		if err != nil {
+			return err
+		}
+		e.table.state.addIndexEdit(idx.Name, prolly.Edit{Key: idxKey, Delete: true})
+	}
 	e.remember(string(key), existing, true)
 	e.table.state.setEdit(string(key), rowEdit{delete: true})
 	tx, _ := transactionFrom(ctx)
@@ -1106,6 +1570,12 @@ func (e *editor) Delete(ctx *sql.Context, row sql.Row) error {
 	return nil
 }
 func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
+	if e.idxInitErr != nil {
+		return e.idxInitErr
+	}
+	if err := e.table.state.ensureIndexEdits(ctx); err != nil {
+		return err
+	}
 	oldKey, err := encodeKey(e.table.state.schema, oldRow)
 	if err != nil {
 		return err
@@ -1136,6 +1606,33 @@ func (e *editor) Update(ctx *sql.Context, oldRow, newRow sql.Row) error {
 		e.remember(string(newKey), nil, false)
 		e.table.state.setEdit(string(oldKey), rowEdit{delete: true})
 	}
+	for _, idx := range e.table.state.indexes {
+		oldIdxKey, _, err := encodeIndexKey(e.table.state.schema, existing, idx.Columns, oldKey)
+		if err != nil {
+			return err
+		}
+		newIdxKey, hasNull, err := encodeIndexKey(e.table.state.schema, newRow, idx.Columns, newKey)
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(oldIdxKey, newIdxKey) {
+			if !bytes.Equal(oldKey, newKey) {
+				e.table.state.addIndexEdit(idx.Name, prolly.Edit{Key: newIdxKey, Value: newKey})
+			}
+			continue
+		}
+		if idx.Unique && !hasNull {
+			found, err := e.table.state.lookupIndexKey(ctx, idx.Name, newIdxKey)
+			if err != nil {
+				return err
+			}
+			if found {
+				return sql.NewUniqueKeyErr(idx.Name, false, newRow)
+			}
+		}
+		e.table.state.addIndexEdit(idx.Name, prolly.Edit{Key: oldIdxKey, Delete: true})
+		e.table.state.addIndexEdit(idx.Name, prolly.Edit{Key: newIdxKey, Value: newKey})
+	}
 	e.table.state.setEdit(string(newKey), rowEdit{row: newRow})
 	tx, _ := transactionFrom(ctx)
 	tx.dirty = true
@@ -1160,10 +1657,16 @@ type checkDisk struct {
 	Expression string `json:"expression"`
 	Enforced   bool   `json:"enforced"`
 }
+type indexDisk struct {
+	Name    string `json:"name"`
+	Columns []int  `json:"columns"`
+	Unique  bool   `json:"unique"`
+}
 type schemaDisk struct {
 	Columns []columnDisk `json:"columns"`
 	PK      []int        `json:"primary_key"`
 	Checks  []checkDisk  `json:"checks,omitempty"`
+	Indexes []indexDisk  `json:"indexes,omitempty"`
 }
 type columnDisk struct {
 	Name         string   `json:"name"`
@@ -1179,7 +1682,7 @@ type columnDisk struct {
 	DefaultParen bool     `json:"default_paren,omitempty"`
 }
 
-func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]byte, error) {
+func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition, indexes []indexDisk) ([]byte, error) {
 	d := schemaDisk{PK: append([]int(nil), schema.PkOrdinals...)}
 	for _, col := range schema.Schema {
 		cd := columnDisk{Name: col.Name, Type: int32(col.Type.Type()), Nullable: col.Nullable}
@@ -1212,13 +1715,14 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition) ([]
 	for _, chk := range checks {
 		d.Checks = append(d.Checks, checkDisk{Name: chk.Name, Expression: chk.CheckExpression, Enforced: chk.Enforced})
 	}
+	d.Indexes = indexes
 	return json.Marshal(d)
 }
 
-func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, error) {
+func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, []indexDisk, error) {
 	var d schemaDisk
 	if err := json.Unmarshal(data, &d); err != nil {
-		return sql.PrimaryKeySchema{}, nil, err
+		return sql.PrimaryKeySchema{}, nil, nil, err
 	}
 	cols := make(sql.Schema, len(d.Columns))
 	for i, cd := range d.Columns {
@@ -1227,12 +1731,12 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 			var err error
 			coll, err = sql.ParseCollation("", cd.Collation, false)
 			if err != nil {
-				return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
+				return sql.PrimaryKeySchema{}, nil, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 			}
 		}
 		typ, err := decodeType(querypb.Type(cd.Type), cd.Length, cd.Precision, cd.Scale, cd.EnumValues, coll)
 		if err != nil {
-			return sql.PrimaryKeySchema{}, nil, fmt.Errorf("column %s: %w", cd.Name, err)
+			return sql.PrimaryKeySchema{}, nil, nil, fmt.Errorf("column %s: %w", cd.Name, err)
 		}
 		col := &sql.Column{Name: cd.Name, Type: typ, Nullable: cd.Nullable, PrimaryKey: contains(d.PK, i)}
 		if cd.Default != "" {
@@ -1247,7 +1751,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, err
 	for _, cd := range d.Checks {
 		checks = append(checks, sql.CheckDefinition{Name: cd.Name, CheckExpression: cd.Expression, Enforced: cd.Enforced})
 	}
-	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, checks, nil
+	return sql.PrimaryKeySchema{Schema: cols, PkOrdinals: d.PK}, checks, d.Indexes, nil
 }
 
 // decodeType maps a querypb.Type to a go-mysql-server sql.Type.
@@ -1482,6 +1986,145 @@ func encodeKey(schema sql.PrimaryKeySchema, row sql.Row) ([]byte, error) {
 	return out, nil
 }
 
+// encodeIndexKey builds a binary key from the given column ordinals of a row.
+// NULL columns are encoded with a 0x00 marker; non-NULL with 0x01 + value.
+// When any column is NULL, pkKey is appended as a disambiguator so that
+// multiple NULLs produce distinct keys (MySQL semantics: NULL != NULL).
+func encodeIndexKey(schema sql.PrimaryKeySchema, row sql.Row, ordinals []int, pkKey []byte) ([]byte, bool, error) {
+	var out []byte
+	hasNull := false
+	for _, ordinal := range ordinals {
+		if ordinal < 0 || ordinal >= len(row) || row[ordinal] == nil {
+			out = append(out, 0x00)
+			hasNull = true
+			continue
+		}
+		out = append(out, 0x01)
+		raw, err := rawValue(schema.Schema[ordinal].Type.Type(), row[ordinal])
+		if err != nil {
+			return nil, false, err
+		}
+		if st, ok := schema.Schema[ordinal].Type.(sql.StringType); ok {
+			if c := st.Collation(); c != sql.Collation_Default {
+				var buf bytes.Buffer
+				if err := c.WriteWeightString(&buf, string(raw)); err != nil {
+					return nil, false, fmt.Errorf("collation weight string: %w", err)
+				}
+				raw = buf.Bytes()
+			}
+		}
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(raw)))
+		out = append(out, byte(schema.Schema[ordinal].Type.Type()>>8), byte(schema.Schema[ordinal].Type.Type()), size[0], size[1], size[2], size[3])
+		out = append(out, raw...)
+	}
+	if hasNull {
+		out = append(out, pkKey...)
+	}
+	return out, hasNull, nil
+}
+
+// ensureIndexEdits rebuilds in-memory index edits from existing rows when
+// the index tree has not been persisted yet (e.g., journal path before checkpoint).
+func (s *tableState) ensureIndexEdits(ctx context.Context) error {
+	if s.idxEdits != nil || len(s.indexes) == 0 {
+		return nil
+	}
+	hasUnpersisted := false
+	for _, idx := range s.indexes {
+		root, ok := s.manifest.Indexes[idx.Name]
+		if !ok || !root.Valid() {
+			hasUnpersisted = true
+			break
+		}
+	}
+	if !hasUnpersisted {
+		s.idxEdits = make(map[string][]prolly.Edit)
+		return nil
+	}
+	if err := s.ensureRows(ctx); err != nil {
+		return err
+	}
+	built := make(map[string][]prolly.Edit)
+	for pkStr, row := range s.rows {
+		pk := []byte(pkStr)
+		for _, idx := range s.indexes {
+			root, ok := s.manifest.Indexes[idx.Name]
+			if ok && root.Valid() {
+				continue
+			}
+			idxKey, _, err := encodeIndexKey(s.schema, row, idx.Columns, pk)
+			if err != nil {
+				return err
+			}
+			built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: idxKey, Value: pk})
+		}
+	}
+	s.idxEdits = built
+	return nil
+}
+
+// lookupIndexKey checks if an index key exists in the index's pending edits
+// or in its persisted prolly tree. Returns true if a non-deleted entry exists.
+func (s *tableState) lookupIndexKey(ctx context.Context, idxName string, key []byte) (bool, error) {
+	if edits, ok := s.idxEdits[idxName]; ok {
+		for i := len(edits) - 1; i >= 0; i-- {
+			if bytes.Equal(edits[i].Key, key) {
+				return !edits[i].Delete, nil
+			}
+		}
+	}
+	root, ok := s.manifest.Indexes[idxName]
+	if !ok || !root.Valid() {
+		return false, nil
+	}
+	tree, err := prolly.Open(s.store, root)
+	if err != nil {
+		return false, err
+	}
+	_, err = tree.Get(ctx, key)
+	if errors.Is(err, prolly.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *tableState) resolveIndexToPK(ctx context.Context, idxName string, idxKey []byte) ([]byte, error) {
+	if edits, ok := s.idxEdits[idxName]; ok {
+		for i := len(edits) - 1; i >= 0; i-- {
+			if bytes.Equal(edits[i].Key, idxKey) {
+				if edits[i].Delete {
+					return nil, nil
+				}
+				return edits[i].Value, nil
+			}
+		}
+	}
+	root, ok := s.manifest.Indexes[idxName]
+	if !ok || !root.Valid() {
+		return nil, nil
+	}
+	tree, err := prolly.Open(s.store, root)
+	if err != nil {
+		return nil, err
+	}
+	value, err := tree.Get(ctx, idxKey)
+	if errors.Is(err, prolly.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func (s *tableState) addIndexEdit(idxName string, edit prolly.Edit) {
+	if s.idxEdits == nil {
+		panic("addIndexEdit called before ensureIndexEdits")
+	}
+	s.idxEdits[idxName] = append(s.idxEdits[idxName], edit)
+}
+
 func rawValue(typ querypb.Type, value any) ([]byte, error) {
 	switch typ {
 	case querypb.Type_BLOB, querypb.Type_VARBINARY, querypb.Type_BINARY:
@@ -1545,11 +2188,12 @@ func loadTableMetadata(ctx context.Context, store storage.Store, manifest reposi
 	if err != nil {
 		return nil, err
 	}
-	schema, checks, err := decodeSchema(schemaData)
+	schema, checks, indexes, err := decodeSchema(schemaData)
 	if err != nil {
 		return nil, err
 	}
-	return &tableState{schema: schema, checks: checks, manifest: manifest, store: store}, nil
+	manifest.Indexes = copyManifestIndexes(manifest.Indexes)
+	return &tableState{schema: schema, checks: checks, indexes: indexes, manifest: manifest, store: store}, nil
 }
 
 func loadTable(ctx context.Context, store storage.Store, manifest repository.Table) (*tableState, error) {
@@ -1586,6 +2230,26 @@ func copyChecks(checks []sql.CheckDefinition) []sql.CheckDefinition {
 	copy(out, checks)
 	return out
 }
+func copyIndexes(indexes []indexDisk) []indexDisk {
+	if indexes == nil {
+		return nil
+	}
+	out := make([]indexDisk, len(indexes))
+	for i, idx := range indexes {
+		out[i] = indexDisk{Name: idx.Name, Unique: idx.Unique, Columns: append([]int(nil), idx.Columns...)}
+	}
+	return out
+}
+func copyManifestIndexes(m map[string]storage.Hash) map[string]storage.Hash {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]storage.Hash, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
 func cloneRow(row sql.Row) sql.Row { return append(sql.Row(nil), row...) }
 func cloneRows(rows map[string]sql.Row) map[string]sql.Row {
 	out := make(map[string]sql.Row, len(rows))
@@ -1601,6 +2265,8 @@ var _ sql.PrimaryKeyTable = (*table)(nil)
 var _ sql.IndexAddressableTable = (*table)(nil)
 var _ sql.IndexedTable = (*table)(nil)
 var _ sql.Index = (*primaryIndex)(nil)
+var _ sql.Index = (*uniqueIndex)(nil)
+var _ sql.IndexAlterableTable = (*table)(nil)
 var _ sql.InsertableTable = (*table)(nil)
 var _ sql.UpdatableTable = (*table)(nil)
 var _ sql.DeletableTable = (*table)(nil)

@@ -2792,6 +2792,726 @@ func TestEnumWithCollation(t *testing.T) {
 	}
 }
 
+func TestUniqueConstraintDDL(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (3, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("expected unique constraint violation, got nil")
+	}
+}
+
+func TestUniqueConstraintUpdate(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "UPDATE t SET email = 'alice@example.com' WHERE id = 2")
+	if err == nil {
+		t.Fatal("expected unique constraint violation on update, got nil")
+	}
+}
+
+func TestUniqueConstraintNullAllowed(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, NULL)"); err != nil {
+		t.Fatalf("multiple NULLs should be allowed in unique index: %v", err)
+	}
+	result, err := s.Query(ctx, "SELECT COUNT(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "2" {
+		t.Fatalf("got %v rows, want 2", got)
+	}
+}
+
+func TestUniqueConstraintComposite(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, first_name VARCHAR(100), last_name VARCHAR(100), UNIQUE KEY idx_name (first_name, last_name))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice', 'Smith')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'Alice', 'Jones')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 'Bob', 'Smith')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (4, 'Alice', 'Smith')")
+	if err == nil {
+		t.Fatal("expected unique constraint violation on composite key, got nil")
+	}
+}
+
+func TestUniqueConstraintPersistsThroughReopen(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	err = s2.Exec(ctx, "INSERT INTO t VALUES (3, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("unique constraint not enforced after reopen")
+	}
+
+	if err := s2.Exec(ctx, "INSERT INTO t VALUES (3, 'charlie@example.com')"); err != nil {
+		t.Fatalf("valid insert failed after reopen: %v", err)
+	}
+}
+
+func TestUniqueConstraintCollation(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100) COLLATE utf8mb4_general_ci, UNIQUE KEY idx_name (name))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (2, 'alice')")
+	if err == nil {
+		t.Fatal("expected case-insensitive unique violation, got nil")
+	}
+}
+
+func TestUniqueConstraintDropIndex(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "DROP INDEX idx_email ON t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'alice@example.com')"); err != nil {
+		t.Fatalf("insert should succeed after DROP INDEX: %v", err)
+	}
+}
+
+func TestUniqueConstraintAlterTableAdd(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t ADD UNIQUE INDEX idx_email (email)"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (3, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("expected unique violation after ALTER TABLE ADD UNIQUE")
+	}
+}
+
+func TestUniqueConstraintAlterTableAddRejectsExistingDuplicates(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "ALTER TABLE t ADD UNIQUE INDEX idx_email (email)")
+	if err == nil {
+		t.Fatal("expected error adding unique index to table with duplicates")
+	}
+}
+
+func TestUniqueIndexJournalDDLPreservesData(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t ADD UNIQUE INDEX idx_name (name)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT COUNT(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "2" {
+		t.Fatalf("rows after ADD UNIQUE: got %s, want 2", got)
+	}
+}
+
+func TestUniqueDeleteThenInsertSameValue(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "DELETE FROM t WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'alice@example.com')"); err != nil {
+		t.Fatalf("insert after delete with same unique value should succeed: %v", err)
+	}
+}
+
+func TestUniqueIndexRollbackOnFailedStatement(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255) NOT NULL, UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This multi-row insert must fail because of NOT NULL violation on the second row.
+	err = tx.Exec(ctx, "INSERT INTO t VALUES (2, 'bob@example.com'), (3, NULL)")
+	if err == nil {
+		t.Fatal("multi-row insert with NULL in NOT NULL column should fail")
+	}
+	// Statement rolled back within the transaction — bob should not be stuck in the index.
+	// Duplicate alice within the same transaction: tests that ensureIndexEdits
+	// baseline was preserved through the rollback.
+	err = tx.Exec(ctx, "INSERT INTO t VALUES (4, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("unique violation on pre-existing value should still be enforced after rollback")
+	}
+	// Bob should be insertable since the failed statement was rolled back.
+	if err := tx.Exec(ctx, "INSERT INTO t VALUES (2, 'bob@example.com')"); err != nil {
+		t.Fatalf("insert after rolled-back statement should succeed: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUniqueAddColumnPreservesIndex(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t ADD COLUMN age INT FIRST"); err != nil {
+		t.Fatal(err)
+	}
+	// Unique constraint should still be on email, not the new column
+	err = s.Exec(ctx, "INSERT INTO t VALUES (NULL, 2, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("unique constraint should still apply after ADD COLUMN FIRST")
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (NULL, 2, 'bob@example.com')"); err != nil {
+		t.Fatalf("valid insert after ADD COLUMN FIRST failed: %v", err)
+	}
+}
+
+func TestUniqueDropIndexedColumnRejected(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "ALTER TABLE t DROP COLUMN email")
+	if err == nil {
+		t.Fatal("dropping indexed column should be rejected")
+	}
+}
+
+func TestUniqueConstraintNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (3, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("expected unique violation in native-git mode")
+	}
+}
+
+func TestUniqueConstraintNativeGitPersistence(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	err = s2.Exec(ctx, "INSERT INTO t VALUES (3, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("unique constraint not enforced after reopen in native-git mode")
+	}
+	if err := s2.Exec(ctx, "INSERT INTO t VALUES (3, 'charlie@example.com')"); err != nil {
+		t.Fatalf("valid insert failed after reopen: %v", err)
+	}
+}
+
+func TestUniqueConstraintNativeGitMultiTable(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t1 (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t1 VALUES (1, 'alice@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "CREATE TABLE t2 (id BIGINT PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+
+	if err := s2.Exec(ctx, "INSERT INTO t2 VALUES (1, 'test')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s2.Exec(ctx, "INSERT INTO t1 VALUES (2, 'alice@example.com')")
+	if err == nil {
+		t.Fatal("unique constraint on t1 lost after modifying t2")
+	}
+}
+
+func TestUniquePKChangeUpdatesIndexValue(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, email VARCHAR(255), UNIQUE KEY idx_email (email))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice@example.com'), (2, 'bob@example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "UPDATE t SET id = 10 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id FROM t WHERE email = 'alice@example.com'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(result.Rows))
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "10" {
+		t.Errorf("id after PK update = %v, want 10", got)
+	}
+}
+
+func TestUniqueModifyColumnTypeCollapse(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, code VARCHAR(10), UNIQUE KEY idx_code (code))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '01'), (2, '1')"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN code BIGINT")
+	if err == nil {
+		t.Fatal("type change that collapses unique values should be rejected")
+	}
+}
+
+func TestUniqueModifyColumnRejectionDoesNotCorruptCache(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	s1, _ := eng.NewSession()
+	if err := s1.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, code VARCHAR(10), UNIQUE KEY idx_code (code))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Exec(ctx, "INSERT INTO t VALUES (1, '01'), (2, '1')"); err != nil {
+		t.Fatal(err)
+	}
+	s1.Close()
+
+	s2, _ := eng.NewSession()
+	err = s2.Exec(ctx, "ALTER TABLE t MODIFY COLUMN code BIGINT")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	s2.Close()
+
+	s3, _ := eng.NewSession()
+	defer s3.Close()
+	result, err := s3.Query(ctx, "SELECT code FROM t WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "01" {
+		t.Fatalf("code after rejected ALTER = %q, want '01' — cache was corrupted", got)
+	}
+}
+
+func TestUniqueModifyColumnTypeRebuildIndex(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, val VARCHAR(10), UNIQUE KEY idx_val (val))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, '100'), (2, '200')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN val BIGINT"); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (3, 100)")
+	if err == nil {
+		t.Fatal("unique constraint should still enforce after type change")
+	}
+}
+
+func TestUniqueJournalCheckpointWithDDL(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err := eng.Checkpoint(ctx, "initial data"); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, _ := eng.NewSession()
+	if err := s2.Exec(ctx, "ALTER TABLE t ADD UNIQUE INDEX idx_name (name)"); err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+	if _, err := eng.Checkpoint(ctx, "add unique index"); err != nil {
+		t.Fatal(err)
+	}
+	eng.Close()
+
+	eng3, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng3.Close()
+	s3, _ := eng3.NewSession()
+	defer s3.Close()
+
+	result, err := s3.Query(ctx, "SELECT COUNT(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(result.Rows[0][0]); got != "2" {
+		t.Fatalf("rows lost after checkpoint with DDL: got %s, want 2", got)
+	}
+	err = s3.Exec(ctx, "INSERT INTO t VALUES (3, 'Alice')")
+	if err == nil {
+		t.Fatal("unique constraint not enforced after checkpoint")
+	}
+}
+
 func gitRepository(t testing.TB) string {
 	t.Helper()
 	root := t.TempDir()

@@ -291,7 +291,7 @@ func (w *WorkingState) Diff(ctx context.Context) ([]TableChange, error) {
 			change = "added"
 		case !afterOK:
 			change = "deleted"
-		case before == after:
+		case before.Equal(after):
 			continue
 		}
 		changes = append(changes, TableChange{Table: name, Change: change})
@@ -456,7 +456,9 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 			cache.mu.Lock()
 			cache.data[schemaHash] = append([]byte(nil), te.Schema...)
 			cache.mu.Unlock()
-			manifest.Tables[te.Table] = Table{SchemaRoot: schemaHash}
+			existing := manifest.Tables[te.Table]
+			existing.SchemaRoot = schemaHash
+			manifest.Tables[te.Table] = existing
 		}
 		for _, re := range te.Edits {
 			entry.rows[string(re.Key)] = re
@@ -478,7 +480,7 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 	manifest.Objects = objects
 	snapshotEdits := make(map[string]map[string]TypedRowEdit, len(pending))
 	for name, te := range pending {
-		if len(te.rows) > 0 {
+		if len(te.rows) > 0 || te.schemaData != nil {
 			rows := make(map[string]TypedRowEdit, len(te.rows))
 			for k, v := range te.rows {
 				rows[k] = v

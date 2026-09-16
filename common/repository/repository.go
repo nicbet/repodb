@@ -73,8 +73,24 @@ func (e *CommitError) Error() string {
 func (e *CommitError) Unwrap() error { return e.Err }
 
 type Table struct {
-	SchemaRoot storage.Hash `json:"schema_root,omitempty"`
-	DataRoot   storage.Hash `json:"data_root,omitempty"`
+	SchemaRoot storage.Hash            `json:"schema_root,omitempty"`
+	DataRoot   storage.Hash            `json:"data_root,omitempty"`
+	Indexes    map[string]storage.Hash  `json:"indexes,omitempty"`
+}
+
+func (t Table) Equal(other Table) bool {
+	if t.SchemaRoot != other.SchemaRoot || t.DataRoot != other.DataRoot {
+		return false
+	}
+	if len(t.Indexes) != len(other.Indexes) {
+		return false
+	}
+	for name, hash := range t.Indexes {
+		if other.Indexes[name] != hash {
+			return false
+		}
+	}
+	return true
 }
 
 // Manifest is the authoritative catalog stored in every data commit. Objects is

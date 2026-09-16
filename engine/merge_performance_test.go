@@ -76,10 +76,10 @@ func TestMergeRetainsSelectedRootsAndReusesLoadedSnapshots(t *testing.T) {
 	if got := repodbgit.ProcessCount(); got != 0 {
 		t.Fatalf("merge construction and computation launched %d Git processes", got)
 	}
-	if manifest.Tables["stable"] != local.Manifest.Tables["stable"] {
+	if !manifest.Tables["stable"].Equal(local.Manifest.Tables["stable"]) {
 		t.Fatal("unchanged local table roots were rebuilt")
 	}
-	if manifest.Tables["remote_only"] != remote.Manifest.Tables["remote_only"] {
+	if !manifest.Tables["remote_only"].Equal(remote.Manifest.Tables["remote_only"]) {
 		t.Fatal("remote-selected table roots were rebuilt")
 	}
 	if err := writer.RetainOnly(hashes); err != nil {
@@ -89,7 +89,7 @@ func TestMergeRetainsSelectedRootsAndReusesLoadedSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if merged.Manifest.Tables["stable"] != local.Manifest.Tables["stable"] || merged.Manifest.Tables["remote_only"] != remote.Manifest.Tables["remote_only"] {
+	if !merged.Manifest.Tables["stable"].Equal(local.Manifest.Tables["stable"]) || !merged.Manifest.Tables["remote_only"].Equal(remote.Manifest.Tables["remote_only"]) {
 		t.Fatal("published snapshot did not retain selected roots")
 	}
 	if err := engine.ValidateSnapshot(ctx, merged); err != nil {
@@ -165,7 +165,7 @@ func TestPointLookupAndDirtyTableWorkAreBounded(t *testing.T) {
 	if counters.TablesRebuilt != 1 || counters.TablesReused != 1 || counters.UndoRowsCaptured != 1 || counters.RowsDecoded != 0 {
 		t.Fatalf("bounded update counters = %#v", counters)
 	}
-	if after.Manifest.Tables["stable"] != before.Manifest.Tables["stable"] {
+	if !after.Manifest.Tables["stable"].Equal(before.Manifest.Tables["stable"]) {
 		t.Fatal("updating one table rebuilt an unchanged table")
 	}
 
