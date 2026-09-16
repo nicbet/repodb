@@ -193,8 +193,11 @@ Go application          MySQL client
   inspectable across restarts.
 
 The current SQL scope supports one database namespace, explicit primary keys,
-basic DDL/DML, and a limited set of persisted types. Secondary indexes,
-auto-increment, foreign keys, and `ALTER TABLE` are not yet supported.
+DDL/DML (including `ALTER TABLE`), secondary indexes (unique and non-unique),
+`CHECK` constraints, `DEFAULT` values, and collation-aware string comparisons.
+Persisted types include integers, floats, `TEXT`, `BLOB`, `BOOL`, `ENUM`,
+`DECIMAL`/`NUMERIC`, `JSON`, `DATE`, `TIME`, `DATETIME`, and `TIMESTAMP`.
+Auto-increment and foreign keys are not yet supported.
 
 | Documentation | Covers |
 | --- | --- |
@@ -209,8 +212,10 @@ auto-increment, foreign keys, and `ALTER TABLE` are not yet supported.
 ## Roadmap
 
 - [x] **M0-M4:** Git storage, persistent SQL, sync, merging, journal persistence, and performance optimization.
-- [ ] **M5:** CLI completion (`commit`, `diff`), example applications, and tool-author validation.
-- [ ] **M6:** Broader SQL compatibility, secondary indexes, and operational hardening.
+- [x] **M5 (partial):** Example applications and tool-author validation.
+- [ ] **M5 (remaining):** CLI completion (`commit`, `diff`).
+- [x] **M6 (partial):** Secondary indexes, `ALTER TABLE`, expanded types and constraints, collation-aware comparisons.
+- [ ] **M6 (remaining):** Auto-increment, foreign keys, and operational hardening.
 
 See [the implementation plan](docs/plan.md) for milestone scope and acceptance criteria.
 
