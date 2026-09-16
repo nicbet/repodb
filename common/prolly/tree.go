@@ -435,6 +435,17 @@ func (t *Tree) Iterator(ctx context.Context) (*Iterator, error) {
 	return it, nil
 }
 
+// IteratorFrom returns a lazy ordered iterator positioned at the first entry
+// whose key is >= startKey. If no such entry exists the iterator is immediately
+// done.
+func (t *Tree) IteratorFrom(ctx context.Context, startKey []byte) (*Iterator, error) {
+	it := &Iterator{ctx: ctx, store: t.store}
+	if err := it.seekTo(t.root, startKey); err != nil {
+		return nil, err
+	}
+	return it, nil
+}
+
 // Next returns the next entry, or ok=false at end of input. Returned bytes are
 // owned by the caller and remain valid after subsequent calls.
 func (it *Iterator) Next() (entry Entry, ok bool, err error) {
@@ -484,6 +495,37 @@ func (it *Iterator) descend(hash storage.Hash) error {
 		}
 		it.stack = append(it.stack, iteratorFrame{node: n, next: 1})
 		hash = n.Children[0].Hash
+	}
+}
+
+func (it *Iterator) seekTo(hash storage.Hash, startKey []byte) error {
+	for {
+		n, err := readNode(it.ctx, it.store, hash)
+		if err != nil {
+			return err
+		}
+		if n.Level == 0 {
+			i := sort.Search(len(n.Entries), func(i int) bool {
+				return bytes.Compare(n.Entries[i].Key, startKey) >= 0
+			})
+			if i == len(n.Entries) {
+				return it.advance()
+			}
+			it.leaf, it.index = n.Entries, i
+			return nil
+		}
+		if len(n.Children) == 0 {
+			return fmt.Errorf("invalid internal Prolly node %s", hash)
+		}
+		i := sort.Search(len(n.Children), func(i int) bool {
+			return bytes.Compare(n.Children[i].MaxKey, startKey) >= 0
+		})
+		if i == len(n.Children) {
+			it.done = true
+			return nil
+		}
+		it.stack = append(it.stack, iteratorFrame{node: n, next: i + 1})
+		hash = n.Children[i].Hash
 	}
 }
 

@@ -206,3 +206,232 @@ func TestApplyDistantEditsMatchesCanonicalBuild(t *testing.T) {
 		t.Fatalf("roots differ: got %s want %s", got.Root(), want.Root())
 	}
 }
+
+func TestIteratorFromExactKey(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := make([]prolly.Entry, 300)
+	for i := range entries {
+		entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%04d", i)), Value: []byte(fmt.Sprintf("val-%04d", i))}
+	}
+	tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := tree.IteratorFrom(ctx, []byte("key-0150"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	entry, ok, err := it.Next()
+	if err != nil || !ok {
+		t.Fatalf("expected entry, got ok=%v err=%v", ok, err)
+	}
+	if string(entry.Key) != "key-0150" {
+		t.Fatalf("got key %q, want key-0150", entry.Key)
+	}
+	if string(entry.Value) != "val-0150" {
+		t.Fatalf("got value %q, want val-0150", entry.Value)
+	}
+}
+
+func TestIteratorFromBetweenKeys(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := make([]prolly.Entry, 100)
+	for i := range entries {
+		entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%04d", i*2)), Value: []byte(fmt.Sprintf("val-%04d", i*2))}
+	}
+	tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := tree.IteratorFrom(ctx, []byte("key-0099"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	entry, ok, err := it.Next()
+	if err != nil || !ok {
+		t.Fatalf("expected entry, got ok=%v err=%v", ok, err)
+	}
+	if string(entry.Key) != "key-0100" {
+		t.Fatalf("got key %q, want key-0100", entry.Key)
+	}
+}
+
+func TestIteratorFromPastEnd(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := []prolly.Entry{
+		{Key: []byte("aaa"), Value: []byte("1")},
+		{Key: []byte("bbb"), Value: []byte("2")},
+	}
+	tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := tree.IteratorFrom(ctx, []byte("zzz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	_, ok, err := it.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected done, got entry")
+	}
+}
+
+func TestIteratorFromEmptyTree(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	tree, err := prolly.Build(ctx, store, nil, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := tree.IteratorFrom(ctx, []byte("anything"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	_, ok, err := it.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected done on empty tree")
+	}
+}
+
+func TestIteratorFromEmptyStart(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := make([]prolly.Entry, 50)
+	for i := range entries {
+		entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%04d", i)), Value: []byte(fmt.Sprintf("val-%04d", i))}
+	}
+	tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := tree.IteratorFrom(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	entry, ok, err := it.Next()
+	if err != nil || !ok {
+		t.Fatalf("expected entry, got ok=%v err=%v", ok, err)
+	}
+	if string(entry.Key) != "key-0000" {
+		t.Fatalf("got key %q, want key-0000", entry.Key)
+	}
+}
+
+func TestIteratorFromSingleEntry(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	tree, err := prolly.Build(ctx, store, []prolly.Entry{
+		{Key: []byte("only"), Value: []byte("one")},
+	}, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := tree.IteratorFrom(ctx, []byte("only"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	entry, ok, err := it.Next()
+	if err != nil || !ok {
+		t.Fatalf("expected entry, got ok=%v err=%v", ok, err)
+	}
+	if string(entry.Key) != "only" || string(entry.Value) != "one" {
+		t.Fatalf("got %q/%q", entry.Key, entry.Value)
+	}
+	_, ok, _ = it.Next()
+	if ok {
+		t.Fatal("expected done after single entry")
+	}
+}
+
+func TestIteratorFromWalksRemainingEntries(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := make([]prolly.Entry, 300)
+	for i := range entries {
+		entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%04d", i)), Value: []byte(fmt.Sprintf("val-%04d", i))}
+	}
+	tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startAt := 200
+	it, err := tree.IteratorFrom(ctx, []byte(fmt.Sprintf("key-%04d", startAt)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	count := 0
+	for {
+		entry, ok, err := it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		want := fmt.Sprintf("key-%04d", startAt+count)
+		if string(entry.Key) != want {
+			t.Fatalf("entry %d: got key %q, want %q", count, entry.Key, want)
+		}
+		count++
+	}
+	if count != 300-startAt {
+		t.Fatalf("got %d entries, want %d", count, 300-startAt)
+	}
+}
+
+func TestIteratorFromPrefixScanPattern(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	entries := []prolly.Entry{
+		{Key: []byte("user-001-email"), Value: []byte("a@b.com")},
+		{Key: []byte("user-001-name"), Value: []byte("Alice")},
+		{Key: []byte("user-001-role"), Value: []byte("admin")},
+		{Key: []byte("user-002-email"), Value: []byte("b@c.com")},
+		{Key: []byte("user-002-name"), Value: []byte("Bob")},
+		{Key: []byte("user-003-email"), Value: []byte("c@d.com")},
+	}
+	tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := []byte("user-001-")
+	it, err := tree.IteratorFrom(ctx, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	var matched []string
+	for {
+		entry, ok, err := it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		if len(entry.Key) < len(prefix) || string(entry.Key[:len(prefix)]) != string(prefix) {
+			break
+		}
+		matched = append(matched, string(entry.Key))
+	}
+	if len(matched) != 3 {
+		t.Fatalf("got %d matches %v, want 3", len(matched), matched)
+	}
+}
