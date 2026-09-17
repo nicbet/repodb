@@ -73,6 +73,22 @@ Resolution choices are `local`, `remote`, `base`, and `delete`. See the
 source branches according to your Git configuration. A successful SQL write is
 durable locally and does not imply that the remote has received it.
 
+## CLI commands
+
+| Command | Description |
+| --- | --- |
+| `repodb init [path]` | Initialize a RepoDB data namespace in a Git repository |
+| `repodb start` | Start a MySQL-compatible server (`--addr`, `--persistence`) |
+| `repodb sql '<statement>'` | Execute a SQL statement against a running server (`--addr`, `--database`) |
+| `repodb status` | Show the data head, format version, object/table counts, and working state |
+| `repodb diff` | Show uncommitted data changes (table-level change list) |
+| `repodb commit -m '<msg>'` | Checkpoint working data into a Git data commit |
+| `repodb enable` | Set up sync for a remote (`--remote`); safe to repeat |
+| `repodb sync` | Fetch and publish data history, merging independent edits (`--remote`) |
+| `repodb conflicts` | List unresolved merge conflicts after a sync (`--remote`) |
+| `repodb resolve` | Resolve a conflict (`--id`, `--take local\|remote\|base\|delete`) |
+| `repodb import-legacy [path]` | Import data from the legacy `.repodb` storage format |
+
 ## Embedded use
 
 For Go applications, add the module and use the engine directly:
@@ -212,8 +228,7 @@ Auto-increment and foreign keys are not yet supported.
 ## Roadmap
 
 - [x] **M0-M4:** Git storage, persistent SQL, sync, merging, journal persistence, and performance optimization.
-- [x] **M5 (partial):** Example applications and tool-author validation.
-- [ ] **M5 (remaining):** CLI completion (`commit`, `diff`).
+- [x] **M5:** CLI commands, example applications, and tool-author validation.
 - [x] **M6 (partial):** Secondary indexes, `ALTER TABLE`, expanded types and constraints, collation-aware comparisons.
 - [ ] **M6 (remaining):** Auto-increment, foreign keys, and operational hardening.
 
