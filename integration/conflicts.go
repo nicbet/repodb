@@ -43,10 +43,11 @@ func (s ConflictSet) Unresolved() []engine.MergeConflict {
 }
 
 func Conflicts(ctx context.Context, start, remote string) (ConflictSet, error) {
-	if _, err := requireRemote(remote); err != nil {
+	_, info, remote, _, err := resolveRemote(ctx, start, remote)
+	if err != nil {
 		return ConflictSet{}, err
 	}
-	repo, err := repository.Discover(ctx, start)
+	repo, err := repository.Discover(ctx, info.TopLevel)
 	if err != nil {
 		return ConflictSet{}, err
 	}
@@ -56,13 +57,14 @@ func Conflicts(ctx context.Context, start, remote string) (ConflictSet, error) {
 // Resolve records one durable whole-row or whole-schema choice. Once all
 // conflicts have choices, it resumes synchronization using the recorded heads.
 func Resolve(ctx context.Context, start, remote, id string, choice engine.Resolution) (Status, error) {
-	if _, err := requireRemote(remote); err != nil {
+	_, info, remote, _, err := resolveRemote(ctx, start, remote)
+	if err != nil {
 		return Status{}, err
 	}
 	if choice != engine.TakeBase && choice != engine.TakeLocal && choice != engine.TakeRemote && choice != engine.TakeDelete {
 		return Status{}, fmt.Errorf("invalid resolution %q", choice)
 	}
-	repo, err := repository.Discover(ctx, start)
+	repo, err := repository.Discover(ctx, info.TopLevel)
 	if err != nil {
 		return Status{}, err
 	}

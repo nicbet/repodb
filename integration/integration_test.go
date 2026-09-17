@@ -423,6 +423,142 @@ func TestEnableRejectsInvalidFetchedSQLGraph(t *testing.T) {
 	}
 }
 
+func TestResolveRemoteFromConfig(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	clone := filepath.Join(root, "clone")
+	git(t, root, "init", "--bare", remote)
+	git(t, root, "init", "--quiet", "-b", "main", clone)
+	if err := os.WriteFile(filepath.Join(clone, "README.md"), []byte("source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, clone, "add", "README.md")
+	git(t, clone, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "source")
+	git(t, clone, "remote", "add", "origin", remote)
+	git(t, clone, "push", "origin", "main")
+
+	t.Run("missing config and no flag returns ErrRemoteRequired", func(t *testing.T) {
+		if _, err := integration.Sync(ctx, clone, ""); !errors.Is(err, integration.ErrRemoteRequired) {
+			t.Fatalf("expected ErrRemoteRequired, got %v", err)
+		}
+	})
+
+	if _, err := integration.Enable(ctx, clone, "origin"); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("sync falls back to config", func(t *testing.T) {
+		status, err := integration.Sync(ctx, clone, "")
+		if err != nil {
+			t.Fatalf("sync with config fallback: %v", err)
+		}
+		if status.Remote != "origin" {
+			t.Fatalf("remote = %q, want %q", status.Remote, "origin")
+		}
+	})
+
+	t.Run("explicit flag overrides config", func(t *testing.T) {
+		upstream := filepath.Join(root, "upstream.git")
+		git(t, root, "init", "--bare", upstream)
+		git(t, clone, "remote", "add", "upstream", upstream)
+		if _, err := integration.Enable(ctx, clone, "upstream"); err != nil {
+			t.Fatal(err)
+		}
+		status, err := integration.Sync(ctx, clone, "origin")
+		if err != nil {
+			t.Fatalf("sync with explicit flag: %v", err)
+		}
+		if status.Remote != "origin" {
+			t.Fatalf("remote = %q, want %q", status.Remote, "origin")
+		}
+	})
+
+	t.Run("conflicts falls back to config", func(t *testing.T) {
+		_, err := integration.Conflicts(ctx, clone, "")
+		if !errors.Is(err, integration.ErrNoConflicts) {
+			t.Fatalf("expected ErrNoConflicts, got %v", err)
+		}
+	})
+
+	t.Run("resolve falls back to config", func(t *testing.T) {
+		// Restore config to origin (the "explicit flag overrides" subtest
+		// switched it to upstream).
+		if _, err := integration.Enable(ctx, clone, "origin"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Set up a second clone so we can create a real row conflict.
+		other := filepath.Join(root, "other")
+		git(t, root, "clone", "--quiet", remote, other)
+		if _, err := integration.Enable(ctx, other, "origin"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Both sides create a table and push from clone first.
+		engClone, err := engine.OpenWithOptions(ctx, clone, engine.Options{Persistence: engine.PersistenceNativeGit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer engClone.Close()
+		sClone, _ := engClone.NewSession()
+		if err := sClone.Exec(ctx, "CREATE TABLE cfg (id BIGINT PRIMARY KEY, v TEXT NOT NULL)"); err != nil {
+			t.Fatal(err)
+		}
+		if err := sClone.Exec(ctx, "INSERT INTO cfg VALUES (1, 'base')"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := integration.Sync(ctx, clone, ""); err != nil {
+			t.Fatal(err)
+		}
+
+		// Other side pulls, then both diverge on the same row.
+		if _, err := integration.Sync(ctx, other, "origin"); err != nil {
+			t.Fatal(err)
+		}
+		engOther, err := engine.OpenWithOptions(ctx, other, engine.Options{Persistence: engine.PersistenceNativeGit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer engOther.Close()
+		sOther, _ := engOther.NewSession()
+		if err := sClone.Exec(ctx, "UPDATE cfg SET v = 'clone-side' WHERE id = 1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := sOther.Exec(ctx, "UPDATE cfg SET v = 'other-side' WHERE id = 1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := integration.Sync(ctx, clone, ""); err != nil {
+			t.Fatal(err)
+		}
+
+		// other sync → conflict
+		_, err = integration.Sync(ctx, other, "origin")
+		var conflictErr *integration.MergeConflictError
+		if !errors.As(err, &conflictErr) || len(conflictErr.Set.Unresolved()) == 0 {
+			t.Fatalf("expected conflict, got %v", err)
+		}
+
+		// Resolve with empty remote — should fall back to config.
+		status, err := integration.Resolve(ctx, other, "", conflictErr.Set.Unresolved()[0].ID, engine.TakeLocal)
+		if err != nil {
+			t.Fatalf("resolve with config fallback: %v", err)
+		}
+		if status.Remote != "origin" {
+			t.Fatalf("remote = %q, want %q", status.Remote, "origin")
+		}
+		if status.Action != "merged" {
+			t.Fatalf("action = %q, want %q", status.Action, "merged")
+		}
+	})
+
+	t.Run("enable still requires explicit remote", func(t *testing.T) {
+		if _, err := integration.Enable(ctx, clone, ""); !errors.Is(err, integration.ErrRemoteRequired) {
+			t.Fatalf("expected ErrRemoteRequired, got %v", err)
+		}
+	})
+}
+
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

@@ -110,12 +110,7 @@ func Enable(ctx context.Context, start, remote string) (Status, error) {
 }
 
 func Sync(ctx context.Context, start, remote string) (Status, error) {
-	tracking, err := requireRemote(remote)
-	if err != nil {
-		return Status{}, err
-	}
-	cli := repodbgit.CLI{}
-	info, err := cli.Discover(ctx, start)
+	cli, info, remote, tracking, err := resolveRemote(ctx, start, remote)
 	if err != nil {
 		return Status{}, err
 	}
@@ -372,6 +367,30 @@ func requireRemote(remote string) (string, error) {
 		return "", ErrRemoteRequired
 	}
 	return TrackingRef(remote)
+}
+
+func resolveRemote(ctx context.Context, start, explicit string) (repodbgit.CLI, repodbgit.RepositoryInfo, string, string, error) {
+	cli := repodbgit.CLI{}
+	info, err := cli.Discover(ctx, start)
+	if err != nil {
+		return cli, info, "", "", err
+	}
+	remote := explicit
+	if remote == "" {
+		values, err := cli.ConfigValues(ctx, info.TopLevel, "repodb.remote")
+		if err != nil {
+			return cli, info, "", "", err
+		}
+		if len(values) != 1 {
+			return cli, info, "", "", ErrRemoteRequired
+		}
+		remote = values[0]
+	}
+	tracking, err := TrackingRef(remote)
+	if err != nil {
+		return cli, info, "", "", err
+	}
+	return cli, info, remote, tracking, nil
 }
 
 func fetch(ctx context.Context, cli repodbgit.CLI, root, remote, tracking string) (string, bool, error) {

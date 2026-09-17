@@ -47,7 +47,7 @@ From a Git repository with a configured remote:
 
 ```sh
 repodb enable --remote origin
-repodb sync --remote origin
+repodb sync
 ```
 
 `enable` adopts existing remote database history or initializes an empty catalog if neither side has one. It is safe to repeat and does not start a server. On a fresh clone, run `enable` before creating a separate local database with `init`.
