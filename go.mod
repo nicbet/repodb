@@ -7,7 +7,8 @@ require (
 	github.com/dolthub/vitess v0.0.0-20250512224608-8fb9c6ea092c
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/shopspring/decimal v1.3.1
-	golang.org/x/sys v0.12.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/term v0.46.0
 )
 
 require (

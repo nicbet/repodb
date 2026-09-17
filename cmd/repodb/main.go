@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"github.com/nicbet/repodb/engine"
 	"github.com/nicbet/repodb/integration"
 	repodbserver "github.com/nicbet/repodb/server"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -152,6 +154,11 @@ func run(ctx context.Context, args []string) error {
 		if err := set.Parse(args[1:]); err != nil {
 			return err
 		}
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			if err := promptCheckpointIfDirty(ctx, *repoPath); err != nil {
+				return err
+			}
+		}
 		status, err := integration.Sync(ctx, *repoPath, *remote)
 		if err != nil {
 			if status.LocalHead != "" || status.RemoteHead != "" {
@@ -236,6 +243,38 @@ func conflictValue(present bool, value []byte) string {
 		return "<absent>"
 	}
 	return string(value)
+}
+
+func promptCheckpointIfDirty(ctx context.Context, repoPath string) error {
+	repo, err := repository.Open(ctx, repoPath)
+	if err != nil {
+		return err
+	}
+	working, _ := repository.OpenWorkingState(repo)
+	if !working.Exists() {
+		return nil
+	}
+	ws, err := working.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if !ws.Dirty {
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "Journal has uncommitted changes at generation %d. Checkpoint before syncing? [y/N] ", ws.Generation)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", integration.ErrWorkingDirty, ws.Generation)
+	}
+	if answer := strings.TrimSpace(line); answer != "y" && answer != "Y" {
+		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", integration.ErrWorkingDirty, ws.Generation)
+	}
+	result, err := working.Checkpoint(ctx, "checkpoint before sync")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "RepoDB data commit: %s\n", result.Commit)
+	return nil
 }
 
 func runSQL(ctx context.Context, args []string) error {
