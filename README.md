@@ -52,14 +52,16 @@ repodb sync
 
 `enable` adopts existing remote database history or initializes an empty catalog if neither side has one. It is safe to repeat and does not start a server. On a fresh clone, run `enable` before creating a separate local database with `init`.
 
-`sync` fetches and publishes database changes, merging independent row edits. Competing edits are preserved for explicit resolution:
+`sync` fetches and publishes database changes, merging independent row edits. If the journal has uncommitted changes, `sync` prompts to checkpoint before proceeding. Competing edits are preserved for explicit resolution:
 
 ```sh
-repodb conflicts --remote origin
-repodb resolve --remote origin --id '<conflict-id>' --take local
+repodb conflicts
+repodb resolve --id '<conflict-id>' --take local
 ```
 
 Resolution choices are `local`, `remote`, `base`, and `delete`. See the [merge guide](docs/merge-m4.md) for row and schema conflict behavior.
+
+After `enable`, all sync commands default to the configured remote. Pass `--remote` only to override.
 
 **Use `repodb sync` to share database changes.** Ordinary `git push` publishes source branches according to your Git configuration. A successful SQL write is durable locally and does not imply that the remote has received it.
 
@@ -74,8 +76,8 @@ Resolution choices are `local`, `remote`, `base`, and `delete`. See the [merge g
 | `repodb diff`                 | Show uncommitted data changes (table-level change list)                    |
 | `repodb commit -m '<msg>'`    | Checkpoint working data into a Git data commit                             |
 | `repodb enable`               | Set up sync for a remote (`--remote`); safe to repeat                      |
-| `repodb sync`                 | Fetch and publish data history, merging independent edits (`--remote`)     |
-| `repodb conflicts`            | List unresolved merge conflicts after a sync (`--remote`)                  |
+| `repodb sync`                 | Fetch and publish data history; prompts to checkpoint uncommitted changes  |
+| `repodb conflicts`            | List unresolved merge conflicts after a sync                               |
 | `repodb resolve`              | Resolve a conflict (`--id`, `--take local\|remote\|base\|delete`)          |
 | `repodb import-legacy [path]` | Import data from the legacy `.repodb` storage format                       |
 
