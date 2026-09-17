@@ -2,46 +2,43 @@
 
 ![RepoDB Banner](docs/banner.png)
 
-RepoDB is an embedded SQL database for Go that stores and synchronizes
-application data in Git, with an optional MySQL-compatible server.
+RepoDB is an embedded SQL database for Go that stores and synchronizes application data in Git, with an optional MySQL-compatible server.
 
-Build agent tools, issue trackers, and dashboards whose data travels with a
-repository. Write data locally, work offline, and synchronize across clones.
-SQL transactions are durable immediately; data history is checkpointed to Git
-when you choose. Source files, index, and code branches are never touched.
+Build agent tools, issue trackers, and dashboards whose data travels with a repository. Write data locally, work offline, and synchronize across clones. SQL transactions are durable immediately; data history is checkpointed to Git when you choose. Source files, index, and code branches are never touched.
 
-**Early development:** persistent SQL, synchronization, and three-way merging
-are implemented and benchmarked. The current scope is small tool databases with
-a documented [SQL subset](docs/sql-m2.md); broader compatibility and scaling
-are on the roadmap. See the [scorecard](docs/benchmark.md) for measured
-latency against MySQL 8 and Dolt.
+**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. The current scope is small tool databases with a documented [SQL subset](docs/sql-m2.md); broader compatibility and scaling are on the roadmap. See the [scorecard](docs/benchmark.md) for measured latency against MySQL 8 and Dolt.
 
 ## Quickstart
 
-After [installing RepoDB](#installation), create a local demo repository and
-start the server:
+After [installing RepoDB](#installation), create a local demo repository and start the server:
 
 ```sh
-git init repodb-demo
+# Create demo directory and initialize git
+mkdir repodb-demo
 cd repodb-demo
+git init
+
+# Initialize repodb refs
 repodb init
+
+# Start the SQL server
 repodb start
 ```
 
-In a second terminal, create a table and query it:
-
-```sh
-repodb sql 'CREATE TABLE issues (id BIGINT PRIMARY KEY, title TEXT NOT NULL)'
-repodb sql "INSERT INTO issues VALUES (1, 'Ship the first version')"
-repodb sql 'SELECT * FROM issues'
-```
-
-Writes persist automatically. Stop and restart the server to read the same
-data. The server listens on `127.0.0.1:3306` by default; any MySQL client
-works:
+The server listens on `127.0.0.1:3306` by default; any MySQL client works:
 
 ```sh
 mysql --host=127.0.0.1 --port=3306 --user=root repodb
+```
+
+Writes persist automatically. Stop and restart the server to read the same data.
+
+You can also use the `repodb sql` command directly. In a second terminal, create a table and query it:
+
+```sh
+repodb sql 'CREATE TABLE greetings (id BIGINT PRIMARY KEY, title TEXT NOT NULL)'
+repodb sql "INSERT INTO greetings VALUES (1, 'Hello from RepoDB!')"
+repodb sql 'SELECT * FROM greetings'
 ```
 
 ### Synchronize an existing project
@@ -53,41 +50,34 @@ repodb enable --remote origin
 repodb sync --remote origin
 ```
 
-`enable` adopts existing remote database history or initializes an empty
-catalog if neither side has one. It is safe to repeat and does not start a
-server. On a fresh clone, run `enable` before creating a separate local
-database with `init`.
+`enable` adopts existing remote database history or initializes an empty catalog if neither side has one. It is safe to repeat and does not start a server. On a fresh clone, run `enable` before creating a separate local database with `init`.
 
-`sync` fetches and publishes database changes, merging independent row edits.
-Competing edits are preserved for explicit resolution:
+`sync` fetches and publishes database changes, merging independent row edits. Competing edits are preserved for explicit resolution:
 
 ```sh
 repodb conflicts --remote origin
 repodb resolve --remote origin --id '<conflict-id>' --take local
 ```
 
-Resolution choices are `local`, `remote`, `base`, and `delete`. See the
-[merge guide](docs/merge-m4.md) for row and schema conflict behavior.
+Resolution choices are `local`, `remote`, `base`, and `delete`. See the [merge guide](docs/merge-m4.md) for row and schema conflict behavior.
 
-**Use `repodb sync` to share database changes.** Ordinary `git push` publishes
-source branches according to your Git configuration. A successful SQL write is
-durable locally and does not imply that the remote has received it.
+**Use `repodb sync` to share database changes.** Ordinary `git push` publishes source branches according to your Git configuration. A successful SQL write is durable locally and does not imply that the remote has received it.
 
 ## CLI commands
 
-| Command | Description |
-| --- | --- |
-| `repodb init [path]` | Initialize a RepoDB data namespace in a Git repository |
-| `repodb start` | Start a MySQL-compatible server (`--addr`, `--persistence`) |
-| `repodb sql '<statement>'` | Execute a SQL statement against a running server (`--addr`, `--database`) |
-| `repodb status` | Show the data head, format version, object/table counts, and working state |
-| `repodb diff` | Show uncommitted data changes (table-level change list) |
-| `repodb commit -m '<msg>'` | Checkpoint working data into a Git data commit |
-| `repodb enable` | Set up sync for a remote (`--remote`); safe to repeat |
-| `repodb sync` | Fetch and publish data history, merging independent edits (`--remote`) |
-| `repodb conflicts` | List unresolved merge conflicts after a sync (`--remote`) |
-| `repodb resolve` | Resolve a conflict (`--id`, `--take local\|remote\|base\|delete`) |
-| `repodb import-legacy [path]` | Import data from the legacy `.repodb` storage format |
+| Command                       | Description                                                                |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `repodb init [path]`          | Initialize a RepoDB data namespace in a Git repository                     |
+| `repodb start`                | Start a MySQL-compatible server (`--addr`, `--persistence`)                |
+| `repodb sql '<statement>'`    | Execute a SQL statement against a running server (`--addr`, `--database`)  |
+| `repodb status`               | Show the data head, format version, object/table counts, and working state |
+| `repodb diff`                 | Show uncommitted data changes (table-level change list)                    |
+| `repodb commit -m '<msg>'`    | Checkpoint working data into a Git data commit                             |
+| `repodb enable`               | Set up sync for a remote (`--remote`); safe to repeat                      |
+| `repodb sync`                 | Fetch and publish data history, merging independent edits (`--remote`)     |
+| `repodb conflicts`            | List unresolved merge conflicts after a sync (`--remote`)                  |
+| `repodb resolve`              | Resolve a conflict (`--id`, `--take local\|remote\|base\|delete`)          |
+| `repodb import-legacy [path]` | Import data from the legacy `.repodb` storage format                       |
 
 ## Embedded use
 
@@ -110,17 +100,11 @@ session.Exec(ctx, "INSERT INTO events VALUES (?, ?)", 1, payload)
 result, _ := session.Query(ctx, "SELECT data FROM events WHERE id = ?", 1)
 ```
 
-The engine defaults to journal persistence: SQL commits are durable
-immediately in a local journal, without creating a Git snapshot per
-transaction. Call `engine.Checkpoint` to publish accumulated changes to Git
-history, then `integration.Sync` to exchange them with a remote. No server
-process, no background service.
+The engine defaults to journal persistence: SQL commits are durable immediately in a local journal, without creating a Git snapshot per transaction. Call `engine.Checkpoint` to publish accumulated changes to Git history, then `integration.Sync` to exchange them with a remote. No server process, no background service.
 
 ## Installation
 
-Build from source with **Go 1.27 or newer**, Git, and Make. The current
-implementation requires POSIX file locking; the documented baseline uses macOS
-and Git 2.55. See [storage and durability assumptions](docs/storage-format.md).
+Build from source with **Go 1.27 or newer**, Git, and Make. The current implementation requires POSIX file locking; the documented baseline uses macOS and Git 2.55. See [storage and durability assumptions](docs/storage-format.md).
 
 ```sh
 git clone https://github.com/nicbet/repodb.git
@@ -138,24 +122,19 @@ go install github.com/nicbet/repodb/cmd/repodb-server@latest
 
 ## Performance
 
-Journal-mode point reads are sub-millisecond; single-row writes take ~5 ms
-(one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the
-journal appends one record regardless of batch size.
+Journal-mode point reads are sub-millisecond; single-row writes take ~5 ms (one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the journal appends one record regardless of batch size.
 
-| Workload (50k rows) | MySQL 8 | Dolt | RepoDB Journal |
-| --- | ---: | ---: | ---: |
-| Point read | 0.23 ms | 0.39 ms | 0.11 ms |
-| Read tx (10 reads) | 6.5 ms | 7.5 ms | 0.77 ms |
-| Update x1 | 1.3 ms | 1.7 ms | 5.0 ms |
-| Update x100 | 59 ms | 80 ms | 7.1 ms |
-| Insert | 1.2 ms | 1.0 ms | 5.0 ms |
+| Workload (50k rows) | MySQL 8 |    Dolt | RepoDB Journal |
+| ------------------- | ------: | ------: | -------------: |
+| Point read          | 0.23 ms | 0.39 ms |        0.11 ms |
+| Read tx (10 reads)  |  6.5 ms |  7.5 ms |        0.77 ms |
+| Update x1           |  1.3 ms |  1.7 ms |         5.0 ms |
+| Update x100         |   59 ms |   80 ms |         7.1 ms |
+| Insert              |  1.2 ms |  1.0 ms |         5.0 ms |
 
-Range queries and full scans are slower because RepoDB decodes rows from a
-content-addressed tree rather than scanning buffer-pool pages. Neither MySQL
-nor Dolt provides Git-native version history or cross-clone synchronization.
+Range queries and full scans are slower because RepoDB decodes rows from a content-addressed tree rather than scanning buffer-pool pages. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
 
-See the [full scorecard](docs/benchmark.md) for methodology, concurrency,
-sync latency, and the native-Git comparison.
+See the [full scorecard](docs/benchmark.md) for methodology, concurrency, sync latency, and the native-Git comparison.
 
 ## Development
 
@@ -196,34 +175,23 @@ Go application          MySQL client
               Git remote
 ```
 
-- **One engine, two entry points.** Embedded sessions and MySQL connections
-  share the same catalog, table adapters, and transaction implementation.
-- **Journal persistence.** SQL commits append typed row edits (~1 KB per
-  transaction) to a local journal with one `fsync`. Checkpoint materializes
-  Prolly trees and publishes a Git data commit. Native-Git mode is available
-  for workloads that need every transaction in Git history.
-- **Snapshot isolation.** Transactions read a pinned snapshot plus their own
-  writes. Stale writers receive a conflict instead of overwriting newer data.
-- **Explicit synchronization.** Remote data is fetched into separate tracking
-  refs. Sync validates, fast-forwards, or three-way-merges. Conflicts remain
-  inspectable across restarts.
+- **One engine, two entry points.** Embedded sessions and MySQL connections share the same catalog, table adapters, and transaction implementation.
+- **Journal persistence.** SQL commits append typed row edits (~1 KB per transaction) to a local journal with one `fsync`. Checkpoint materializes Prolly trees and publishes a Git data commit. Native-Git mode is available for workloads that need every transaction in Git history.
+- **Snapshot isolation.** Transactions read a pinned snapshot plus their own writes. Stale writers receive a conflict instead of overwriting newer data.
+- **Explicit synchronization.** Remote data is fetched into separate tracking refs. Sync validates, fast-forwards, or three-way-merges. Conflicts remain inspectable across restarts.
 
-The current SQL scope supports one database namespace, explicit primary keys,
-DDL/DML (including `ALTER TABLE`), secondary indexes (unique and non-unique),
-`CHECK` constraints, `DEFAULT` values, and collation-aware string comparisons.
-Persisted types include integers, floats, `TEXT`, `BLOB`, `BOOL`, `ENUM`,
-`DECIMAL`/`NUMERIC`, `JSON`, `DATE`, `TIME`, `DATETIME`, and `TIMESTAMP`.
-Auto-increment and foreign keys are not yet supported.
+The current SQL scope supports one database namespace, explicit primary keys, DDL/DML (including `ALTER TABLE`), secondary indexes (unique and non-unique), `CHECK` constraints, `DEFAULT` values, and collation-aware string comparisons. Persisted types include integers, floats, `TEXT`, `BLOB`, `BOOL`, `ENUM`, `DECIMAL`/`NUMERIC`, `JSON`, `DATE`, `TIME`, `DATETIME`, and `TIMESTAMP`. Auto-increment and foreign keys are not yet supported.
 
-| Documentation | Covers |
-| --- | --- |
-| [SQL and embedded API](docs/sql-m2.md) | Supported types, transactions, commit recovery, and workload bounds |
-| [Storage format](docs/storage-format.md) | Snapshots, object inventories, locking, durability, and legacy import |
-| [Git integration](docs/git-integration.md) | Ref layout and ordinary Git command behavior |
-| [Synchronization](docs/sync-m3.md) | Enable, tracking refs, and transport |
-| [Merging](docs/merge-m4.md) | Three-way merge, conflict resolution, and distributed row identity |
-| [Working state](docs/working-state.md) | Durable journal, checkpoints, and recovery |
-| [Scorecard](docs/benchmark.md) | Four-way performance comparison and workload contract |
+| Documentation                              | Covers                                                                |
+| ------------------------------------------ | --------------------------------------------------------------------- |
+| [User guide](docs/guide.md)                | Setup, CLI reference, persistence modes, sync workflow, and backup    |
+| [SQL and embedded API](docs/sql-m2.md)     | Supported types, transactions, commit recovery, and workload bounds   |
+| [Storage format](docs/storage-format.md)   | Snapshots, object inventories, locking, durability, and legacy import |
+| [Git integration](docs/git-integration.md) | Ref layout and ordinary Git command behavior                          |
+| [Synchronization](docs/sync-m3.md)         | Enable, tracking refs, and transport                                  |
+| [Merging](docs/merge-m4.md)                | Three-way merge, conflict resolution, and distributed row identity    |
+| [Working state](docs/working-state.md)     | Durable journal, checkpoints, and recovery                            |
+| [Scorecard](docs/benchmark.md)             | Four-way performance comparison and workload contract                 |
 
 ## Roadmap
 
@@ -236,11 +204,8 @@ See [the implementation plan](docs/plan.md) for milestone scope and acceptance c
 
 ## Contributing
 
-Issues and pull requests are welcome. For substantial changes, open an issue
-to discuss the use case and approach first; the
-[implementation plan](docs/plan.md) is the starting point for scope and
-priorities.
+Issues and pull requests are welcome. For substantial changes, open an issue to discuss the use case and approach first; the [implementation plan](docs/plan.md) is the starting point for scope and priorities.
 
-Keep pull requests focused, format changed Go files with `gofmt`, and add
-tests for behavioral changes. Run the development checks above and update
-documentation when changing SQL behavior, storage, or synchronization.
+Issues are tracked with [Exponential](https://go-exponential.dev) and travel with this repository.
+
+Keep pull requests focused, format changed Go files with `gofmt`, and add tests for behavioral changes. Run the development checks above and update documentation when changing SQL behavior, storage, or synchronization.
