@@ -1051,6 +1051,36 @@ func (t *table) AddColumn(ctx *sql.Context, column *sql.Column, order *sql.Colum
 	return nil
 }
 
+func rekeyRows(schema sql.PrimaryKeySchema, oldRows map[string]sql.Row, oldEdits map[string]rowEdit) (map[string]sql.Row, map[string]rowEdit, error) {
+	newRows := make(map[string]sql.Row, len(oldRows))
+	for _, row := range oldRows {
+		key, err := encodeKey(schema, row)
+		if err != nil {
+			return nil, nil, fmt.Errorf("re-key failed: %w", err)
+		}
+		keyStr := string(key)
+		if _, dup := newRows[keyStr]; dup {
+			return nil, nil, fmt.Errorf("primary key column change produces duplicate key")
+		}
+		newRows[keyStr] = row
+	}
+	newEdits := make(map[string]rowEdit, len(newRows)+len(oldRows))
+	for key, edit := range oldEdits {
+		if edit.delete {
+			newEdits[key] = edit
+		}
+	}
+	for oldKey := range oldRows {
+		if _, exists := newRows[oldKey]; !exists {
+			newEdits[oldKey] = rowEdit{delete: true}
+		}
+	}
+	for newKey, row := range newRows {
+		newEdits[newKey] = rowEdit{row: cloneRow(row)}
+	}
+	return newRows, newEdits, nil
+}
+
 func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 	tx, err := transactionFrom(ctx)
 	if err != nil {
@@ -1066,10 +1096,15 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 	if dropIdx < 0 {
 		return fmt.Errorf("column %s not found", columnName)
 	}
+	isPKColumn := false
 	for _, ord := range t.state.schema.PkOrdinals {
 		if ord == dropIdx {
-			return fmt.Errorf("cannot drop primary key column %s", columnName)
+			isPKColumn = true
+			break
 		}
+	}
+	if isPKColumn && len(t.state.schema.PkOrdinals) == 1 {
+		return fmt.Errorf("cannot drop the only primary key column %s", columnName)
 	}
 	for _, idx := range t.state.indexes {
 		for _, ord := range idx.Columns {
@@ -1084,34 +1119,69 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 	newSchema := make(sql.Schema, 0, len(t.state.schema.Schema)-1)
 	newSchema = append(newSchema, t.state.schema.Schema[:dropIdx]...)
 	newSchema = append(newSchema, t.state.schema.Schema[dropIdx+1:]...)
-	newPK := make([]int, len(t.state.schema.PkOrdinals))
-	for i, ord := range t.state.schema.PkOrdinals {
-		if ord > dropIdx {
-			newPK[i] = ord - 1
-		} else {
-			newPK[i] = ord
+	var newPK []int
+	if isPKColumn {
+		newPK = make([]int, 0, len(t.state.schema.PkOrdinals)-1)
+		for _, ord := range t.state.schema.PkOrdinals {
+			if ord == dropIdx {
+				continue
+			}
+			if ord > dropIdx {
+				newPK = append(newPK, ord-1)
+			} else {
+				newPK = append(newPK, ord)
+			}
+		}
+	} else {
+		newPK = make([]int, len(t.state.schema.PkOrdinals))
+		for i, ord := range t.state.schema.PkOrdinals {
+			if ord > dropIdx {
+				newPK[i] = ord - 1
+			} else {
+				newPK[i] = ord
+			}
 		}
 	}
-	newRows := make(map[string]sql.Row, len(t.state.rows))
+	candidateRows := make(map[string]sql.Row, len(t.state.rows))
 	for key, row := range t.state.rows {
 		newRow := make(sql.Row, len(row)-1)
 		copy(newRow, row[:dropIdx])
 		copy(newRow[dropIdx:], row[dropIdx+1:])
-		newRows[key] = newRow
+		candidateRows[key] = newRow
 	}
-	t.state.schema = sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
-	for i := range t.state.indexes {
-		for j, ord := range t.state.indexes[i].Columns {
-			if ord > dropIdx {
-				t.state.indexes[i].Columns[j] = ord - 1
+	candidateSchema := sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
+	if isPKColumn {
+		reKeyedRows, reKeyedEdits, err := rekeyRows(candidateSchema, candidateRows, t.state.edits)
+		if err != nil {
+			return err
+		}
+		t.state.schema = candidateSchema
+		for i := range t.state.indexes {
+			for j, ord := range t.state.indexes[i].Columns {
+				if ord > dropIdx {
+					t.state.indexes[i].Columns[j] = ord - 1
+				}
 			}
 		}
-	}
-	t.state.idxEdits = nil
-	t.state.rows = newRows
-	t.state.edits = make(map[string]rowEdit)
-	for key, row := range newRows {
-		t.state.edits[key] = rowEdit{row: cloneRow(row)}
+		t.state.rows = reKeyedRows
+		t.state.edits = reKeyedEdits
+		t.state.idxEdits = nil
+		t.state.manifest.Indexes = nil
+	} else {
+		t.state.schema = candidateSchema
+		for i := range t.state.indexes {
+			for j, ord := range t.state.indexes[i].Columns {
+				if ord > dropIdx {
+					t.state.indexes[i].Columns[j] = ord - 1
+				}
+			}
+		}
+		t.state.idxEdits = nil
+		t.state.rows = candidateRows
+		t.state.edits = make(map[string]rowEdit)
+		for key, row := range candidateRows {
+			t.state.edits[key] = rowEdit{row: cloneRow(row)}
+		}
 	}
 	t.state.dirty = true
 	t.state.schemaDirty = true
@@ -1137,9 +1207,11 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 	if colIdx < 0 {
 		return fmt.Errorf("column %s not found", columnName)
 	}
+	isPKColumn := false
 	for _, ord := range t.state.schema.PkOrdinals {
-		if ord == colIdx && !t.state.schema.Schema[colIdx].Type.Equals(column.Type) {
-			return fmt.Errorf("cannot change type of primary key column %s", columnName)
+		if ord == colIdx {
+			isPKColumn = true
+			break
 		}
 	}
 	if err := t.state.ensureRows(ctx); err != nil {
@@ -1208,6 +1280,21 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 						seen[keyStr] = struct{}{}
 					}
 				}
+			}
+		}
+		if isPKColumn {
+			candidateSchema := copySchema(t.state.schema)
+			candidateSchema.Schema[colIdx] = column
+			candidateRows := make(map[string]sql.Row, len(t.state.rows))
+			for key, row := range t.state.rows {
+				r := cloneRow(row)
+				if v, ok := convertedRows[key]; ok {
+					r[colIdx] = v
+				}
+				candidateRows[key] = r
+			}
+			if _, _, err := rekeyRows(candidateSchema, candidateRows, t.state.edits); err != nil {
+				return err
 			}
 		}
 		for key, converted := range convertedRows {
@@ -1291,9 +1378,20 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 			t.state.rows[key] = newRow
 		}
 	}
-	t.state.edits = make(map[string]rowEdit)
-	for key, row := range t.state.rows {
-		t.state.edits[key] = rowEdit{row: cloneRow(row)}
+	if isPKColumn && typeChanged {
+		reKeyedRows, reKeyedEdits, err := rekeyRows(t.state.schema, t.state.rows, t.state.edits)
+		if err != nil {
+			return err
+		}
+		t.state.rows = reKeyedRows
+		t.state.edits = reKeyedEdits
+		t.state.idxEdits = nil
+		t.state.manifest.Indexes = nil
+	} else {
+		t.state.edits = make(map[string]rowEdit)
+		for key, row := range t.state.rows {
+			t.state.edits[key] = rowEdit{row: cloneRow(row)}
+		}
 	}
 	t.state.dirty = true
 	t.state.schemaDirty = true

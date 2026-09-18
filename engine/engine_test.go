@@ -395,7 +395,7 @@ func TestAlterTableModifyVarcharNarrowingValidates(t *testing.T) {
 	}
 }
 
-func TestAlterTableModifyPKLengthRejected(t *testing.T) {
+func TestAlterTableModifyPKColumnLength(t *testing.T) {
 	eng, ctx := openEngine(t)
 	s, _ := eng.NewSession()
 	defer s.Close()
@@ -403,9 +403,18 @@ func TestAlterTableModifyPKLengthRejected(t *testing.T) {
 	if err := s.Exec(ctx, "CREATE TABLE t (id VARCHAR(100) PRIMARY KEY, name TEXT)"); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id VARCHAR(50)")
-	if err == nil {
-		t.Fatal("expected error changing PK column length")
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('short', 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id VARCHAR(50)"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "short" {
+		t.Fatalf("row = %v, want [short alice]", result.Rows)
 	}
 }
 
@@ -432,7 +441,7 @@ func TestAlterTableModifyColumnType(t *testing.T) {
 	}
 }
 
-func TestAlterTableModifyPKTypeRejected(t *testing.T) {
+func TestAlterTableModifyPKColumnType(t *testing.T) {
 	eng, ctx := openEngine(t)
 	s, _ := eng.NewSession()
 	defer s.Close()
@@ -440,9 +449,24 @@ func TestAlterTableModifyPKTypeRejected(t *testing.T) {
 	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)"); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id TEXT")
-	if err == nil {
-		t.Fatal("expected error changing PK type")
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][0] != "1" {
+		t.Errorf("row 1 id = %v (%T), want '1'", result.Rows[0][0], result.Rows[0][0])
 	}
 }
 
@@ -686,6 +710,503 @@ func TestAlterTablePersistsNativeGit(t *testing.T) {
 	}
 	if result.Rows[1][1] != int64(25) {
 		t.Errorf("row 2 age = %v, want 25", result.Rows[1][1])
+	}
+}
+
+func TestAlterTableDropPKColumnComposite(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c TEXT, PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 20, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t DROP COLUMN a"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT b, c FROM t ORDER BY b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][0] != int64(10) || result.Rows[0][1] != "x" {
+		t.Errorf("row 1 = %v, want [10, x]", result.Rows[0])
+	}
+	if result.Rows[1][0] != int64(20) || result.Rows[1][1] != "y" {
+		t.Errorf("row 2 = %v, want [20, y]", result.Rows[1])
+	}
+	err = s.Exec(ctx, "INSERT INTO t VALUES (10, 'dup')")
+	if err == nil {
+		t.Fatal("expected duplicate PK error for b=10")
+	}
+}
+
+func TestAlterTableDropPKColumnDuplicateRejected(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c TEXT, PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 10, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "ALTER TABLE t DROP COLUMN a")
+	if err == nil {
+		t.Fatal("expected duplicate key error when remaining PK columns collide")
+	}
+}
+
+func TestAlterTableDropPKColumnWithIndex(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c VARCHAR(100), PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "CREATE INDEX idx_c ON t (c)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 20, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t DROP COLUMN a"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT b, c FROM t WHERE c = 'x'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != int64(10) {
+		t.Fatalf("index lookup = %v, want [[10, x]]", result.Rows)
+	}
+}
+
+func TestAlterTableDropPKColumnPersistsJournal(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c TEXT, PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 20, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t DROP COLUMN a"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+	result, err := s2.Query(ctx, "SELECT b, c FROM t ORDER BY b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][0] != int64(10) || result.Rows[0][1] != "x" {
+		t.Errorf("row 1 = %v, want [10, x]", result.Rows[0])
+	}
+}
+
+func TestAlterTableDropPKColumnPersistsNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	nativeGit := engine.Options{Persistence: engine.PersistenceNativeGit}
+	eng, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c TEXT, PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 20, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t DROP COLUMN a"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+	result, err := s2.Query(ctx, "SELECT b, c FROM t ORDER BY b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][0] != int64(10) || result.Rows[0][1] != "x" {
+		t.Errorf("row 1 = %v, want [10, x]", result.Rows[0])
+	}
+}
+
+func TestAlterTableModifyPKColumnTypeDuplicateRejected(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id VARCHAR(100) PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('100', 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('0100', 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id BIGINT")
+	if err == nil {
+		t.Fatal("expected duplicate key error from type conversion")
+	}
+}
+
+func TestAlterTableModifyPKColumnTypeWithIndex(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "CREATE INDEX idx_name ON t (name)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, name FROM t WHERE name = 'alice'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "1" {
+		t.Fatalf("index lookup = %v, want [[1, alice]]", result.Rows)
+	}
+}
+
+func TestAlterTableModifyPKColumnTypePersistsJournal(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+	result, err := s2.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "1" {
+		t.Fatalf("row = %v, want [1, alice]", result.Rows)
+	}
+}
+
+func TestAlterTableModifyPKColumnTypePersistsNativeGit(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	nativeGit := engine.Options{Persistence: engine.PersistenceNativeGit}
+	eng, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	eng.Close()
+
+	eng2, err := engine.OpenWithOptions(ctx, root, nativeGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	s2, _ := eng2.NewSession()
+	defer s2.Close()
+	result, err := s2.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "1" {
+		t.Fatalf("row = %v, want [1, alice]", result.Rows)
+	}
+}
+
+func TestAlterTableModifyPKColumnTypeComposite(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c TEXT, PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 20, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "ALTER TABLE t MODIFY COLUMN a TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT a, b, c FROM t ORDER BY b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(result.Rows))
+	}
+	if result.Rows[0][0] != "1" || result.Rows[0][1] != int64(10) {
+		t.Errorf("row 1 = %v, want [1, 10, x]", result.Rows[0])
+	}
+	if result.Rows[1][0] != "2" || result.Rows[1][1] != int64(20) {
+		t.Errorf("row 2 = %v, want [2, 20, y]", result.Rows[1])
+	}
+}
+
+func TestAlterTableDropPKColumnPreservesTransactionDeletes(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c VARCHAR(100), PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 20, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (3, 30, 'z')"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "DELETE FROM t WHERE a = 1 AND b = 10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "ALTER TABLE t DROP COLUMN a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT b, c FROM t ORDER BY b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (deleted row should not reappear)", len(result.Rows))
+	}
+	if result.Rows[0][0] != int64(20) {
+		t.Errorf("row 1 b = %v, want 20", result.Rows[0][0])
+	}
+	if result.Rows[1][0] != int64(30) {
+		t.Errorf("row 2 b = %v, want 30", result.Rows[1][0])
+	}
+}
+
+func TestAlterTableModifyPKTypePreservesTransactionDeletes(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "DELETE FROM t WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1 (deleted row should not reappear)", len(result.Rows))
+	}
+	if result.Rows[0][0] != "2" {
+		t.Errorf("id = %v, want '2'", result.Rows[0][0])
+	}
+}
+
+func TestAlterTableDropPKColumnDuplicateDoesNotCorruptState(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (a BIGINT, b BIGINT, c VARCHAR(100), PRIMARY KEY(a, b))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (1, 10, 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES (2, 10, 'y')"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "INSERT INTO t VALUES (3, 30, 'z')"); err != nil {
+		t.Fatal(err)
+	}
+	err = tx.Exec(ctx, "ALTER TABLE t DROP COLUMN a")
+	if err == nil {
+		t.Fatal("expected duplicate key error")
+	}
+	result, err := tx.Query(ctx, "SELECT a, b, c FROM t ORDER BY a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (2 original + 1 inserted in tx)", len(result.Rows))
+	}
+	if result.Rows[0][0] != int64(1) || result.Rows[0][1] != int64(10) {
+		t.Errorf("row 1 = %v, want [1, 10, x]", result.Rows[0])
+	}
+	if result.Rows[2][0] != int64(3) || result.Rows[2][1] != int64(30) {
+		t.Errorf("row 3 = %v, want [3, 30, z]", result.Rows[2])
+	}
+}
+
+func TestAlterTableModifyPKTypeDuplicateDoesNotCorruptState(t *testing.T) {
+	eng, ctx := openEngine(t)
+	s, _ := eng.NewSession()
+	defer s.Close()
+
+	if err := s.Exec(ctx, "CREATE TABLE t (id VARCHAR(100) PRIMARY KEY, name VARCHAR(100))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('100', 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Exec(ctx, "INSERT INTO t VALUES ('0100', 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "INSERT INTO t VALUES ('200', 'charlie')"); err != nil {
+		t.Fatal(err)
+	}
+	err = tx.Exec(ctx, "ALTER TABLE t MODIFY COLUMN id BIGINT")
+	if err == nil {
+		t.Fatal("expected duplicate key error")
+	}
+	result, err := tx.Query(ctx, "SELECT id, name FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (2 original + 1 inserted in tx)", len(result.Rows))
+	}
+	if result.Rows[0][0] != "0100" {
+		t.Errorf("row 1 id = %v, want '0100'", result.Rows[0][0])
 	}
 }
 
