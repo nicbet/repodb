@@ -45,10 +45,13 @@ func New(config Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open persistent SQL engine: %w", err)
 	}
+	var interceptors mysqlserver.InterceptorChain
+	interceptors.WithInterceptor(explainInterceptor{})
 	wire, err := mysqlserver.NewServer(mysqlserver.Config{
 		Protocol: "tcp",
 		Address:  config.Address,
 		Version:  "RepoDB experimental",
+		Options:  []mysqlserver.Option{interceptors.Option()},
 	}, persistent.SQLEngine(), sql.NewContext, persistent.SessionBuilder(), nil)
 	if err != nil {
 		_ = persistent.Close()

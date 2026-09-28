@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,6 +62,23 @@ func TestMySQLWireRoundTrip(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || result.Rows[0][0] == nil || *result.Rows[0][0] != "Ada" {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+	// A plain EXPLAIN is served as EXPLAIN PLAN: go-mysql-server's tabular
+	// placeholder row cannot be encoded for the MySQL protocol.
+	explained, err := cli.Query(ctx, "EXPLAIN SELECT name FROM people WHERE id = 1")
+	if err != nil {
+		t.Fatalf("EXPLAIN over the wire: %v", err)
+	}
+	var plan []string
+	for _, row := range explained.Rows {
+		plan = append(plan, *row[0])
+	}
+	if len(explained.Columns) != 1 || explained.Columns[0] != "plan" || !strings.Contains(strings.Join(plan, "\n"), "IndexedTableAccess(people)") {
+		t.Fatalf("EXPLAIN = %v %v, want plan rows", explained.Columns, plan)
+	}
+	described, err := cli.Query(ctx, "DESCRIBE people")
+	if err != nil || len(described.Rows) != 2 {
+		t.Fatalf("DESCRIBE people = %v, %v; want 2 column rows", described.Rows, err)
 	}
 	if err := cli.Close(); err != nil {
 		t.Fatal(err)

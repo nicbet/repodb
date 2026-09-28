@@ -335,3 +335,25 @@ func TestRangeQueriesAtIntegerExtremes(t *testing.T) {
 		}
 	}
 }
+
+// A plain EXPLAIN returns the plan tree: go-mysql-server's tabular EXPLAIN is
+// a placeholder that cannot be sent over the MySQL protocol.
+func TestPlainExplainReturnsPlan(t *testing.T) {
+	_, eng := openCheckpointedIndexedTable(t)
+	defer eng.Close()
+	session, _ := eng.NewSession()
+	defer session.Close()
+	for _, q := range []string{"EXPLAIN SELECT id FROM t WHERE id > 1", "DESCRIBE SELECT id FROM t WHERE id > 1"} {
+		result, err := session.Query(context.Background(), q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if len(result.Columns) != 1 || result.Columns[0] != "plan" || !strings.Contains(fmt.Sprint(result.Rows), "IndexedTableAccess(t)") {
+			t.Fatalf("%s = %v %v, want plan rows", q, result.Columns, result.Rows)
+		}
+	}
+	result, err := session.Query(context.Background(), "DESCRIBE t")
+	if err != nil || len(result.Rows) != 3 {
+		t.Fatalf("DESCRIBE t = %v, %v; want 3 column rows", result.Rows, err)
+	}
+}

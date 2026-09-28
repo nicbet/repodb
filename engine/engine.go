@@ -487,6 +487,7 @@ func (s *Session) Query(ctx context.Context, statement string, args ...any) (Res
 			return Result{}, err
 		}
 	}
+	statement = NormalizeExplain(statement)
 	sqlCtx := sql.NewContext(ctx, sql.WithSession(s.session))
 	schema, iter, _, err := s.engine.sql.Query(sqlCtx, statement)
 	if err != nil {
