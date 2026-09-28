@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/nicbet/repodb/common/robustio"
 )
+
+// rename is robustio.Rename; tests replace it to simulate losing a race.
+var rename = robustio.Rename
 
 // Filesystem stores immutable objects beneath a Git-tracked directory. Object
 // paths are split by their first two hex digits, like loose Git objects.
@@ -66,14 +70,23 @@ func (f *Filesystem) Put(_ context.Context, data []byte) (Hash, error) {
 		tmp.Close()
 		return "", err
 	}
-	if err := tmp.Chmod(0o444); err != nil {
-		tmp.Close()
-		return "", err
+	// On Windows 0444 sets FILE_ATTRIBUTE_READONLY, which blocks both renaming
+	// onto the object and removing it. Content addressing already guards it.
+	if runtime.GOOS != "windows" {
+		if err := tmp.Chmod(0o444); err != nil {
+			tmp.Close()
+			return "", err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	if err := robustio.Rename(tmpName, path); err != nil {
+	if err := rename(tmpName, path); err != nil {
+		// A concurrent writer stored the same object first; its content is
+		// identical by construction.
+		if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+			return hash, nil
+		}
 		return "", err
 	}
 	return hash, nil
