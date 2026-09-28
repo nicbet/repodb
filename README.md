@@ -79,7 +79,6 @@ After `enable`, all sync commands default to the configured remote. Pass `--remo
 | `repodb sync`                 | Fetch and publish data history; prompts to checkpoint uncommitted changes  |
 | `repodb conflicts`            | List unresolved merge conflicts after a sync                               |
 | `repodb resolve`              | Resolve a conflict (`--id`, `--take local\|remote\|base\|delete`)          |
-| `repodb import-legacy [path]` | Import data from the legacy `.repodb` storage format                       |
 
 ## Embedded use
 
@@ -193,7 +192,7 @@ The current SQL scope supports one database namespace, explicit primary keys, DD
 | ------------------------------------------ | --------------------------------------------------------------------- |
 | [User guide](docs/guide.md)                | Setup, CLI reference, persistence modes, sync workflow, and backup    |
 | [SQL and embedded API](docs/sql-m2.md)     | Supported types, transactions, commit recovery, and workload bounds   |
-| [Storage format](docs/storage-format.md)   | Snapshots, object inventories, locking, durability, and legacy import |
+| [Storage format](docs/storage-format.md)   | Snapshots, key encoding, object inventories, locking, and durability  |
 | [Git integration](docs/git-integration.md) | Ref layout and ordinary Git command behavior                          |
 | [Synchronization](docs/sync-m3.md)         | Enable, tracking refs, and transport                                  |
 | [Merging](docs/merge-m4.md)                | Three-way merge, conflict resolution, and distributed row identity    |

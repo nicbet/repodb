@@ -30,7 +30,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: repodb <init|status|diff|commit|import-legacy|enable|sync|conflicts|resolve|start|sql>")
+		return errors.New("usage: repodb <init|status|diff|commit|enable|sync|conflicts|resolve|start|sql>")
 	}
 	switch args[0] {
 	case "init":
@@ -108,21 +108,6 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	case "snapshot":
 		return errors.New("snapshot is obsolete; RepoDB transactions publish data commits automatically")
-	case "import-legacy":
-		set := flag.NewFlagSet("import-legacy", flag.ContinueOnError)
-		if err := set.Parse(args[1:]); err != nil {
-			return err
-		}
-		path := "."
-		if set.NArg() > 0 {
-			path = set.Arg(0)
-		}
-		_, snapshot, err := repository.ImportLegacy(ctx, path)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("imported legacy .repodb state at %s (%s); legacy files were retained\n", repository.DataRef, snapshot.Commit)
-		return nil
 	case "sql":
 		return runSQL(ctx, args[1:])
 	case "enable":

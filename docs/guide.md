@@ -137,7 +137,6 @@ The `-m` flag is required. This checkpoints the journal (in journal mode) or is 
 | `repodb sync`                 | Fetch and publish data history, merging independent edits (`--remote`) |
 | `repodb conflicts`            | List unresolved merge conflicts after a sync (`--remote`)              |
 | `repodb resolve`              | Resolve a specific merge conflict (`--id`, `--take`, `--remote`)       |
-| `repodb import-legacy [path]` | Import data from the legacy `.repodb` format                           |
 
 ### `repodb sql`
 
@@ -228,17 +227,6 @@ When all conflicts are resolved, the merge commit is published automatically.
 | `--repo`   | `.`        | Path inside the Git worktree        |
 | `--id`     | (required) | Conflict ID from `repodb conflicts` |
 | `--take`   | (required) | Resolution choice                   |
-
-### `repodb import-legacy`
-
-Import data from the legacy `.repodb` storage format:
-
-```sh
-repodb import-legacy
-```
-
-Verifies the old store, publishes its data as an initial commit, and retains
-the `.repodb/` directory for review.
 
 ## Synchronization
 
@@ -343,16 +331,6 @@ The cache directory (`<git-common-dir>/repodb/cache/`) is disposable and safe to
 ### Worktrees
 
 Linked Git worktrees share the journal and publication lock with the main worktree. There is one journal per repository, not per worktree.
-
-### Legacy import
-
-If the repository has data in the old `.repodb/` format, import it:
-
-```sh
-repodb import-legacy
-```
-
-The old files are retained for review after import.
 
 ## Git interaction
 

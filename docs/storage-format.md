@@ -4,7 +4,10 @@ This remains the default native-Git persistence path. M4.3's opt-in authoritativ
 journal and intentional checkpoint protocol are documented in
 [working-state.md](working-state.md); they do not change the default yet.
 
-Status: format version 1 baseline, implemented 2026-09-11.
+Status: format version 2 (2026-09-28): order-preserving keys. Format version 1
+was the 2026-09-11 baseline. RepoDB is alpha and does not migrate between
+formats: opening a format 1 data history fails with an unsupported-format error
+asking to re-initialize it.
 
 ## Authoritative state
 
@@ -33,8 +36,35 @@ contents as opaque bytes.
 
 The Git commit has the previous data head as its sole parent. Initial snapshots
 have no parent. Commits use `RepoDB <repodb@localhost>` as author and committer
-and `RepoDB snapshot v1` as the subject. Commit timestamps come from Git at
-publication time. Source commits and data commits have independent histories.
+and `RepoDB snapshot v<format version>` as the subject (currently
+`RepoDB snapshot v2`). Commit timestamps come from Git at publication time.
+Source commits and data commits have independent histories.
+
+## Key encoding (format 2)
+
+Rows live in Prolly trees keyed by their primary key; secondary indexes are
+Prolly trees keyed by index columns. Keys are the concatenation of one
+self-delimiting, order-preserving encoding per column (`engine/keycodec.go`),
+so `bytes.Compare` on keys agrees with SQL order. Range predicates and
+`ORDER BY … LIMIT` on index columns therefore seek into the tree and stream
+rows in order instead of scanning the table.
+
+| Column type | Encoding |
+| --- | --- |
+| signed integers | 8-byte big-endian, sign bit flipped |
+| unsigned integers | 8-byte big-endian |
+| ENUM | 2-byte big-endian index |
+| FLOAT/DOUBLE | 8-byte IEEE-754 bits, all flipped when negative, else the sign bit flipped; −0 normalized |
+| DECIMAL | sign class byte, then for non-zero values a sign-flipped 4-byte exponent and digit bytes ending in `0x00`, bitwise inverted for negatives; `1.0` and `1.00` encode equally |
+| DATE/DATETIME/TIMESTAMP, TIME | 8-byte microseconds since the Unix epoch (UTC) or duration microseconds, sign bit flipped |
+| CHAR/VARCHAR/TEXT | UTF-8 bytes for the default binary collation, else 4-byte big-endian collation weights per rune; CHAR ignores trailing spaces; `0x00` escaped as `0x00 0xFF`, terminated by `0x00 0x01` |
+| BINARY/VARBINARY/BLOB | raw bytes, escaped and terminated like strings |
+
+A secondary-index key writes `0x00` for a NULL column or `0x01` plus the column
+encoding, so NULLs sort first, and appends the primary key when the index is not
+unique or a column is NULL. Keys are never decoded; row values are stored in the
+row blob. Format 1 keys (`type, length, decimal text`) were not
+order-preserving, which limited lookups to exact points.
 
 ## Publication and concurrency
 
@@ -88,16 +118,8 @@ does not claim atomic publication between the source branch and the data ref.
 ## Repository states and recovery
 
 - No `refs/repodb/data`: `repository.ErrNotInitialized`.
-- A tracked `.repodb/config.json` or `.repodb/manifest.json` without a data ref:
-  `repository.ErrLegacyLayout`, with instructions to run `repodb import-legacy`.
 - Unsupported `format_version`: an explicit unsupported-format error.
 - Missing, extra, malformed, or hash-mismatched snapshot content:
   `repository.ErrCorrupt`.
 - A stale expected head: `repository.ErrConflict`; the current live snapshot is
   unchanged.
-
-`repodb import-legacy [path]` verifies the prototype filesystem object store and
-publishes it as the initial data commit. It refuses to overwrite an existing
-data ref and deliberately retains `.repodb/` so migration is reviewable and
-recoverable. Users may remove those legacy files in a separate source commit
-after checking the imported snapshot.

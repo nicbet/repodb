@@ -3,7 +3,6 @@ package repository_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -527,7 +526,7 @@ func TestSHA256GitRepositoryRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAbsentLegacyUnsupportedAndCorruptRepositories(t *testing.T) {
+func TestAbsentUnsupportedAndCorruptRepositories(t *testing.T) {
 	ctx := context.Background()
 
 	absent := initRepository(t)
@@ -535,30 +534,15 @@ func TestAbsentLegacyUnsupportedAndCorruptRepositories(t *testing.T) {
 		t.Fatalf("absent error = %v", err)
 	}
 
-	legacy := initRepository(t)
-	writeLegacyLayout(t, legacy)
-	legacyStatus := git(t, legacy, "status", "--porcelain=v1")
-	if _, err := repository.Init(ctx, legacy); !errors.Is(err, repository.ErrLegacyLayout) {
-		t.Fatalf("legacy init error = %v", err)
-	}
-	repo, imported, err := repository.ImportLegacy(ctx, legacy)
+	unsupportedRoot := initRepository(t)
+	unsupportedRepo, err := repository.Init(ctx, unsupportedRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(legacy, ".repodb", "manifest.json")); err != nil {
-		t.Fatalf("legacy files were removed: %v", err)
-	}
-	if status := git(t, legacy, "status", "--porcelain=v1"); status != legacyStatus {
-		t.Fatalf("legacy import changed source state: %q != %q", status, legacyStatus)
-	}
-	rootHash := imported.Manifest.Tables["issues"].DataRoot
-	if data, err := imported.Store().Get(ctx, rootHash); err != nil || string(data) != "legacy rows" {
-		t.Fatalf("imported object = %q, err = %v", data, err)
-	}
-
+	head, _ := unsupportedRepo.Current(ctx)
 	unsupported := []byte("{\"format_version\":99,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[]}\n")
-	installRawManifest(t, repo, imported.Commit, unsupported)
-	if _, err := repository.Open(ctx, legacy); err == nil || !strings.Contains(err.Error(), "unsupported RepoDB format 99") {
+	installRawManifest(t, unsupportedRepo, head.Commit, unsupported)
+	if _, err := repository.Open(ctx, unsupportedRoot); err == nil || !strings.Contains(err.Error(), "unsupported RepoDB format 99") {
 		t.Fatalf("unsupported format error = %v", err)
 	}
 
@@ -569,7 +553,7 @@ func TestAbsentLegacyUnsupportedAndCorruptRepositories(t *testing.T) {
 	}
 	base, _ := corruptRepo.Current(ctx)
 	fake := strings.Repeat("a", 64)
-	corrupt := []byte(fmt.Sprintf("{\"format_version\":1,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[%q]}\n", fake))
+	corrupt := []byte(fmt.Sprintf("{\"format_version\":2,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[%q]}\n", fake))
 	installRawManifest(t, corruptRepo, base.Commit, corrupt)
 	if _, err := repository.Open(ctx, corruptRoot); !errors.Is(err, repository.ErrCorrupt) {
 		t.Fatalf("corrupt snapshot error = %v", err)
@@ -593,37 +577,6 @@ func installRawManifest(t *testing.T, repo *repository.Repository, old string, m
 		t.Fatal(err)
 	}
 	if err := cli.UpdateRef(ctx, repo.Root, repository.DataRef, commit, old); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func writeLegacyLayout(t *testing.T, root string) {
-	t.Helper()
-	dir := filepath.Join(root, ".repodb")
-	store := storage.NewFilesystem(filepath.Join(dir, "objects", "sha256"))
-	hash, err := store.Put(context.Background(), []byte("legacy rows"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeJSON(t, filepath.Join(dir, "config.json"), map[string]any{
-		"format_version": 1, "default_database": "repodb",
-	})
-	writeJSON(t, filepath.Join(dir, "manifest.json"), map[string]any{
-		"format_version": 1,
-		"tables":         map[string]repository.Table{"issues": {DataRoot: hash}},
-	})
-}
-
-func writeJSON(t *testing.T, path string, value any) {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

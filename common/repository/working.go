@@ -22,7 +22,7 @@ import (
 	"github.com/nicbet/repodb/common/storage"
 )
 
-const workingFormatVersion = 1
+const workingFormatVersion = 2
 
 var (
 	ErrWorkingCorrupt     = errors.New("corrupt RepoDB working journal")

@@ -21,13 +21,12 @@ import (
 )
 
 const (
-	FormatVersion = 1
+	FormatVersion = 2
 	DataRef       = "refs/repodb/data"
 )
 
 var (
 	ErrNotInitialized = errors.New("RepoDB is not initialized")
-	ErrLegacyLayout   = errors.New("legacy tracked .repodb layout found")
 	ErrConflict       = errors.New("RepoDB data head changed")
 	ErrCorrupt        = errors.New("corrupt RepoDB snapshot")
 	ErrCommitUnknown  = errors.New("RepoDB commit outcome is unknown")
@@ -103,7 +102,6 @@ type Manifest struct {
 
 type Repository struct {
 	Root         string
-	Dir          string // Legacy tracked layout; retained only for explicit import.
 	CommonDir    string
 	ObjectFormat string
 	git          repodbgit.CLI
@@ -172,7 +170,7 @@ type Writer struct {
 }
 
 // Init creates the initial empty catalog commit. It is idempotent when the data
-// ref already contains a valid snapshot and refuses to hide a legacy layout.
+// ref already contains a valid snapshot.
 func Init(ctx context.Context, start string) (*Repository, error) {
 	repo, err := discover(ctx, start)
 	if err != nil {
@@ -185,9 +183,6 @@ func Init(ctx context.Context, start string) (*Repository, error) {
 		return repo, nil
 	} else if !errors.Is(err, repodbgit.ErrRefNotFound) {
 		return nil, err
-	}
-	if legacyExists(repo.Dir) {
-		return nil, fmt.Errorf("%w; run repodb import-legacy or move it aside before initialization", ErrLegacyLayout)
 	}
 	w := &Writer{repo: repo, objects: make(map[storage.Hash][]byte), objectOIDs: make(map[storage.Hash]string)}
 	if _, err := w.Commit(ctx, Manifest{DefaultDatabase: "repodb", Tables: map[string]Table{}}); err != nil {
@@ -217,9 +212,6 @@ func OpenWithSnapshot(ctx context.Context, start string) (*Repository, *Snapshot
 	commit, err := repo.git.ResolveRef(ctx, repo.Root, DataRef)
 	if err != nil {
 		if errors.Is(err, repodbgit.ErrRefNotFound) {
-			if legacyExists(repo.Dir) {
-				return nil, nil, fmt.Errorf("%w; run repodb import-legacy", ErrLegacyLayout)
-			}
 			return nil, nil, ErrNotInitialized
 		}
 		return nil, nil, err
@@ -247,7 +239,6 @@ func discover(ctx context.Context, start string) (*Repository, error) {
 	}
 	return &Repository{
 		Root:         info.TopLevel,
-		Dir:          filepath.Join(info.TopLevel, ".repodb"),
 		CommonDir:    info.CommonDir,
 		ObjectFormat: info.ObjectFormat,
 		git:          cli,
@@ -861,7 +852,7 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 		return nil, fmt.Errorf("%w: trailing manifest content", ErrCorrupt)
 	}
 	if manifest.FormatVersion != FormatVersion {
-		return nil, fmt.Errorf("unsupported RepoDB format %d (supported: %d)", manifest.FormatVersion, FormatVersion)
+		return nil, fmt.Errorf("unsupported RepoDB format %d (supported: %d); RepoDB is alpha and does not migrate data between formats, so re-initialize the data history", manifest.FormatVersion, FormatVersion)
 	}
 	objectSet := make(map[storage.Hash]struct{}, len(manifest.Objects))
 	for i, hash := range manifest.Objects {
@@ -1011,10 +1002,4 @@ func acquireFileLock(ctx context.Context, path string) (func(), error) {
 		return nil, err
 	}
 	return func() { _ = fl.Unlock() }, nil
-}
-
-func legacyExists(path string) bool {
-	_, configErr := os.Stat(filepath.Join(path, "config.json"))
-	_, manifestErr := os.Stat(filepath.Join(path, "manifest.json"))
-	return configErr == nil || manifestErr == nil
 }

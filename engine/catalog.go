@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -937,15 +937,47 @@ func (t *table) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.
 		return nil, errors.New("RepoDB index supports point lookups only")
 	}
 	if _, isPrimary := lookup.Index.(*primaryIndex); isPrimary {
-		return t.lookupPrimaryPartitions(ctx, ranges)
+		if allFullPointRanges(ranges, len(t.state.schema.PkOrdinals)) {
+			return t.lookupPrimaryPartitions(ctx, ranges)
+		}
+		intervals, err := rangeIntervals(ctx, t.columnTypes(t.state.schema.PkOrdinals), false, ranges)
+		if err != nil {
+			return nil, err
+		}
+		return sql.PartitionsToPartitionIter(rangePartition{intervals: intervals}), nil
 	}
 	if si, isSecondary := lookup.Index.(*secondaryIndex); isSecondary {
-		if si.def.Unique {
-			return t.lookupUniquePartitions(ctx, ranges, si.def)
+		intervals, err := rangeIntervals(ctx, t.columnTypes(si.def.Columns), true, ranges)
+		if err != nil {
+			return nil, err
 		}
-		return t.lookupSecondaryPartitions(ctx, ranges, si.def)
+		return sql.PartitionsToPartitionIter(rangePartition{intervals: intervals, index: si.def}), nil
 	}
 	return nil, fmt.Errorf("unsupported index type %T", lookup.Index)
+}
+
+func (t *table) columnTypes(ordinals []int) []sql.Type {
+	out := make([]sql.Type, len(ordinals))
+	for i, ordinal := range ordinals {
+		out[i] = t.state.schema.Schema[ordinal].Type
+	}
+	return out
+}
+
+// allFullPointRanges reports whether every range fixes every one of n columns
+// to a non-NULL value, which the primary-key point path answers directly.
+func allFullPointRanges(ranges sql.MySQLRangeCollection, n int) bool {
+	for _, r := range ranges {
+		if len(r) != n {
+			return false
+		}
+		for _, col := range r {
+			if _, isNull := col.LowerBound.(sql.BelowNull); isNull || !isPointColumn(col) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (t *table) lookupPrimaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection) (sql.PartitionIter, error) {
@@ -973,80 +1005,9 @@ func (t *table) lookupPrimaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeC
 		}
 		keys = append(keys, string(key))
 	}
-	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
-}
-
-func (t *table) lookupUniquePartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection, def *indexDisk) (sql.PartitionIter, error) {
-	if err := t.state.ensureIndexEdits(ctx); err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0, len(ranges))
-	for _, indexRange := range ranges {
-		if len(indexRange) != len(def.Columns) {
-			return nil, errors.New("incomplete RepoDB unique-index lookup")
-		}
-		row := make(sql.Row, len(t.state.schema.Schema))
-		for i, ordinal := range def.Columns {
-			lower, lok := indexRange[i].LowerBound.(sql.Below)
-			upper, uok := indexRange[i].UpperBound.(sql.Above)
-			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
-				return nil, errors.New("RepoDB unique index received a non-point range")
-			}
-			value, _, err := t.state.schema.Schema[ordinal].Type.Convert(ctx, lower.Key)
-			if err != nil {
-				return nil, err
-			}
-			row[ordinal] = value
-		}
-		idxKey, _, err := encodeIndexKey(t.state.schema, row, def.Columns, nil, true)
-		if err != nil {
-			return nil, err
-		}
-		pkKey, err := t.state.resolveIndexToPK(ctx, def.Name, idxKey)
-		if err != nil {
-			return nil, err
-		}
-		if pkKey != nil {
-			keys = append(keys, string(pkKey))
-		}
-	}
-	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
-}
-
-func (t *table) lookupSecondaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection, def *indexDisk) (sql.PartitionIter, error) {
-	if err := t.state.ensureIndexEdits(ctx); err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0)
-	for _, indexRange := range ranges {
-		if len(indexRange) != len(def.Columns) {
-			return nil, errors.New("incomplete RepoDB secondary-index lookup")
-		}
-		row := make(sql.Row, len(t.state.schema.Schema))
-		for i, ordinal := range def.Columns {
-			lower, lok := indexRange[i].LowerBound.(sql.Below)
-			upper, uok := indexRange[i].UpperBound.(sql.Above)
-			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
-				return nil, errors.New("RepoDB secondary index received a non-point range")
-			}
-			value, _, err := t.state.schema.Schema[ordinal].Type.Convert(ctx, lower.Key)
-			if err != nil {
-				return nil, err
-			}
-			row[ordinal] = value
-		}
-		prefix, _, err := encodeIndexKey(t.state.schema, row, def.Columns, nil, true)
-		if err != nil {
-			return nil, err
-		}
-		pks, err := t.state.resolveIndexToPKs(ctx, def.Name, prefix)
-		if err != nil {
-			return nil, err
-		}
-		for _, pk := range pks {
-			keys = append(keys, string(pk))
-		}
-	}
+	// Keys are order-preserving: sorted keys return rows in index order.
+	sort.Strings(keys)
+	keys = slices.Compact(keys)
 	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
 }
 
@@ -1069,20 +1030,14 @@ func (t *table) partitionRows(ctx context.Context, partition sql.Partition) (sql
 		}
 		return sql.RowsToRowIter(rows...), nil
 	}
-	if err := t.state.ensureRows(ctx); err != nil {
-		return nil, err
+	if rp, ok := partition.(rangePartition); ok {
+		if rp.index != nil {
+			return newIndexRowIter(ctx, t.state, rp.index, rp.intervals)
+		}
+		return newPrimaryRowIter(t.state, rp.intervals), nil
 	}
-	keys := make([]string, 0, len(t.state.rows))
-	performanceCounters.rowsScanned.Add(uint64(len(t.state.rows)))
-	for key := range t.state.rows {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	rows := make([]sql.Row, 0, len(keys))
-	for _, key := range keys {
-		rows = append(rows, cloneRow(t.state.rows[key]))
-	}
-	return sql.RowsToRowIter(rows...), nil
+	// A full scan streams every row in primary-key order.
+	return newPrimaryRowIter(t.state, []keyInterval{{}}), nil
 }
 func (t *table) Inserter(*sql.Context) sql.RowInserter { return &editor{table: t} }
 func (t *table) Updater(*sql.Context) sql.RowUpdater   { return &editor{table: t} }
@@ -1621,17 +1576,20 @@ func (i *primaryIndex) ColumnExpressionTypes(*sql.Context) []sql.ColumnExpressio
 	return types
 }
 func (*primaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
+	return canSupportRanges(ranges, false)
+}
+
+// Order and Reversible make the primary index an sql.OrderedIndex: keys are
+// order-preserving, so scans return rows in ascending primary-key order and
+// the planner can drop matching sorts. Reverse scans are not implemented.
+func (*primaryIndex) Order(*sql.Context) sql.IndexOrder { return sql.IndexOrderAsc }
+func (*primaryIndex) Reversible(*sql.Context) bool      { return false }
+
+func canSupportRanges(ranges []sql.Range, nullable bool) bool {
 	for _, candidate := range ranges {
-		rangeValue, ok := candidate.(sql.MySQLRange)
-		if !ok || len(rangeValue) == 0 {
+		r, ok := candidate.(sql.MySQLRange)
+		if !ok || len(r) == 0 || !rangeShapeSupported(r, nullable) {
 			return false
-		}
-		for _, column := range rangeValue {
-			lower, lok := column.LowerBound.(sql.Below)
-			upper, uok := column.UpperBound.(sql.Above)
-			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
-				return false
-			}
 		}
 	}
 	return true
@@ -1670,21 +1628,11 @@ func (s *secondaryIndex) ColumnExpressionTypes(*sql.Context) []sql.ColumnExpress
 	return cets
 }
 func (*secondaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
-	for _, candidate := range ranges {
-		rangeValue, ok := candidate.(sql.MySQLRange)
-		if !ok || len(rangeValue) == 0 {
-			return false
-		}
-		for _, column := range rangeValue {
-			lower, lok := column.LowerBound.(sql.Below)
-			upper, uok := column.UpperBound.(sql.Above)
-			if !lok || !uok || !reflect.DeepEqual(lower.Key, upper.Key) {
-				return false
-			}
-		}
-	}
-	return true
+	return canSupportRanges(ranges, true)
 }
+
+func (*secondaryIndex) Order(*sql.Context) sql.IndexOrder { return sql.IndexOrderAsc }
+func (*secondaryIndex) Reversible(*sql.Context) bool      { return false }
 
 type editor struct {
 	table       *table
@@ -2217,31 +2165,19 @@ func encodeKey(schema sql.PrimaryKeySchema, row sql.Row) ([]byte, error) {
 		if ordinal < 0 || ordinal >= len(row) || row[ordinal] == nil {
 			return nil, errors.New("primary key columns must be non-NULL")
 		}
-		raw, err := rawValue(schema.Schema[ordinal].Type.Type(), row[ordinal])
-		if err != nil {
+		var err error
+		if out, err = appendKeyColumn(out, schema.Schema[ordinal].Type, row[ordinal]); err != nil {
 			return nil, err
 		}
-		if st, ok := schema.Schema[ordinal].Type.(sql.StringType); ok {
-			if c := st.Collation(); c != sql.Collation_Default {
-				var buf bytes.Buffer
-				if err := c.WriteWeightString(&buf, string(raw)); err != nil {
-					return nil, fmt.Errorf("collation weight string: %w", err)
-				}
-				raw = buf.Bytes()
-			}
-		}
-		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(raw)))
-		out = append(out, byte(schema.Schema[ordinal].Type.Type()>>8), byte(schema.Schema[ordinal].Type.Type()), size[0], size[1], size[2], size[3])
-		out = append(out, raw...)
 	}
 	return out, nil
 }
 
-// encodeIndexKey builds a binary key from the given column ordinals of a row.
-// NULL columns are encoded with a 0x00 marker; non-NULL with 0x01 + value.
-// When any column is NULL, pkKey is appended as a disambiguator so that
-// multiple NULLs produce distinct keys (MySQL semantics: NULL != NULL).
+// encodeIndexKey builds an order-preserving key from the given column ordinals
+// of a row (see keycodec.go). Each column is 0x00 if NULL, else 0x01 followed
+// by its encoding, so NULL sorts first. When any column is NULL, or the index
+// is not unique, pkKey is appended so that entries stay distinct (MySQL
+// semantics: NULL != NULL).
 func encodeIndexKey(schema sql.PrimaryKeySchema, row sql.Row, ordinals []int, pkKey []byte, unique bool) ([]byte, bool, error) {
 	var out []byte
 	hasNull := false
@@ -2252,23 +2188,10 @@ func encodeIndexKey(schema sql.PrimaryKeySchema, row sql.Row, ordinals []int, pk
 			continue
 		}
 		out = append(out, 0x01)
-		raw, err := rawValue(schema.Schema[ordinal].Type.Type(), row[ordinal])
-		if err != nil {
+		var err error
+		if out, err = appendKeyColumn(out, schema.Schema[ordinal].Type, row[ordinal]); err != nil {
 			return nil, false, err
 		}
-		if st, ok := schema.Schema[ordinal].Type.(sql.StringType); ok {
-			if c := st.Collation(); c != sql.Collation_Default {
-				var buf bytes.Buffer
-				if err := c.WriteWeightString(&buf, string(raw)); err != nil {
-					return nil, false, fmt.Errorf("collation weight string: %w", err)
-				}
-				raw = buf.Bytes()
-			}
-		}
-		var size [4]byte
-		binary.BigEndian.PutUint32(size[:], uint32(len(raw)))
-		out = append(out, byte(schema.Schema[ordinal].Type.Type()>>8), byte(schema.Schema[ordinal].Type.Type()), size[0], size[1], size[2], size[3])
-		out = append(out, raw...)
 	}
 	if hasNull || !unique {
 		out = append(out, pkKey...)
@@ -2399,81 +2322,6 @@ func (s *tableState) lookupIndexKey(ctx context.Context, idxName string, key []b
 		return false, nil
 	}
 	return err == nil, err
-}
-
-func (s *tableState) resolveIndexToPK(ctx context.Context, idxName string, idxKey []byte) ([]byte, error) {
-	if edits, ok := s.idxEdits[idxName]; ok {
-		for i := len(edits) - 1; i >= 0; i-- {
-			if bytes.Equal(edits[i].Key, idxKey) {
-				if edits[i].Delete {
-					return nil, nil
-				}
-				return edits[i].Value, nil
-			}
-		}
-	}
-	root, ok := s.manifest.Indexes[idxName]
-	if !ok || !root.Valid() {
-		return nil, nil
-	}
-	tree, err := prolly.Open(s.store, root)
-	if err != nil {
-		return nil, err
-	}
-	value, err := tree.Get(ctx, idxKey)
-	if errors.Is(err, prolly.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return value, nil
-}
-
-func (s *tableState) resolveIndexToPKs(ctx context.Context, idxName string, prefix []byte) ([][]byte, error) {
-	pksByFullKey := make(map[string][]byte)
-
-	root, ok := s.manifest.Indexes[idxName]
-	if ok && root.Valid() {
-		tree, err := prolly.Open(s.store, root)
-		if err != nil {
-			return nil, err
-		}
-		it, err := tree.IteratorFrom(ctx, prefix)
-		if err != nil {
-			return nil, err
-		}
-		defer it.Close()
-		for {
-			entry, ok, err := it.Next()
-			if err != nil {
-				return nil, err
-			}
-			if !ok || !bytes.HasPrefix(entry.Key, prefix) {
-				break
-			}
-			pksByFullKey[string(entry.Key)] = entry.Value
-		}
-	}
-
-	if edits, ok := s.idxEdits[idxName]; ok {
-		for _, edit := range edits {
-			if !bytes.HasPrefix(edit.Key, prefix) {
-				continue
-			}
-			if edit.Delete {
-				delete(pksByFullKey, string(edit.Key))
-			} else {
-				pksByFullKey[string(edit.Key)] = edit.Value
-			}
-		}
-	}
-
-	pks := make([][]byte, 0, len(pksByFullKey))
-	for _, pk := range pksByFullKey {
-		pks = append(pks, pk)
-	}
-	return pks, nil
 }
 
 func (s *tableState) addIndexEdit(idxName string, edit prolly.Edit) {
@@ -2624,6 +2472,8 @@ var _ sql.IndexAddressableTable = (*table)(nil)
 var _ sql.IndexedTable = (*table)(nil)
 var _ sql.Index = (*primaryIndex)(nil)
 var _ sql.Index = (*secondaryIndex)(nil)
+var _ sql.OrderedIndex = (*primaryIndex)(nil)
+var _ sql.OrderedIndex = (*secondaryIndex)(nil)
 var _ sql.IndexAlterableTable = (*table)(nil)
 var _ sql.InsertableTable = (*table)(nil)
 var _ sql.UpdatableTable = (*table)(nil)

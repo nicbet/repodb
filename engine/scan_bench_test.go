@@ -1,0 +1,42 @@
+package engine_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/nicbet/repodb/engine"
+)
+
+// BenchmarkSQLAutocommitScans measures range, ordered-limit and full-scan
+// queries in their own implicit transactions over a 50k-row journal table,
+// the shapes that order-preserving keys let the planner push into the tree.
+func BenchmarkSQLAutocommitScans(b *testing.B) {
+	eng, repo := sqlBenchmarkEngineWithRepository(b, 50_000, 32, 1)
+	if err := eng.Close(); err != nil {
+		b.Fatal(err)
+	}
+	eng, err := engine.NewWithOptions(repo, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer eng.Close()
+	for _, q := range []struct{ name, sql string }{
+		{"range100", "SELECT id, value FROM bench WHERE id BETWEEN 25000 AND 25099"},
+		{"limit20", "SELECT id, value FROM bench ORDER BY id LIMIT 20"},
+		{"after-limit20", "SELECT id, value FROM bench WHERE id > 49000 ORDER BY id LIMIT 20"},
+		{"fullscan", "SELECT id, value FROM bench"},
+	} {
+		b.Run(q.name, func(b *testing.B) {
+			session, _ := eng.NewSession()
+			defer session.Close()
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := session.Query(ctx, q.sql); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
