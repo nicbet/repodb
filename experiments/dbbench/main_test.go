@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -76,5 +78,28 @@ func TestReportOmitsUnavailablePeakRSS(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"process_peak_rss_bytes":42`) {
 		t.Fatalf("measured peak RSS missing: %s", data)
+	}
+}
+
+// Git's background auto-gc prunes loose objects while the harness measures
+// fixture size; an entry listed before it vanished must count as zero.
+func TestEntryBytesToleratesVanishedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "loose-object")
+	if err := os.WriteFile(path, []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("read dir = %v, %v", entries, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := entryBytes(entries[0]); err != nil || n != 0 {
+		t.Fatalf("entryBytes(vanished) = %d, %v; want 0, nil", n, err)
+	}
+	if n, err := directoryBytes(filepath.Join(dir, "missing-root")); err != nil || n != 0 {
+		t.Fatalf("directoryBytes(missing root) = %d, %v; want 0, nil", n, err)
 	}
 }

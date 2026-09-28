@@ -241,22 +241,40 @@ func expect(s *engine.Session, q, value string) error {
 	return nil
 }
 
+// directoryBytes sums logical file sizes under root. Git's background auto-gc
+// can prune loose objects while the walk runs; entries that vanish between
+// listing and stat count as zero bytes instead of failing the measurement.
 func directoryBytes(root string) (int64, error) {
 	var size int64
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if !d.IsDir() {
-			info, e := d.Info()
+			n, e := entryBytes(d)
 			if e != nil {
 				return e
 			}
-			size += info.Size()
+			size += n
 		}
 		return nil
 	})
 	return size, err
+}
+
+// entryBytes returns a directory entry's size, or zero if it no longer exists.
+func entryBytes(d fs.DirEntry) (int64, error) {
+	info, err := d.Info()
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 func percentile(sorted []float64, p float64) float64 {
