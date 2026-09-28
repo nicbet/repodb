@@ -49,6 +49,31 @@ func (e *externalDB) open() error {
 	return e.db.PingContext(ctx)
 }
 
+// externalServerVersion identifies the server under test: SELECT VERSION(),
+// prefixed by the Dolt release when the server is Dolt (whose VERSION() is the
+// MySQL version it emulates).
+func externalServerVersion(dsn string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse DSN: %w", err)
+	}
+	cfg.DBName = ""
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+		return "", err
+	}
+	var dolt string
+	if db.QueryRowContext(ctx, "SELECT dolt_version()").Scan(&dolt) == nil {
+		return fmt.Sprintf("Dolt %s (VERSION() %s)", dolt, version), nil
+	}
+	return version, nil
+}
+
 func (e *externalDB) close() error {
 	if e.db == nil {
 		return nil
@@ -107,6 +132,11 @@ func (e *externalDB) newConn() (*sql.Conn, error) {
 
 func runExternal(r *report, dsn string) error {
 	var failures []error
+	version, err := externalServerVersion(dsn)
+	if err != nil {
+		failures = append(failures, fmt.Errorf("read server version: %w", err))
+	}
+	r.Server = version
 	for _, rows := range r.Config.Rows {
 		if err := runExternalSize(r, dsn, rows); err != nil {
 			failures = append(failures, fmt.Errorf("rows=%d: %w", rows, err))

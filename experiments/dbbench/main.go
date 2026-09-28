@@ -65,6 +65,7 @@ type report struct {
 	Git         string        `json:"git"`
 	Revision    string        `json:"revision"`
 	WorkingTree string        `json:"working_tree_status"`
+	Server      string        `json:"server_version,omitempty"`
 	Root        string        `json:"fixture_root"`
 	Results     []measurement `json:"results"`
 	PeakRSS     *int64        `json:"process_peak_rss_bytes,omitempty"`
@@ -804,6 +805,9 @@ func syncPair(root, name, seed string, options engine.Options) (*database, *data
 
 func printReport(r report) {
 	fmt.Printf("\nRepoDB scorecard v%d | %s | %s | %s\n", r.Version, r.Config.Mode, r.Platform, r.Revision)
+	if r.Server != "" {
+		fmt.Printf("server %s\n", r.Server)
+	}
 	fmt.Println("Latency is per successful request, milliseconds. Conflicts are rejected attempts; no retries. Small samples do not establish stable tails.")
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "Rows\tWorkload\tClients\tOK\tConflict\tError\tStatus\tOps/s\tp50\tp95\tp99\tMax\tGrowth KiB")
@@ -815,6 +819,24 @@ func printReport(r report) {
 		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%d\t%d\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.1f\n", m.Rows, m.Name, m.Clients, m.Success, m.Conflicts, len(m.Errors), status, m.Ops, m.P50, m.P95, m.P99, m.Max, float64(m.Growth)/1024)
 	}
 	_ = w.Flush()
+	printed := false
+	for _, m := range r.Results {
+		reason := m.VerificationError
+		if reason == "" && len(m.Errors) > 0 {
+			reason = m.Errors[0]
+			if len(m.Errors) > 1 {
+				reason += fmt.Sprintf(" (and %d more errors)", len(m.Errors)-1)
+			}
+		}
+		if reason == "" {
+			continue
+		}
+		if !printed {
+			fmt.Println("Correctness failures:")
+			printed = true
+		}
+		fmt.Printf("  rows=%d %s clients=%d: %s\n", m.Rows, m.Name, m.Clients, reason)
+	}
 	if r.PeakRSS != nil {
 		fmt.Printf("Process peak RSS: %.1f MiB (excludes Git/verification children)\n", float64(*r.PeakRSS)/(1024*1024))
 	} else {
