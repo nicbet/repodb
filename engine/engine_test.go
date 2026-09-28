@@ -2592,7 +2592,7 @@ func TestDecimalRoundTrip(t *testing.T) {
 	if len(result.Rows) != 3 {
 		t.Fatalf("got %d rows, want 3", len(result.Rows))
 	}
-	expected := []string{"99.99", "0.1", "12345678.5"}
+	expected := []string{"99.99", "0.10", "12345678.50"}
 	for i, want := range expected {
 		got := fmt.Sprint(result.Rows[i][1])
 		if got != want {

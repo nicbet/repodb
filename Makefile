@@ -1,6 +1,9 @@
 .PHONY: build test cross-windows fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
 .DEFAULT_GOAL := build
 
+# go-mysql-server's default regex backend needs cgo and ICU4C; use its pure-Go one.
+export GOFLAGS += -tags=gms_pure_go
+
 BENCH_MODE ?= native-git
 BENCH_ARGS ?=
 

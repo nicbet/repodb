@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/vitess/go/mysql"
@@ -126,7 +127,7 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 	sqlEngine := sqle.NewDefault(provider)
 	sqlEngine.Analyzer.Catalog.RegisterFunction(sql.NewEmptyContext(), sql.Function1{
 		Name: "repodb_recover_commit",
-		Fn: func(child sql.Expression) sql.Expression {
+		Fn: func(_ *sql.Context, child sql.Expression) sql.Expression {
 			return &recoverCommitExpression{repo: repo, child: child}
 		},
 	})
@@ -644,6 +645,8 @@ func sqlLiteral(value any) (string, error) {
 		return "'" + value.UTC().Format("2006-01-02 15:04:05.999999") + "'", nil
 	case decimal.Decimal:
 		return value.String(), nil
+	case *apd.Decimal:
+		return value.Text('f'), nil
 	default:
 		return "", fmt.Errorf("unsupported SQL parameter type %T", value)
 	}

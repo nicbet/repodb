@@ -17,9 +17,9 @@ func (e *recoverCommitExpression) FunctionName() string { return "repodb_recover
 func (e *recoverCommitExpression) Description() string {
 	return "resolves a RepoDB commit candidate as committed, rejected, or unknown"
 }
-func (e *recoverCommitExpression) Type() sql.Type   { return types.LongText }
-func (e *recoverCommitExpression) IsNullable() bool { return false }
-func (e *recoverCommitExpression) Resolved() bool   { return e.child.Resolved() }
+func (e *recoverCommitExpression) Type(*sql.Context) sql.Type   { return types.LongText }
+func (e *recoverCommitExpression) IsNullable(*sql.Context) bool { return false }
+func (e *recoverCommitExpression) Resolved() bool               { return e.child.Resolved() }
 func (e *recoverCommitExpression) String() string {
 	return fmt.Sprintf("repodb_recover_commit(%s)", e.child)
 }
@@ -27,7 +27,7 @@ func (e *recoverCommitExpression) Children() []sql.Expression { return []sql.Exp
 func (e *recoverCommitExpression) CollationCoercibility(*sql.Context) (sql.CollationID, byte) {
 	return sql.Collation_Default, 4
 }
-func (e *recoverCommitExpression) WithChildren(children ...sql.Expression) (sql.Expression, error) {
+func (e *recoverCommitExpression) WithChildren(_ *sql.Context, children ...sql.Expression) (sql.Expression, error) {
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(e, len(children), 1)
 	}

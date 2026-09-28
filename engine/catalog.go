@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
 	querypb "github.com/dolthub/vitess/go/vt/proto/query"
@@ -704,10 +705,10 @@ type table struct {
 	state *tableState
 }
 
-func (t *table) Name() string       { return t.name }
-func (t *table) String() string     { return t.name }
-func (t *table) Schema() sql.Schema { return sourcedSchema(t.state.schema.Schema, t.name) }
-func (t *table) PrimaryKeySchema() sql.PrimaryKeySchema {
+func (t *table) Name() string                   { return t.name }
+func (t *table) String() string                 { return t.name }
+func (t *table) Schema(*sql.Context) sql.Schema { return sourcedSchema(t.state.schema.Schema, t.name) }
+func (t *table) PrimaryKeySchema(*sql.Context) sql.PrimaryKeySchema {
 	return sql.PrimaryKeySchema{Schema: sourcedSchema(t.state.schema.Schema, t.name), PkOrdinals: append([]int(nil), t.state.schema.PkOrdinals...)}
 }
 func (t *table) Collation() sql.CollationID { return sql.Collation_Default }
@@ -1241,7 +1242,7 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 				if err != nil {
 					return fmt.Errorf("cannot convert column %s value: %w", columnName, err)
 				}
-				if !inRange {
+				if inRange != sql.InRange {
 					return fmt.Errorf("value out of range for column %s new type", columnName)
 				}
 				convertedRows[key] = converted
@@ -1478,17 +1479,21 @@ func (p pointPartition) Key() []byte { return []byte(strings.Join(p.keys, "\x00"
 
 type primaryIndex struct{ table *table }
 
-func (*primaryIndex) ID() string                            { return "PRIMARY" }
-func (i *primaryIndex) Database() string                    { return i.table.db.name }
-func (i *primaryIndex) Table() string                       { return i.table.name }
-func (*primaryIndex) IsUnique() bool                        { return true }
-func (*primaryIndex) IsSpatial() bool                       { return false }
-func (*primaryIndex) IsFullText() bool                      { return false }
-func (*primaryIndex) IsVector() bool                        { return false }
-func (*primaryIndex) Comment() string                       { return "" }
-func (*primaryIndex) IndexType() string                     { return "BTREE" }
-func (*primaryIndex) IsGenerated() bool                     { return false }
-func (*primaryIndex) PrefixLengths() []uint16               { return nil }
+func (*primaryIndex) ID() string              { return "PRIMARY" }
+func (i *primaryIndex) Database() string      { return i.table.db.name }
+func (i *primaryIndex) Table() string         { return i.table.name }
+func (*primaryIndex) IsUnique() bool          { return true }
+func (*primaryIndex) IsSpatial() bool         { return false }
+func (*primaryIndex) IsFullText() bool        { return false }
+func (*primaryIndex) IsVector() bool          { return false }
+func (*primaryIndex) Comment() string         { return "" }
+func (*primaryIndex) IndexType() string       { return "BTREE" }
+func (*primaryIndex) IsGenerated() bool       { return false }
+func (*primaryIndex) PrefixLengths() []uint16 { return nil }
+
+// CoversColumns reports false: index lookups always fetch full rows, so no
+// index is covering.
+func (*primaryIndex) CoversColumns([]string) bool           { return false }
 func (*primaryIndex) CanSupportOrderBy(sql.Expression) bool { return false }
 func (i *primaryIndex) Expressions() []string {
 	expressions := make([]string, len(i.table.state.schema.PkOrdinals))
@@ -1497,7 +1502,7 @@ func (i *primaryIndex) Expressions() []string {
 	}
 	return expressions
 }
-func (i *primaryIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
+func (i *primaryIndex) ColumnExpressionTypes(*sql.Context) []sql.ColumnExpressionType {
 	types := make([]sql.ColumnExpressionType, len(i.table.state.schema.PkOrdinals))
 	for n, ordinal := range i.table.state.schema.PkOrdinals {
 		types[n] = sql.ColumnExpressionType{Expression: i.Expressions()[n], Type: i.table.state.schema.Schema[ordinal].Type}
@@ -1537,6 +1542,7 @@ func (*secondaryIndex) Comment() string                       { return "" }
 func (*secondaryIndex) IndexType() string                     { return "BTREE" }
 func (*secondaryIndex) IsGenerated() bool                     { return false }
 func (*secondaryIndex) PrefixLengths() []uint16               { return nil }
+func (*secondaryIndex) CoversColumns([]string) bool           { return false }
 func (*secondaryIndex) CanSupportOrderBy(sql.Expression) bool { return false }
 func (s *secondaryIndex) Expressions() []string {
 	exprs := make([]string, len(s.def.Columns))
@@ -1545,7 +1551,7 @@ func (s *secondaryIndex) Expressions() []string {
 	}
 	return exprs
 }
-func (s *secondaryIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
+func (s *secondaryIndex) ColumnExpressionTypes(*sql.Context) []sql.ColumnExpressionType {
 	cets := make([]sql.ColumnExpressionType, len(s.def.Columns))
 	for i, ordinal := range s.def.Columns {
 		cets[i] = sql.ColumnExpressionType{Expression: s.Expressions()[i], Type: s.table.state.schema.Schema[ordinal].Type}
@@ -2070,7 +2076,7 @@ func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
 				return nil, err
 			}
 		case querypb.Type_DECIMAL:
-			d, err := decimal.NewFromString(string(raw))
+			d, _, err := apd.NewFromString(string(raw))
 			if err != nil {
 				return nil, err
 			}
@@ -2338,17 +2344,24 @@ func rawValue(typ querypb.Type, value any) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("json value has type %T", value)
 		}
-		s, err := types.JsonToMySqlString(jw)
+		// The context only matters for lazily loaded JSON; RepoDB values are in memory.
+		s, err := types.JsonToMySqlString(context.Background(), jw)
 		if err != nil {
 			return nil, err
 		}
 		return []byte(s), nil
 	case querypb.Type_DECIMAL:
-		d, ok := value.(decimal.Decimal)
+		d, ok := value.(*apd.Decimal)
 		if !ok {
 			return nil, fmt.Errorf("decimal value has type %T", value)
 		}
-		return []byte(d.String()), nil
+		// Stored rows and keys use shopspring's canonical form (trailing zeros
+		// trimmed); keep it so existing data and index keys still match.
+		canonical, err := decimal.NewFromString(d.Text('f'))
+		if err != nil {
+			return nil, err
+		}
+		return []byte(canonical.String()), nil
 	case querypb.Type_ENUM:
 		v, ok := value.(uint16)
 		if !ok {

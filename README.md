@@ -89,6 +89,8 @@ For Go applications, add the module and use the engine directly:
 go get github.com/nicbet/repodb/engine
 ```
 
+Build with `-tags gms_pure_go` (for example `go build -tags gms_pure_go ./...`, or set `GOFLAGS=-tags=gms_pure_go`). RepoDB uses go-mysql-server, whose default regular-expression backend links the ICU4C C library through cgo; the tag selects its pure-Go backend instead, so SQL `REGEXP` functions use Go's RE2 syntax. Without the tag you need cgo, a C++ toolchain, and ICU4C installed.
+
 ```go
 eng, err := engine.Open(ctx, ".")
 defer eng.Close()
@@ -106,7 +108,7 @@ The engine defaults to journal persistence: SQL commits are durable immediately 
 
 ## Installation
 
-Build from source with **Go 1.25 or newer**, Git, and Make. The current implementation requires POSIX file locking; the documented baseline uses macOS and Git 2.55. See [storage and durability assumptions](docs/storage-format.md).
+Build from source with **Go 1.26 or newer**, Git, and Make. The current implementation requires POSIX file locking; the documented baseline uses macOS and Git 2.55. See [storage and durability assumptions](docs/storage-format.md).
 
 ```sh
 git clone https://github.com/nicbet/repodb.git
@@ -118,8 +120,8 @@ export PATH="$PWD/bin:$PATH"
 You can also install the command-line programs directly:
 
 ```sh
-go install github.com/nicbet/repodb/cmd/repodb@latest
-go install github.com/nicbet/repodb/cmd/repodb-server@latest
+go install -tags gms_pure_go github.com/nicbet/repodb/cmd/repodb@latest
+go install -tags gms_pure_go github.com/nicbet/repodb/cmd/repodb-server@latest
 ```
 
 ## Performance
@@ -143,7 +145,7 @@ See the [full scorecard](docs/benchmark.md) for methodology, concurrency, sync l
 ```sh
 make build
 make test
-go test -race ./common/repository ./engine ./integration
+go test -race -tags gms_pure_go ./common/repository ./engine ./integration
 git diff --check
 ```
 

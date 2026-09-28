@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	mysqlserver "github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
@@ -24,6 +25,9 @@ type Server struct {
 	wire   *mysqlserver.Server
 	engine *engine.Engine
 	repo   *repository.Repository
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func New(config Config) (*Server, error) {
@@ -57,7 +61,13 @@ func (s *Server) Address() string { return s.wire.Listener.Addr().String() }
 
 func (s *Server) Start() error { return s.wire.Start() }
 
+// Close is idempotent; go-mysql-server's own Close panics on a second call.
 func (s *Server) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.close() })
+	return s.closeErr
+}
+
+func (s *Server) close() error {
 	wireErr := s.wire.Close()
 	engineErr := s.engine.Close()
 	if errors.Is(engineErr, context.Canceled) {
