@@ -4,10 +4,11 @@ This remains the default native-Git persistence path. M4.3's opt-in authoritativ
 journal and intentional checkpoint protocol are documented in
 [working-state.md](working-state.md); they do not change the default yet.
 
-Status: format version 2 (2026-09-28): order-preserving keys. Format version 1
-was the 2026-09-11 baseline. RepoDB is alpha and does not migrate between
-formats: opening a format 1 data history fails with an unsupported-format error
-asking to re-initialize it.
+Status: format version 3 (2026-09-28): binary row encoding. Format version 2
+(2026-09-28) introduced order-preserving keys; format version 1 was the
+2026-09-11 baseline. RepoDB is alpha and does not migrate between formats:
+opening an older data history fails with an unsupported-format error asking to
+re-initialize it.
 
 ## Authoritative state
 
@@ -37,10 +38,10 @@ contents as opaque bytes.
 The Git commit has the previous data head as its sole parent. Initial snapshots
 have no parent. Commits use `RepoDB <repodb@localhost>` as author and committer
 and `RepoDB snapshot v<format version>` as the subject (currently
-`RepoDB snapshot v2`). Commit timestamps come from Git at publication time.
+`RepoDB snapshot v3`). Commit timestamps come from Git at publication time.
 Source commits and data commits have independent histories.
 
-## Key encoding (format 2)
+## Key encoding (format 2 and later)
 
 Rows live in Prolly trees keyed by their primary key; secondary indexes are
 Prolly trees keyed by index columns. Keys are the concatenation of one
@@ -65,6 +66,31 @@ encoding, so NULLs sort first, and appends the primary key when the index is not
 unique or a column is NULL. Keys are never decoded; row values are stored in the
 row blob. Format 1 keys (`type, length, decimal text`) were not
 order-preserving, which limited lookups to exact points.
+
+## Row encoding (format 3)
+
+A row value in the primary Prolly tree is a binary blob (`engine/rowcodec.go`):
+a uvarint column count, a NULL bitmap of `ceil(n/8)` bytes (bit `i%8` of byte
+`i/8` set when column `i` is NULL), then one cell per non-NULL column in schema
+order.
+
+| SQL type | Cell encoding |
+| --- | --- |
+| signed integers | zigzag varint |
+| unsigned integers, ENUM index | uvarint |
+| FLOAT | 4-byte little-endian IEEE-754 bits |
+| DOUBLE | 8-byte little-endian IEEE-754 bits |
+| DATE/DATETIME/TIMESTAMP | 8-byte little-endian int64 microseconds since the Unix epoch (UTC) |
+| TIME | zigzag varint microseconds |
+| DECIMAL | unscaled value (value × 10^scale): `0x00` + zigzag varint when it fits int64, else `0x01`, a sign byte and a uvarint-length big-endian magnitude |
+| JSON | uvarint length + canonical MySQL JSON text |
+| CHAR/VARCHAR/TEXT, BINARY/VARBINARY/BLOB | uvarint length + bytes |
+
+The schema describes the cells, so rows carry no type tags. Every encoding is a
+function of the value (negative zero DECIMALs encode as zero), so equal rows
+have equal bytes: three-way merge compares row blobs byte for byte. Changing a
+column's type, including a DECIMAL's scale, rewrites the table's rows. Format 2
+rows were JSON arrays of base64 text cells.
 
 ## Publication and concurrency
 

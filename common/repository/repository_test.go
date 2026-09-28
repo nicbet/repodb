@@ -534,16 +534,21 @@ func TestAbsentUnsupportedAndCorruptRepositories(t *testing.T) {
 		t.Fatalf("absent error = %v", err)
 	}
 
-	unsupportedRoot := initRepository(t)
-	unsupportedRepo, err := repository.Init(ctx, unsupportedRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, _ := unsupportedRepo.Current(ctx)
-	unsupported := []byte("{\"format_version\":99,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[]}\n")
-	installRawManifest(t, unsupportedRepo, head.Commit, unsupported)
-	if _, err := repository.Open(ctx, unsupportedRoot); err == nil || !strings.Contains(err.Error(), "unsupported RepoDB format 99") {
-		t.Fatalf("unsupported format error = %v", err)
+	// 99 is from the future; FormatVersion-1 is the previous alpha format,
+	// which is refused rather than migrated.
+	for _, version := range []int{99, repository.FormatVersion - 1} {
+		unsupportedRoot := initRepository(t)
+		unsupportedRepo, err := repository.Init(ctx, unsupportedRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		head, _ := unsupportedRepo.Current(ctx)
+		unsupported := []byte(fmt.Sprintf("{\"format_version\":%d,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[]}\n", version))
+		installRawManifest(t, unsupportedRepo, head.Commit, unsupported)
+		want := fmt.Sprintf("unsupported RepoDB format %d (supported: %d)", version, repository.FormatVersion)
+		if _, err := repository.Open(ctx, unsupportedRoot); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("format %d error = %v", version, err)
+		}
 	}
 
 	corruptRoot := initRepository(t)
@@ -553,7 +558,7 @@ func TestAbsentUnsupportedAndCorruptRepositories(t *testing.T) {
 	}
 	base, _ := corruptRepo.Current(ctx)
 	fake := strings.Repeat("a", 64)
-	corrupt := []byte(fmt.Sprintf("{\"format_version\":2,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[%q]}\n", fake))
+	corrupt := []byte(fmt.Sprintf("{\"format_version\":%d,\"default_database\":\"repodb\",\"tables\":{},\"objects\":[%q]}\n", repository.FormatVersion, fake))
 	installRawManifest(t, corruptRepo, base.Commit, corrupt)
 	if _, err := repository.Open(ctx, corruptRoot); !errors.Is(err, repository.ErrCorrupt) {
 		t.Fatalf("corrupt snapshot error = %v", err)

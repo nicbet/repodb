@@ -24,6 +24,7 @@ func BenchmarkSQLAutocommitScans(b *testing.B) {
 		{"range100", "SELECT id, value FROM bench WHERE id BETWEEN 25000 AND 25099"},
 		{"limit20", "SELECT id, value FROM bench ORDER BY id LIMIT 20"},
 		{"after-limit20", "SELECT id, value FROM bench WHERE id > 49000 ORDER BY id LIMIT 20"},
+		{"range10k", "SELECT id, value FROM bench WHERE id BETWEEN 20000 AND 29999"},
 		{"fullscan", "SELECT id, value FROM bench"},
 	} {
 		b.Run(q.name, func(b *testing.B) {

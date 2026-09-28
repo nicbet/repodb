@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	FormatVersion = 2
+	FormatVersion = 3
 	DataRef       = "refs/repodb/data"
 )
 

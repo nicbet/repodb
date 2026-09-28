@@ -10,19 +10,16 @@ import (
 	"reflect"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
 	querypb "github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
-	"github.com/shopspring/decimal"
 )
 
 type provider struct{ db *database }
@@ -1955,7 +1952,7 @@ func decodeSchema(data []byte) (sql.PrimaryKeySchema, []sql.CheckDefinition, []i
 }
 
 // decodeType maps a querypb.Type to a go-mysql-server sql.Type.
-// Future cleanup: these per-type switches (decodeType, rawValue, decodeRow)
+// Future cleanup: these per-type switches (decodeType, appendCell, rowDecoder.cell)
 // could be collapsed into a type registry keyed by querypb.Type.
 func decodeType(t querypb.Type, length int64, precision int, scale int, enumValues []string, collation sql.CollationID) (sql.Type, error) {
 	switch t {
@@ -2042,121 +2039,6 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 		}
 	}
 	return nil
-}
-
-type cellDisk struct {
-	Null  bool   `json:"null,omitempty"`
-	Value string `json:"value,omitempty"`
-}
-
-func encodeRow(schema sql.Schema, row sql.Row) ([]byte, error) {
-	if len(row) != len(schema) {
-		return nil, fmt.Errorf("row has %d values, schema has %d", len(row), len(schema))
-	}
-	cells := make([]cellDisk, len(row))
-	for i, value := range row {
-		if value == nil {
-			cells[i].Null = true
-			continue
-		}
-		raw, err := rawValue(schema[i].Type.Type(), value)
-		if err != nil {
-			return nil, err
-		}
-		cells[i].Value = base64.RawStdEncoding.EncodeToString(raw)
-	}
-	return json.Marshal(cells)
-}
-func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
-	var cells []cellDisk
-	if err := json.Unmarshal(data, &cells); err != nil {
-		return nil, err
-	}
-	if len(cells) != len(schema) {
-		return nil, errors.New("stored row width does not match schema")
-	}
-	row := make(sql.Row, len(cells))
-	for i, cell := range cells {
-		if cell.Null {
-			continue
-		}
-		raw, err := base64.RawStdEncoding.DecodeString(cell.Value)
-		if err != nil {
-			return nil, err
-		}
-		switch schema[i].Type.Type() {
-		case querypb.Type_INT8, querypb.Type_INT16, querypb.Type_INT24, querypb.Type_INT32, querypb.Type_INT64:
-			v, err := strconv.ParseInt(string(raw), 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			row[i], _, err = schema[i].Type.Convert(context.Background(), v)
-			if err != nil {
-				return nil, err
-			}
-		case querypb.Type_UINT8, querypb.Type_UINT16, querypb.Type_UINT24, querypb.Type_UINT32, querypb.Type_UINT64:
-			v, err := strconv.ParseUint(string(raw), 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			row[i], _, err = schema[i].Type.Convert(context.Background(), v)
-			if err != nil {
-				return nil, err
-			}
-		case querypb.Type_FLOAT32, querypb.Type_FLOAT64:
-			v, err := strconv.ParseFloat(string(raw), 64)
-			if err != nil {
-				return nil, err
-			}
-			row[i], _, err = schema[i].Type.Convert(context.Background(), v)
-			if err != nil {
-				return nil, err
-			}
-		case querypb.Type_BLOB, querypb.Type_VARBINARY, querypb.Type_BINARY:
-			row[i] = append([]byte(nil), raw...)
-		case querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
-			t, err := time.Parse(time.RFC3339Nano, string(raw))
-			if err != nil {
-				return nil, err
-			}
-			row[i], _, err = schema[i].Type.Convert(context.Background(), t)
-			if err != nil {
-				return nil, err
-			}
-		case querypb.Type_TIME:
-			v, err := strconv.ParseInt(string(raw), 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			row[i] = types.Timespan(v)
-		case querypb.Type_JSON:
-			row[i], _, err = types.JSON.Convert(context.Background(), string(raw))
-			if err != nil {
-				return nil, err
-			}
-		case querypb.Type_DECIMAL:
-			d, _, err := apd.NewFromString(string(raw))
-			if err != nil {
-				return nil, err
-			}
-			row[i], _, err = schema[i].Type.Convert(context.Background(), d)
-			if err != nil {
-				return nil, err
-			}
-		case querypb.Type_ENUM:
-			v, err := strconv.ParseUint(string(raw), 10, 16)
-			if err != nil {
-				return nil, err
-			}
-			row[i], _, err = schema[i].Type.Convert(context.Background(), v)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			row[i] = string(raw)
-		}
-	}
-	return row, nil
 }
 
 func encodeKey(schema sql.PrimaryKeySchema, row sql.Row) ([]byte, error) {
@@ -2329,71 +2211,6 @@ func (s *tableState) addIndexEdit(idxName string, edit prolly.Edit) {
 		panic("addIndexEdit called before ensureIndexEdits")
 	}
 	s.idxEdits[idxName] = append(s.idxEdits[idxName], edit)
-}
-
-func rawValue(typ querypb.Type, value any) ([]byte, error) {
-	switch typ {
-	case querypb.Type_BLOB, querypb.Type_VARBINARY, querypb.Type_BINARY:
-		switch value := value.(type) {
-		case []byte:
-			return append([]byte(nil), value...), nil
-		case string:
-			return []byte(value), nil
-		default:
-			return nil, fmt.Errorf("binary value has type %T", value)
-		}
-	case querypb.Type_INT8, querypb.Type_INT16, querypb.Type_INT24, querypb.Type_INT32, querypb.Type_INT64,
-		querypb.Type_UINT8, querypb.Type_UINT16, querypb.Type_UINT24, querypb.Type_UINT32, querypb.Type_UINT64,
-		querypb.Type_FLOAT32, querypb.Type_FLOAT64:
-		return []byte(fmt.Sprint(value)), nil
-	case querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
-		t, ok := value.(time.Time)
-		if !ok {
-			return nil, fmt.Errorf("datetime value has type %T", value)
-		}
-		return []byte(t.UTC().Format(time.RFC3339Nano)), nil
-	case querypb.Type_TIME:
-		ts, ok := value.(types.Timespan)
-		if !ok {
-			return nil, fmt.Errorf("time value has type %T", value)
-		}
-		return []byte(strconv.FormatInt(int64(ts), 10)), nil
-	case querypb.Type_JSON:
-		jw, ok := value.(sql.JSONWrapper)
-		if !ok {
-			return nil, fmt.Errorf("json value has type %T", value)
-		}
-		// The context only matters for lazily loaded JSON; RepoDB values are in memory.
-		s, err := types.JsonToMySqlString(context.Background(), jw)
-		if err != nil {
-			return nil, err
-		}
-		return []byte(s), nil
-	case querypb.Type_DECIMAL:
-		d, ok := value.(*apd.Decimal)
-		if !ok {
-			return nil, fmt.Errorf("decimal value has type %T", value)
-		}
-		// Stored rows and keys use shopspring's canonical form (trailing zeros
-		// trimmed); keep it so existing data and index keys still match.
-		canonical, err := decimal.NewFromString(d.Text('f'))
-		if err != nil {
-			return nil, err
-		}
-		return []byte(canonical.String()), nil
-	case querypb.Type_ENUM:
-		v, ok := value.(uint16)
-		if !ok {
-			return nil, fmt.Errorf("enum value has type %T", value)
-		}
-		return []byte(strconv.FormatUint(uint64(v), 10)), nil
-	default:
-		value, ok := value.(string)
-		if !ok {
-			return nil, fmt.Errorf("text value has type %T", value)
-		}
-		return []byte(value), nil
-	}
 }
 
 func loadTableMetadata(ctx context.Context, store storage.Store, manifest repository.Table) (*tableState, error) {

@@ -4431,3 +4431,58 @@ func gitRepository(t testing.TB) string {
 	}
 	return root
 }
+
+// Row blobs store DECIMALs as unscaled integers at the column scale, so a
+// scale change must rewrite them. Reopening reads the rows back from storage.
+func TestAlterTableModifyDecimalScaleRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	for _, stmt := range []string{
+		"CREATE TABLE t (id BIGINT PRIMARY KEY, amount DECIMAL(10,2), big DECIMAL(40,10))",
+		"INSERT INTO t VALUES (1, 1234.56, 123456789012345678901234567890.0123456789), (2, -0.05, -1), (3, NULL, 0)",
+		"ALTER TABLE t MODIFY COLUMN amount DECIMAL(12,4)",
+		"ALTER TABLE t MODIFY COLUMN big DECIMAL(40,2)",
+	} {
+		if err := s.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	s.Close()
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	eng, err = engine.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	s, _ = eng.NewSession()
+	defer s.Close()
+	result, err := s.Query(ctx, "SELECT id, CAST(amount AS CHAR), CAST(big AS CHAR) FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]any{
+		{int64(1), "1234.5600", "123456789012345678901234567890.01"},
+		{int64(2), "-0.0500", "-1.00"},
+		{int64(3), nil, "0.00"},
+	}
+	if len(result.Rows) != len(want) {
+		t.Fatalf("got %d rows, want %d", len(result.Rows), len(want))
+	}
+	for i := range want {
+		for j := range want[i] {
+			if result.Rows[i][j] != want[i][j] {
+				t.Fatalf("row %d column %d = %#v, want %#v", i, j, result.Rows[i][j], want[i][j])
+			}
+		}
+	}
+}

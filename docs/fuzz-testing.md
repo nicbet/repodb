@@ -29,6 +29,11 @@ path.
 
 Each verifies `decodeRow(encodeRow(row)) == row` for the given column type.
 
+`FuzzDecodeRow` (`engine/rowcodec_test.go`) feeds arbitrary bytes to
+`decodeRow` for a schema with a column of every supported type. Decoding must
+fail cleanly rather than panic, and whatever decodes must survive another
+encode/decode round-trip unchanged.
+
 ### Schema encoding round-trip
 
 | Target | Property |
