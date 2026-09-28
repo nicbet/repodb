@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/nicbet/repodb/common/robustio"
 )
 
 // Filesystem stores immutable objects beneath a Git-tracked directory. Object
@@ -71,7 +73,7 @@ func (f *Filesystem) Put(_ context.Context, data []byte) (Hash, error) {
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := robustio.Rename(tmpName, path); err != nil {
 		return "", err
 	}
 	return hash, nil

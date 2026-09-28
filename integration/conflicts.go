@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/nicbet/repodb/common/repository"
+	"github.com/nicbet/repodb/common/robustio"
 	"github.com/nicbet/repodb/engine"
 )
 
@@ -151,11 +152,11 @@ func saveConflictSet(repo *repository.Repository, set ConflictSet) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	return robustio.Rename(name, path)
 }
 
 func clearConflictSet(repo *repository.Repository, remote string) error {
-	err := os.Remove(conflictPath(repo, remote))
+	err := robustio.Remove(conflictPath(repo, remote))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
