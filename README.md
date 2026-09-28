@@ -107,7 +107,7 @@ The engine defaults to journal persistence: SQL commits are durable immediately 
 
 ## Installation
 
-Build from source with **Go 1.26 or newer**, Git, and Make. The current implementation requires POSIX file locking; the documented baseline uses macOS and Git 2.55. See [storage and durability assumptions](docs/storage-format.md).
+Build from source with **Go 1.26 or newer**, Git, and Make. The tested baseline is macOS with Git 2.55. Windows builds and passes `go vet` on every `make test`, but the test suite has not been run on Windows yet. See [storage and durability assumptions](docs/storage-format.md).
 
 ```sh
 git clone https://github.com/nicbet/repodb.git

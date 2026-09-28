@@ -79,7 +79,11 @@ A snapshot writer pins its base commit and implements the content-addressed
 5. Run `git update-ref refs/repodb/data <new> <expected-old>`.
 6. Reload and verify the newly published snapshot before returning success.
 
-The lock is an advisory POSIX file lock shared by linked worktrees and processes.
+The lock is shared by linked worktrees and processes. It is taken through
+`gofrs/flock`: an advisory `flock(2)` lock on Unix and a mandatory `LockFileEx`
+lock on Windows. The lock file is only held, never read or written, so the
+difference does not matter. The working-state journal lock (`working.lock`)
+works the same way.
 The expected old ref value remains the authority: concurrent writers based on
 the same snapshot yield exactly one success, while every stale writer receives
 `repository.ErrConflict`. A failed or interrupted operation before `update-ref`
@@ -103,8 +107,10 @@ RepoDB reports a normal successful publication only after the compare-and-swap
 `update-ref` process exits and the resulting snapshot passes integrity checks.
 If the ref advanced but a later check fails, the commit error explicitly carries
 a committed outcome and candidate ID. This baseline was exercised with Git
-2.55.0 on a local macOS filesystem. The current
-implementation requires POSIX `flock`. Automated round trips cover both Git's
+2.55.0 on a local macOS filesystem. Windows builds and passes `go vet` on every
+`make test`, and has Windows-specific rename and removal handling, but the test
+suite has not been run on Windows. Linux shares the Unix code path and is not
+separately qualified. Automated round trips cover both Git's
 SHA-1 and SHA-256 repository object formats; RepoDB content identities remain
 SHA-256 in either case.
 

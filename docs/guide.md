@@ -336,8 +336,7 @@ Linked Git worktrees share the journal and publication lock with the main worktr
 
 RepoDB stores data on `refs/repodb/data`, a ref outside the normal branch namespace. It uses a temporary index under `<git-common-dir>/repodb/tmp` and never touches the user's index or working tree.
 
-Publication is serialized by a POSIX file lock at `<git-common-dir>/repodb/locks/publish.lock`. The lock is shared across
-worktrees.
+Publication is serialized by a file lock at `<git-common-dir>/repodb/locks/publish.lock` (`flock(2)` on Unix, `LockFileEx` on Windows). The lock is shared across worktrees and processes.
 
 Git commands that operate on source branches (`checkout`, `merge`, `rebase`) have no effect on RepoDB data. Concurrent fetch or sync operations do not affect in-flight SQL transactions because sessions pin immutable snapshots.
 
