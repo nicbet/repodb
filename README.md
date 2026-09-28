@@ -126,19 +126,19 @@ go install -tags gms_pure_go github.com/nicbet/repodb/cmd/repodb-server@latest
 
 ## Performance
 
-Measured 2026-09-13 across mixed revisions, before the current code; a fresh run is pending. See [latest results](docs/benchmarks/latest.md) and the [2026-09-13 report](docs/benchmarks/history/2026-09-13-m4.4-scorecard.md).
+Measured 2026-09-28 at `57a0cd8` on an Apple M1 Max: p50 at 50k rows, with RepoDB embedded and MySQL and Dolt over loopback TCP. See [latest results](docs/benchmarks/latest.md) for all sizes, concurrency, sync, and the environment.
 
 Journal-mode point reads are sub-millisecond; single-row writes take ~5 ms (one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the journal appends one record regardless of batch size.
 
-| Workload (50k rows) | MySQL 8 |    Dolt | RepoDB Journal |
-| ------------------- | ------: | ------: | -------------: |
-| Point read          | 0.23 ms | 0.39 ms |        0.11 ms |
-| Read tx (10 reads)  |  6.5 ms |  7.5 ms |        0.77 ms |
-| Update x1           |  1.3 ms |  1.7 ms |         5.0 ms |
-| Update x100         |   59 ms |   80 ms |         7.1 ms |
-| Insert              |  1.2 ms |  1.0 ms |         5.0 ms |
+| Workload (50k rows) | MySQL 8.4 | Dolt 2.3 | RepoDB Journal |
+| ------------------- | --------: | -------: | -------------: |
+| Point read          |   0.26 ms |  0.38 ms |        0.09 ms |
+| Read tx (10 reads)  |    6.4 ms |   7.7 ms |        0.79 ms |
+| Update x1           |    1.3 ms |   1.5 ms |         4.6 ms |
+| Update x100         |     44 ms |    80 ms |         7.0 ms |
+| Insert              |   0.74 ms |  0.91 ms |         5.0 ms |
 
-Range queries and full scans are slower because RepoDB decodes rows from a content-addressed tree rather than scanning buffer-pool pages. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
+Range queries and full scans are slower (about 90 ms at 50k rows) because RepoDB decodes rows from a content-addressed tree rather than scanning buffer-pool pages. Concurrent writers to the same rows are rejected rather than queued, and journal-mode merge syncs take about 20 s at 50k rows. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
 
 See the [latest results](docs/benchmarks/latest.md) for concurrency, sync latency, and the native-Git comparison, and the [methodology](docs/benchmark.md) for how they are measured.
 
