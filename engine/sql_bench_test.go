@@ -133,7 +133,7 @@ func BenchmarkM43JournalCheckpoint(b *testing.B) {
 					b.Fatal(err)
 				}
 				b.StartTimer()
-				if _, err := eng.WorkingState().Checkpoint(context.Background(), "M4.3 benchmark checkpoint"); err != nil {
+				if _, err := eng.Checkpoint(context.Background(), "M4.3 benchmark checkpoint"); err != nil {
 					b.Fatal(err)
 				}
 				b.StopTimer()

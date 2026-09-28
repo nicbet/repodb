@@ -381,3 +381,41 @@ func TestJournalCacheUsesVerifiedOffsetAndDetectsReplacement(t *testing.T) {
 		t.Fatalf("replacement metrics = %#v", metrics)
 	}
 }
+
+func TestWorkingCheckpointRefusesPendingRowEdits(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	session, _ := eng.NewSession()
+	defer session.Close()
+	if err := session.Exec(ctx, "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Exec(ctx, "INSERT INTO items VALUES (1, 'a'), (2, 'b')"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := eng.WorkingState().Checkpoint(ctx, "would drop rows")
+	if !errors.Is(err, repository.ErrPendingRowEdits) || result.Outcome != repository.OutcomeRejected {
+		t.Fatalf("working checkpoint = %#v, %v; want ErrPendingRowEdits", result, err)
+	}
+	status, err := eng.WorkingState().Status(ctx)
+	if err != nil || !status.Dirty {
+		t.Fatalf("status after refused checkpoint = %#v, %v", status, err)
+	}
+
+	if _, err := eng.Checkpoint(ctx, "engine checkpoint"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := session.Query(ctx, "SELECT COUNT(*) FROM items")
+	if err != nil || len(got.Rows) != 1 || got.Rows[0][0] != int64(2) {
+		t.Fatalf("rows after engine checkpoint = %#v, %v", got.Rows, err)
+	}
+}

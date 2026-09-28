@@ -100,12 +100,7 @@ func run(ctx context.Context, args []string) error {
 		if strings.TrimSpace(*message) == "" {
 			return errors.New("commit requires -m <message>")
 		}
-		repo, err := repository.Open(ctx, *repoPath)
-		if err != nil {
-			return err
-		}
-		working, _ := repository.OpenWorkingState(repo)
-		result, err := working.Checkpoint(ctx, *message)
+		result, err := checkpoint(ctx, *repoPath, *message)
 		if err != nil {
 			return err
 		}
@@ -250,7 +245,10 @@ func promptCheckpointIfDirty(ctx context.Context, repoPath string) error {
 	if err != nil {
 		return err
 	}
-	working, _ := repository.OpenWorkingState(repo)
+	working, err := repository.OpenWorkingState(repo)
+	if err != nil {
+		return err
+	}
 	if !working.Exists() {
 		return nil
 	}
@@ -269,12 +267,23 @@ func promptCheckpointIfDirty(ctx context.Context, repoPath string) error {
 	if answer := strings.TrimSpace(line); answer != "y" && answer != "Y" {
 		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", integration.ErrWorkingDirty, ws.Generation)
 	}
-	result, err := working.Checkpoint(ctx, "checkpoint before sync")
+	result, err := checkpoint(ctx, repoPath, "checkpoint before sync")
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "RepoDB data commit: %s\n", result.Commit)
 	return nil
+}
+
+// checkpoint publishes the journal through the engine, which materializes
+// pending typed row edits into Prolly trees before committing.
+func checkpoint(ctx context.Context, repoPath, message string) (repository.CommitResult, error) {
+	eng, err := engine.OpenWithOptions(ctx, repoPath, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		return repository.CommitResult{}, err
+	}
+	result, err := eng.Checkpoint(ctx, message)
+	return result, errors.Join(err, eng.Close())
 }
 
 func runSQL(ctx context.Context, args []string) error {

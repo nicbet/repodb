@@ -28,6 +28,7 @@ var (
 	ErrWorkingCorrupt     = errors.New("corrupt RepoDB working journal")
 	ErrWorkingBaseChanged = errors.New("RepoDB committed head changed while working state is dirty")
 	ErrWorkingStateDirty  = errors.New("RepoDB durable working state is dirty")
+	ErrPendingRowEdits    = errors.New("RepoDB working state has pending row edits; checkpoint through the engine")
 )
 
 type WorkingFaultPoint string
@@ -549,6 +550,14 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 	}
 	if !view.dirty {
 		return CommitResult{Outcome: OutcomeCommitted, Commit: view.snapshot.Commit, Snapshot: view.snapshot}, nil
+	}
+	// Typed row edits live only in the journal until the engine builds Prolly
+	// trees from them. Publishing the snapshot objects alone and marking the
+	// journal clean would discard those rows.
+	for _, rows := range view.snapshot.PendingEdits() {
+		if len(rows) > 0 {
+			return CommitResult{Outcome: OutcomeRejected}, ErrPendingRowEdits
+		}
 	}
 	base, err := w.repo.SnapshotCommit(ctx, view.baseCommit)
 	if err != nil {
