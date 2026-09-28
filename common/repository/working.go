@@ -119,10 +119,10 @@ type journalRecord struct {
 }
 
 type TypedTableEdit struct {
-	Table  string           `json:"table"`
-	Schema []byte           `json:"schema,omitempty"`
-	Drop   bool             `json:"drop,omitempty"`
-	Edits  []TypedRowEdit   `json:"edits,omitempty"`
+	Table  string         `json:"table"`
+	Schema []byte         `json:"schema,omitempty"`
+	Drop   bool           `json:"drop,omitempty"`
+	Edits  []TypedRowEdit `json:"edits,omitempty"`
 }
 
 type TypedRowEdit struct {

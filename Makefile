@@ -1,4 +1,4 @@
-.PHONY: build test cross-windows fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
+.PHONY: build test lint cross-windows fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
 .DEFAULT_GOAL := build
 
 # go-mysql-server's default regex backend needs cgo and ICU4C; use its pure-Go one.
@@ -24,6 +24,16 @@ test: cross-windows
 cross-windows:
 	GOOS=windows GOARCH=amd64 go build ./...
 	GOOS=windows GOARCH=amd64 go vet ./...
+
+STATICCHECK_VERSION := v0.8.1
+
+lint:
+	@test -z "$$(gofmt -l client cmd common engine experiments integration server)" || { gofmt -l client cmd common engine experiments integration server; exit 1; }
+	go vet ./...
+	GOOS=windows GOARCH=amd64 go vet ./...
+	GOBIN=$(CURDIR)/bin go install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
+	bin/staticcheck ./...
+	GOOS=windows GOARCH=amd64 bin/staticcheck ./...
 
 fmt:
 	gofmt -w client cmd common engine experiments integration server

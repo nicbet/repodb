@@ -75,7 +75,7 @@ func (e *CommitError) Unwrap() error { return e.Err }
 type Table struct {
 	SchemaRoot storage.Hash            `json:"schema_root,omitempty"`
 	DataRoot   storage.Hash            `json:"data_root,omitempty"`
-	Indexes    map[string]storage.Hash  `json:"indexes,omitempty"`
+	Indexes    map[string]storage.Hash `json:"indexes,omitempty"`
 }
 
 func (t Table) Equal(other Table) bool {
@@ -931,17 +931,6 @@ func (*snapshotStore) Put(context.Context, []byte) (storage.Hash, error) {
 	return "", errors.New("snapshot store is read-only")
 }
 
-func validateManifest(manifest Manifest, objects map[storage.Hash][]byte) error {
-	set := make(map[storage.Hash]struct{}, len(objects))
-	for hash, data := range objects {
-		if !hash.Valid() || storage.Sum(data) != hash {
-			return fmt.Errorf("object %q failed integrity check", hash)
-		}
-		set[hash] = struct{}{}
-	}
-	return validateManifestInventory(manifest, set)
-}
-
 func validateManifestInventory(manifest Manifest, objects map[storage.Hash]struct{}) error {
 	if manifest.DefaultDatabase == "" {
 		return fmt.Errorf("%w: default database is empty", ErrCorrupt)
@@ -965,15 +954,6 @@ func validateManifestInventory(manifest Manifest, objects map[storage.Hash]struc
 	return nil
 }
 
-func sortedHashes(objects map[storage.Hash][]byte) []storage.Hash {
-	hashes := make([]storage.Hash, 0, len(objects))
-	for hash := range objects {
-		hashes = append(hashes, hash)
-	}
-	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
-	return hashes
-}
-
 func sortedHashSet(objects map[storage.Hash]struct{}) []storage.Hash {
 	hashes := make([]storage.Hash, 0, len(objects))
 	for hash := range objects {
@@ -981,14 +961,6 @@ func sortedHashSet(objects map[storage.Hash]struct{}) []storage.Hash {
 	}
 	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
 	return hashes
-}
-
-func cloneObjects(objects map[storage.Hash][]byte) map[storage.Hash][]byte {
-	cloned := make(map[storage.Hash][]byte, len(objects))
-	for hash, data := range objects {
-		cloned[hash] = append([]byte(nil), data...)
-	}
-	return cloned
 }
 
 func objectPath(hash storage.Hash) string {

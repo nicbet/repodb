@@ -145,6 +145,7 @@ See the [full scorecard](docs/benchmark.md) for methodology, concurrency, sync l
 ```sh
 make build
 make test
+make lint
 go test -race -tags gms_pure_go ./common/repository ./engine ./integration
 git diff --check
 ```

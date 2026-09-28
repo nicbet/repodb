@@ -155,7 +155,9 @@ func TestJournalRejectsStaleWriterAndIgnoresIncompleteTail(t *testing.T) {
 		t.Fatalf("append after incomplete tail: %v", err)
 	}
 	verified, err := repository.OpenWorkingState(repo)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := verified.Current(ctx); err != nil {
 		t.Fatalf("journal after tail repair: %v", err)
 	}

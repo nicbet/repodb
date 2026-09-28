@@ -421,19 +421,6 @@ func sameValue(a []byte, ap bool, b []byte, bp bool) bool {
 	return ap == bp && (!ap || bytes.Equal(a, b))
 }
 
-func validateEntries(schemaData []byte, entries []prolly.Entry) error {
-	schema, err := decodeAndValidateSchema(schemaData)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if err := validateEntry(schema, entry); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func decodeAndValidateSchema(schemaData []byte) (sql.PrimaryKeySchema, error) {
 	schema, _, _, err := decodeSchema(schemaData)
 	if err != nil {

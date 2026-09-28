@@ -588,7 +588,7 @@ func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[
 		}
 		for i := 1; i < len(n.Entries); i++ {
 			if bytes.Compare(n.Entries[i-1].Key, n.Entries[i].Key) >= 0 {
-				return fmt.Errorf("Prolly node %s entries are not strictly ordered", hash)
+				return fmt.Errorf("prolly node %s entries are not strictly ordered", hash)
 			}
 		}
 	} else {

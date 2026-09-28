@@ -33,8 +33,8 @@ func ResetObjectWriteBytes()   { objectWriteBytes.Store(0) }
 type CLI struct{}
 
 var (
-	ErrRefNotFound       = errors.New("Git ref not found")
-	ErrRefConflict       = errors.New("Git ref changed")
+	ErrRefNotFound       = errors.New("git ref not found")
+	ErrRefConflict       = errors.New("git ref changed")
 	ErrRemoteRefNotFound = errors.New("remote Git ref not found")
 )
 

@@ -345,39 +345,6 @@ func externalConcurrency(r *report, root string, rows int, e *externalDB) error 
 	return errors.Join(failures...)
 }
 
-func externalMySQLPointReadWrite(r *report, root string, rows int, e *externalDB) error {
-	n := r.Config.Requests
-
-	if err := r.measure(root, rows, "mysql_point_read", 1, n, false, func(int, int) error {
-		return e.verify("SELECT value FROM marker WHERE id = 1", "durable")
-	}); err != nil {
-		return err
-	}
-
-	if err := r.measure(root, rows, "mysql_update", 1, n, false, func(_ int, i int) error {
-		return e.exec(fmt.Sprintf("UPDATE bench SET value = 'wire-%d' WHERE id = 1", i))
-	}); err != nil {
-		return err
-	}
-
-	return e.verify("SELECT value FROM bench WHERE id = 1", fmt.Sprintf("wire-%d", n-1))
-}
-
-// cleanupExternal drops the benchmark database. Best effort.
-func cleanupExternal(dsn, dbName string) {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return
-	}
-	cfg.DBName = ""
-	db, err := sql.Open("mysql", cfg.FormatDSN())
-	if err != nil {
-		return
-	}
-	defer db.Close()
-	db.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
-}
-
 func printExternalUsage() {
 	fmt.Fprintln(os.Stderr, `External baseline mode:
   dbbench -mode external -dsn 'user:pass@tcp(host:port)/' [flags]
@@ -393,4 +360,3 @@ The DSN format follows the go-sql-driver/mysql standard:
 
 A fresh database is created per fixture size and dropped on success.`)
 }
-

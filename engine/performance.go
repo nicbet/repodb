@@ -5,16 +5,16 @@ import "sync/atomic"
 // PerformanceCounters expose structural work for benchmarks and regression
 // tests. They are process-wide, monotonic between resets, and not persisted.
 type PerformanceCounters struct {
-	RowsDecoded        uint64
-	RowsScanned        uint64
-	PointKeysVisited   uint64
-	TablesRebuilt      uint64
-	TablesReused       uint64
-	UndoRowsCaptured   uint64
-	TreeMutationNanos  uint64
-	ReachabilityNanos  uint64
-	SnapshotBuildNanos uint64
-	MetadataCacheHits  uint64
+	RowsDecoded         uint64
+	RowsScanned         uint64
+	PointKeysVisited    uint64
+	TablesRebuilt       uint64
+	TablesReused        uint64
+	UndoRowsCaptured    uint64
+	TreeMutationNanos   uint64
+	ReachabilityNanos   uint64
+	SnapshotBuildNanos  uint64
+	MetadataCacheHits   uint64
 	MetadataCacheMisses uint64
 }
 

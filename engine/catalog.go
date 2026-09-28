@@ -55,6 +55,14 @@ type database struct {
 	decodedEditsCommit string
 	decodedEdits       map[string]map[string]rowEdit
 
+	// indexEdits caches each table's secondary-index edits for the current
+	// snapshot, keyed by table then index. A committing journal transaction
+	// stores its own edits here, so the next transaction need not re-derive
+	// them from the pending-row overlay.
+	indexEditsGen    uint64
+	indexEditsCommit string
+	indexEdits       map[string]map[string][]prolly.Edit
+
 	// lastStateSeq tracks the repo's StateSeq at the time the snapshot was
 	// last resolved. resolveSnapshot skips Current() when it hasn't changed.
 	lastStateSeq uint64
@@ -240,7 +248,107 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 		s.db.decodedEditsGen = snapshot.Generation()
 		s.db.mu.Unlock()
 	}
+	s.db.mu.RLock()
+	if s.db.indexEdits != nil && s.db.indexEditsCommit == snapshot.Commit && s.db.indexEditsGen == snapshot.Generation() {
+		for name, byIndex := range s.db.indexEdits {
+			if state := tx.tables[name]; state != nil {
+				state.idxEdits = shareIndexEdits(byIndex)
+			}
+		}
+	}
+	s.db.mu.RUnlock()
 	return tx, nil
+}
+
+// shareIndexEdits returns a per-transaction map over cached edit slices. Each
+// slice's capacity is clipped so an append copies instead of writing into the
+// shared backing array.
+func shareIndexEdits(byIndex map[string][]prolly.Edit) map[string][]prolly.Edit {
+	shared := make(map[string][]prolly.Edit, len(byIndex))
+	for name, edits := range byIndex {
+		shared[name] = edits[:len(edits):len(edits)]
+	}
+	return shared
+}
+
+// compactIndexEdits keeps only the last edit per index key, in key order.
+// Readers apply edits last-wins per key, so the result is equivalent.
+func compactIndexEdits(byIndex map[string][]prolly.Edit) map[string][]prolly.Edit {
+	compacted := make(map[string][]prolly.Edit, len(byIndex))
+	for name, edits := range byIndex {
+		last := make(map[string]prolly.Edit, len(edits))
+		for _, edit := range edits {
+			last[string(edit.Key)] = edit
+		}
+		out := make([]prolly.Edit, 0, len(last))
+		for _, edit := range last {
+			out = append(out, edit)
+		}
+		sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Key, out[j].Key) < 0 })
+		compacted[name] = out
+	}
+	return compacted
+}
+
+// storeIndexEdits caches a committed journal transaction's index edits for the
+// generation it produced. They stay valid because a journal commit keeps the
+// base Git commit, and with it the persisted data and index trees.
+func (d *database) storeIndexEdits(tx *transaction, next *repository.Snapshot) {
+	base := tx.writer.BaseSnapshot()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if next.Commit != base.Commit {
+		d.indexEdits = nil
+		return
+	}
+	var carried map[string]map[string][]prolly.Edit
+	if d.indexEditsCommit == base.Commit && d.indexEditsGen == base.Generation() {
+		carried = d.indexEdits
+	}
+	cache := make(map[string]map[string][]prolly.Edit, len(tx.tables))
+	for name, state := range tx.tables {
+		switch {
+		case tx.dropped[name] || state.schemaDirty:
+		case state.idxEdits != nil:
+			cache[name] = compactIndexEdits(state.idxEdits)
+		case !state.dirty && carried[name] != nil:
+			cache[name] = carried[name]
+		}
+	}
+	d.indexEdits = cache
+	d.indexEditsCommit = next.Commit
+	d.indexEditsGen = next.Generation()
+}
+
+// rememberIndexEdits caches index edits that a clean transaction derived, so
+// later readers of the same generation reuse them. Entries already cached for
+// that generation are kept.
+func (d *database) rememberIndexEdits(tx *transaction) {
+	base := tx.writer.BaseSnapshot()
+	var derived map[string]*tableState
+	for name, state := range tx.tables {
+		if state.idxEdits != nil {
+			if derived == nil {
+				derived = make(map[string]*tableState)
+			}
+			derived[name] = state
+		}
+	}
+	if derived == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.indexEdits == nil || d.indexEditsCommit != base.Commit || d.indexEditsGen != base.Generation() {
+		d.indexEdits = make(map[string]map[string][]prolly.Edit, len(derived))
+		d.indexEditsCommit = base.Commit
+		d.indexEditsGen = base.Generation()
+	}
+	for name, state := range derived {
+		if _, cached := d.indexEdits[name]; !cached {
+			d.indexEdits[name] = compactIndexEdits(state.idxEdits)
+		}
+	}
 }
 
 // resolveSnapshot returns the current valid snapshot, skipping the expensive
@@ -283,6 +391,9 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 		return fmt.Errorf("invalid RepoDB transaction %T", opaque)
 	}
 	if !tx.dirty {
+		if s.db.working != nil {
+			s.db.rememberIndexEdits(tx)
+		}
 		return nil
 	}
 	if s.db.working != nil {
@@ -328,6 +439,9 @@ func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
 		s.db.mu.Lock()
 		s.db.snapshot = snapshot
 		s.db.mu.Unlock()
+		if err == nil {
+			s.db.storeIndexEdits(tx, snapshot)
+		}
 	}
 	return err
 }
@@ -589,11 +703,6 @@ func transactionFrom(ctx *sql.Context) (*transaction, error) {
 	}
 	ctx.SetTransaction(opaque)
 	return opaque.(*transaction), nil
-}
-
-type indexState struct {
-	def   indexDisk
-	edits []prolly.Edit
 }
 
 type tableState struct {
@@ -2171,37 +2280,97 @@ func (s *tableState) ensureIndexEdits(ctx context.Context) error {
 	if s.idxEdits != nil || len(s.indexes) == 0 {
 		return nil
 	}
-	hasUnpersisted := false
+	var persisted, unpersisted []indexDisk
 	for _, idx := range s.indexes {
-		root, ok := s.manifest.Indexes[idx.Name]
-		if !ok || !root.Valid() {
-			hasUnpersisted = true
-			break
+		if root, ok := s.manifest.Indexes[idx.Name]; ok && root.Valid() {
+			persisted = append(persisted, idx)
+		} else {
+			unpersisted = append(unpersisted, idx)
 		}
 	}
-	if !hasUnpersisted {
-		s.idxEdits = make(map[string][]prolly.Edit)
-		return nil
-	}
-	if err := s.ensureRows(ctx); err != nil {
-		return err
-	}
 	built := make(map[string][]prolly.Edit)
-	for pkStr, row := range s.rows {
-		pk := []byte(pkStr)
-		for _, idx := range s.indexes {
-			root, ok := s.manifest.Indexes[idx.Name]
-			if ok && root.Valid() {
-				continue
+	if len(persisted) > 0 && len(s.edits) > 0 {
+		if err := s.overlayIndexEdits(ctx, persisted, built); err != nil {
+			return err
+		}
+	}
+	if len(unpersisted) > 0 {
+		if err := s.ensureRows(ctx); err != nil {
+			return err
+		}
+		for pkStr, row := range s.rows {
+			pk := []byte(pkStr)
+			for _, idx := range unpersisted {
+				idxKey, _, err := encodeIndexKey(s.schema, row, idx.Columns, pk, idx.Unique)
+				if err != nil {
+					return err
+				}
+				built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: idxKey, Value: pk})
 			}
-			idxKey, _, err := encodeIndexKey(s.schema, row, idx.Columns, pk, idx.Unique)
-			if err != nil {
-				return err
-			}
-			built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: idxKey, Value: pk})
 		}
 	}
 	s.idxEdits = built
+	return nil
+}
+
+// overlayIndexEdits adds, for each persisted index tree, the edits implied by
+// the pending row overlay: the base row's entry is removed and the overlay
+// row's entry added. Without them, rows from earlier journal transactions are
+// invisible to index lookups and unique checks.
+func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk, built map[string][]prolly.Edit) error {
+	var base *prolly.Tree
+	if s.manifest.DataRoot.Valid() {
+		tree, err := prolly.Open(s.store, s.manifest.DataRoot)
+		if err != nil {
+			return err
+		}
+		base = tree
+	}
+	keys := make([]string, 0, len(s.edits))
+	for key := range s.edits {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		edit := s.edits[key]
+		pk := []byte(key)
+		var baseRow sql.Row
+		if base != nil {
+			value, err := base.Get(ctx, pk)
+			switch {
+			case errors.Is(err, prolly.ErrNotFound):
+			case err != nil:
+				return err
+			default:
+				if baseRow, err = decodeRow(s.schema.Schema, value); err != nil {
+					return err
+				}
+			}
+		}
+		for _, idx := range indexes {
+			var oldKey, newKey []byte
+			var err error
+			if baseRow != nil {
+				if oldKey, _, err = encodeIndexKey(s.schema, baseRow, idx.Columns, pk, idx.Unique); err != nil {
+					return err
+				}
+			}
+			if !edit.delete {
+				if newKey, _, err = encodeIndexKey(s.schema, edit.row, idx.Columns, pk, idx.Unique); err != nil {
+					return err
+				}
+			}
+			if oldKey != nil && newKey != nil && bytes.Equal(oldKey, newKey) {
+				continue
+			}
+			if oldKey != nil {
+				built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: oldKey, Delete: true})
+			}
+			if newKey != nil {
+				built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: newKey, Value: pk})
+			}
+		}
+	}
 	return nil
 }
 
@@ -2445,13 +2614,6 @@ func copyManifestIndexes(m map[string]storage.Hash) map[string]storage.Hash {
 	return out
 }
 func cloneRow(row sql.Row) sql.Row { return append(sql.Row(nil), row...) }
-func cloneRows(rows map[string]sql.Row) map[string]sql.Row {
-	out := make(map[string]sql.Row, len(rows))
-	for k, row := range rows {
-		out[k] = cloneRow(row)
-	}
-	return out
-}
 
 var _ sql.TableCreator = (*database)(nil)
 var _ sql.TableDropper = (*database)(nil)
