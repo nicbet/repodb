@@ -1,4 +1,4 @@
-.PHONY: build test fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
+.PHONY: build test cross-windows fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
 .DEFAULT_GOAL := build
 
 BENCH_MODE ?= native-git
@@ -15,8 +15,12 @@ build:
 	go build -o bin/repodb ./cmd/repodb
 	go build -o bin/repodb-server ./cmd/repodb-server
 
-test:
+test: cross-windows
 	go test ./...
+
+cross-windows:
+	GOOS=windows GOARCH=amd64 go build ./...
+	GOOS=windows GOARCH=amd64 go vet ./...
 
 fmt:
 	gofmt -w client cmd common engine experiments integration server
