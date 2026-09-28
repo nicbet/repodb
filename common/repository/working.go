@@ -351,7 +351,6 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
 		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit}, info: info, offset: info.Size()}
 	}
-	w.repo.StateSeq.Add(1)
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
 			return snapshot, txid, &WorkingCommitError{Outcome: OutcomeCommitted, TransactionID: txid, Err: err}
@@ -413,7 +412,6 @@ func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edi
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
 		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit, pendingEdits: newPending}, info: info, offset: info.Size()}
 	}
-	w.repo.StateSeq.Add(1)
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
 			return snapshot, txid, &WorkingCommitError{Outcome: OutcomeCommitted, TransactionID: txid, Err: err}
@@ -609,7 +607,6 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
 		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
 	}
-	w.repo.StateSeq.Add(1)
 	return result, err
 }
 
@@ -659,7 +656,6 @@ func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, w
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
 		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
 	}
-	w.repo.StateSeq.Add(1)
 	return result, err
 }
 

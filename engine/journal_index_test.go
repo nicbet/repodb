@@ -216,11 +216,25 @@ func BenchmarkJournalIndexedInsertWithPending(b *testing.B) {
 // TestJournalIndexesMatchModel applies a deterministic random mix of inserts,
 // updates and deletes, with occasional checkpoints and engine reopens (which
 // drop the index-edit cache), and checks every unique and secondary index
-// lookup against an in-memory model.
+// lookup against an in-memory model. The two-engine variant writes and reads
+// through independent engines, as separate processes would.
 func TestJournalIndexesMatchModel(t *testing.T) {
+	t.Run("one-engine", func(t *testing.T) { runIndexModel(t, 1) })
+	t.Run("two-engines", func(t *testing.T) { runIndexModel(t, 2) })
+}
+
+func runIndexModel(t *testing.T, engineCount int) {
 	ctx := context.Background()
-	root, eng := openCheckpointedIndexedTable(t)
-	defer func() { _ = eng.Close() }()
+	root, first := openCheckpointedIndexedTable(t)
+	engines := []*engine.Engine{first}
+	for len(engines) < engineCount {
+		engines = append(engines, openJournal(t, root))
+	}
+	defer func() {
+		for _, eng := range engines {
+			_ = eng.Close()
+		}
+	}()
 
 	type row struct {
 		u int64
@@ -237,12 +251,14 @@ func TestJournalIndexesMatchModel(t *testing.T) {
 	}
 	rng := rand.New(rand.NewPCG(1, 2))
 	for step := 0; step < 150; step++ {
+		pick := rng.IntN(len(engines))
 		if rng.IntN(15) == 0 {
-			if err := eng.Close(); err != nil {
+			if err := engines[pick].Close(); err != nil {
 				t.Fatal(err)
 			}
-			eng = openJournal(t, root)
+			engines[pick] = openJournal(t, root)
 		}
+		eng := engines[pick]
 		session, _ := eng.NewSession()
 		id := int64(rng.IntN(40))
 		u := int64(rng.IntN(60))
@@ -279,7 +295,7 @@ func TestJournalIndexesMatchModel(t *testing.T) {
 			t.Fatalf("step %d: %s: err = %v, want error %v", step, stmt, err, wantErr)
 		}
 
-		check := eng
+		check := engines[rng.IntN(len(engines))]
 		for probe := int64(0); probe < 60; probe += 7 {
 			want := "[]"
 			for id, r := range model {

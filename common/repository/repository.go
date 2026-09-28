@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -110,10 +109,12 @@ type Repository struct {
 	git          repodbgit.CLI
 	fault        func(PublicationPoint) error
 
-	// StateSeq is bumped on every successful state change visible to readers:
-	// commits, checkpoints, and ref publications. Engines compare it to skip
-	// expensive Current() calls when nothing has changed.
-	StateSeq atomic.Uint64
+	// head caches the last resolved data ref together with the ref storage
+	// stamp observed before resolving it; see refStamp.
+	headMu    sync.Mutex
+	head      string
+	headStamp refStamp
+	headKnown bool
 }
 
 type PublicationPoint string
@@ -265,22 +266,43 @@ func (r *Repository) Identity() string { return r.CommonDir + "\x00" + r.ObjectF
 func (s *Snapshot) RepositoryIdentity() string { return s.repo.Identity() }
 
 func (r *Repository) Current(ctx context.Context) (*Snapshot, error) {
-	commit, err := r.git.ResolveRef(ctx, r.Root, DataRef)
-	if errors.Is(err, repodbgit.ErrRefNotFound) {
-		return nil, ErrNotInitialized
-	}
+	commit, err := r.Head(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if commit == "" {
+		return nil, ErrNotInitialized
 	}
 	return r.loadSnapshot(ctx, commit)
 }
 
 // Head returns the live data commit, or an empty string when RepoDB has not yet
 // initialized a local data history.
+//
+// Head is safe to call on every read: while the ref's storage files are
+// unchanged it returns the cached value without starting a Git process, and any
+// update by another process changes them (see refStamp).
 func (r *Repository) Head(ctx context.Context) (string, error) {
+	// Stamp before resolving: an update racing with resolution changes the
+	// stamp, so the next call resolves again instead of trusting a stale value.
+	stamp, stampErr := r.refStorageStamp()
+	if stampErr == nil {
+		r.headMu.Lock()
+		if r.headKnown && r.headStamp.equal(stamp) {
+			head := r.head
+			r.headMu.Unlock()
+			return head, nil
+		}
+		r.headMu.Unlock()
+	}
 	head, err := r.git.ResolveRef(ctx, r.Root, DataRef)
 	if errors.Is(err, repodbgit.ErrRefNotFound) {
-		return "", nil
+		head, err = "", nil
+	}
+	if err == nil && stampErr == nil {
+		r.headMu.Lock()
+		r.head, r.headStamp, r.headKnown = head, stamp, true
+		r.headMu.Unlock()
 	}
 	return head, err
 }
@@ -369,7 +391,6 @@ func (p *LockedPublication) FastForwardSnapshot(ctx context.Context, expected st
 		}
 		return nil, err
 	}
-	p.repo.StateSeq.Add(1)
 	return snapshot, nil
 }
 
@@ -722,7 +743,6 @@ func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest
 		}
 	}
 	publicationMetrics.refUpdate.Add(uint64(time.Since(phaseStarted)))
-	w.repo.StateSeq.Add(1)
 	result = CommitResult{Outcome: OutcomeCommitted, Commit: commit}
 	if w.repo.fault != nil {
 		if err := w.repo.fault(AfterRefPublication); err != nil {

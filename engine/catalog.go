@@ -62,10 +62,6 @@ type database struct {
 	indexEditsGen    uint64
 	indexEditsCommit string
 	indexEdits       map[string]map[string][]prolly.Edit
-
-	// lastStateSeq tracks the repo's StateSeq at the time the snapshot was
-	// last resolved. resolveSnapshot skips Current() when it hasn't changed.
-	lastStateSeq uint64
 }
 
 type cachedTableMeta struct {
@@ -351,26 +347,33 @@ func (d *database) rememberIndexEdits(tx *transaction) {
 	}
 }
 
-// resolveSnapshot returns the current valid snapshot, skipping the expensive
-// Current() call when nothing has changed since the last in-process commit.
+// resolveSnapshot returns the current valid snapshot. It checks on-disk state
+// every time, so writes by other engines and processes are visible; the checks
+// are cheap while nothing has changed (a journal stat, and a ref storage stamp
+// in place of a Git process).
 func (s *session) resolveSnapshot(ctx *sql.Context) (*repository.Snapshot, error) {
-	currentSeq := s.db.repo.StateSeq.Load()
 	s.db.mu.RLock()
 	snapshot := s.db.snapshot
-	lastSeq := s.db.lastStateSeq
 	s.db.mu.RUnlock()
-	if snapshot != nil && currentSeq > 0 && currentSeq == lastSeq {
-		return snapshot, nil
-	}
 	var current *repository.Snapshot
-	var err error
 	if s.db.working != nil {
-		current, err = s.db.working.Current(ctx)
+		var err error
+		if current, err = s.db.working.Current(ctx); err != nil {
+			return nil, err
+		}
 	} else {
-		current, err = s.db.repo.Current(ctx)
-	}
-	if err != nil {
-		return nil, err
+		head, err := s.db.repo.Head(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if head == "" {
+			return nil, repository.ErrNotInitialized
+		}
+		if snapshot != nil && snapshot.Commit == head && snapshot.Generation() == 0 {
+			current = snapshot
+		} else if current, err = s.db.repo.SnapshotCommit(ctx, head); err != nil {
+			return nil, err
+		}
 	}
 	if snapshot == nil || snapshot.Commit != current.Commit || snapshot.Generation() != current.Generation() {
 		snapshot = current
@@ -380,7 +383,6 @@ func (s *session) resolveSnapshot(ctx *sql.Context) (*repository.Snapshot, error
 	}
 	s.db.mu.Lock()
 	s.db.snapshot = snapshot
-	s.db.lastStateSeq = s.db.repo.StateSeq.Load()
 	s.db.mu.Unlock()
 	return snapshot, nil
 }
