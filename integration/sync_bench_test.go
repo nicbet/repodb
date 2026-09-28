@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -15,7 +14,6 @@ import (
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
 	"github.com/nicbet/repodb/integration"
-	"golang.org/x/sys/unix"
 )
 
 type syncBenchmarkFixture struct {
@@ -101,12 +99,7 @@ func BenchmarkSyncDivergent(b *testing.B) {
 func reportSyncMetrics(b *testing.B) {
 	b.ReportMetric(float64(repodbgit.ProcessCount())/float64(b.N), "git-procs/op")
 	b.ReportMetric(float64(repodbgit.ObjectWriteCount())/float64(b.N), "object-writes/op")
-	var usage unix.Rusage
-	if err := unix.Getrusage(unix.RUSAGE_SELF, &usage); err == nil {
-		peak := int64(usage.Maxrss)
-		if runtime.GOOS != "darwin" {
-			peak *= 1024
-		}
+	if peak, ok := peakRSS(); ok {
 		b.ReportMetric(float64(peak), "peak-rss-bytes")
 	}
 }

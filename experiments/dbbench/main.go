@@ -26,7 +26,6 @@ import (
 	"github.com/nicbet/repodb/engine"
 	"github.com/nicbet/repodb/integration"
 	"github.com/nicbet/repodb/server"
-	"golang.org/x/sys/unix"
 )
 
 type config struct {
@@ -68,7 +67,7 @@ type report struct {
 	WorkingTree string        `json:"working_tree_status"`
 	Root        string        `json:"fixture_root"`
 	Results     []measurement `json:"results"`
-	PeakRSS     int64         `json:"process_peak_rss_bytes"`
+	PeakRSS     *int64        `json:"process_peak_rss_bytes,omitempty"`
 	Failure     string        `json:"failure,omitempty"`
 }
 
@@ -138,12 +137,8 @@ func main() {
 	if err != nil {
 		r.Failure = err.Error()
 	}
-	var usage unix.Rusage
-	if unix.Getrusage(unix.RUSAGE_SELF, &usage) == nil {
-		r.PeakRSS = int64(usage.Maxrss)
-		if runtime.GOOS != "darwin" {
-			r.PeakRSS *= 1024
-		}
+	if peak, ok := peakRSS(); ok {
+		r.PeakRSS = &peak
 	}
 	data, jsonErr := json.MarshalIndent(r, "", "  ")
 	if jsonErr == nil {
@@ -820,7 +815,11 @@ func printReport(r report) {
 		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%d\t%d\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.1f\n", m.Rows, m.Name, m.Clients, m.Success, m.Conflicts, len(m.Errors), status, m.Ops, m.P50, m.P95, m.P99, m.Max, float64(m.Growth)/1024)
 	}
 	_ = w.Flush()
-	fmt.Printf("Process peak RSS: %.1f MiB (excludes Git/verification children)\n", float64(r.PeakRSS)/(1024*1024))
+	if r.PeakRSS != nil {
+		fmt.Printf("Process peak RSS: %.1f MiB (excludes Git/verification children)\n", float64(*r.PeakRSS)/(1024*1024))
+	} else {
+		fmt.Println("Process peak RSS: unavailable")
+	}
 	if r.Failure != "" {
 		fmt.Printf("FAILED: %s\n", r.Failure)
 	}

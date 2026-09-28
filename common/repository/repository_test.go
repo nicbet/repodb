@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
-	"golang.org/x/sys/unix"
 )
 
 func TestSnapshotRoundTripTransferAndCleanSourceState(t *testing.T) {
@@ -286,15 +286,11 @@ func TestLockCancellationIsDefiniteRejection(t *testing.T) {
 	}
 	old, _ := repo.Current(ctx)
 	lockPath := filepath.Join(repo.CommonDir, "repodb", "locks", "publish.lock")
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
+	lock := flock.New(lockPath)
+	if ok, err := lock.TryLock(); !ok || err != nil {
+		t.Fatalf("hold publish lock: ok=%v err=%v", ok, err)
 	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	defer lock.Unlock()
 	writer, _ := repo.Begin(ctx)
 	hash, _ := writer.Put(ctx, []byte("blocked"))
 	canceled, cancel := context.WithTimeout(ctx, 50*time.Millisecond)

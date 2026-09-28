@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/nicbet/repodb/common/repository"
@@ -56,5 +58,23 @@ func TestRejectInvalidMatrix(t *testing.T) {
 		if integers(s) != nil {
 			t.Fatalf("accepted %q", s)
 		}
+	}
+}
+
+func TestReportOmitsUnavailablePeakRSS(t *testing.T) {
+	data, err := json.Marshal(report{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "process_peak_rss_bytes") {
+		t.Fatalf("unavailable peak RSS serialized: %s", data)
+	}
+	peak := int64(42)
+	data, err = json.Marshal(report{PeakRSS: &peak})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"process_peak_rss_bytes":42`) {
+		t.Fatalf("measured peak RSS missing: %s", data)
 	}
 }

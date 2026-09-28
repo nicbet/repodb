@@ -16,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gofrs/flock"
 	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/storage"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -1000,29 +1000,25 @@ func (r *Repository) lock(ctx context.Context) (func(), error) {
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(filepath.Join(lockDir, "publish.lock"), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
+	return acquireFileLock(ctx, filepath.Join(lockDir, "publish.lock"))
+}
+
+// acquireFileLock takes an exclusive advisory lock on path, polling until it
+// is granted or ctx is done. A free lock is granted even if ctx is already done.
+func acquireFileLock(ctx context.Context, path string) (func(), error) {
+	fl := flock.New(path, flock.SetPermissions(0o600))
+	ok, err := fl.TryLock()
+	if !ok && err == nil {
+		ok, err = fl.TryLockContext(ctx, 10*time.Millisecond)
+	}
+	if !ok {
+		_ = fl.Close()
+		if err == nil {
+			err = ctx.Err()
+		}
 		return nil, err
 	}
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
-			return func() {
-				_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
-				_ = file.Close()
-			}, nil
-		} else if !errors.Is(err, unix.EWOULDBLOCK) {
-			file.Close()
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			file.Close()
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return func() { _ = fl.Unlock() }, nil
 }
 
 func legacyExists(path string) bool {

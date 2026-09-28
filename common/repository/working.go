@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/nicbet/repodb/common/storage"
-	"golang.org/x/sys/unix"
 )
 
 const workingFormatVersion = 1
@@ -1084,27 +1083,10 @@ func (w *WorkingState) lock(ctx context.Context) (func(), error) {
 		w.mu.Unlock()
 		return nil, err
 	}
-	file, err := os.OpenFile(filepath.Join(lockDir, "working.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	unlock, err := acquireFileLock(ctx, filepath.Join(lockDir, "working.lock"))
 	if err != nil {
 		w.mu.Unlock()
 		return nil, err
 	}
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
-			return func() { _ = unix.Flock(int(file.Fd()), unix.LOCK_UN); _ = file.Close(); w.mu.Unlock() }, nil
-		} else if !errors.Is(err, unix.EWOULDBLOCK) {
-			file.Close()
-			w.mu.Unlock()
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			file.Close()
-			w.mu.Unlock()
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return func() { unlock(); w.mu.Unlock() }, nil
 }
