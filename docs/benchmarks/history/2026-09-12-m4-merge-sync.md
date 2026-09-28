@@ -1,5 +1,11 @@
 # M4 merge benchmark
 
+> **Historical record.** M4 merge benchmark and M4.1 merge/sync results, measured
+> 2026-09-12 on Linux/amd64 (Intel Core i7-8550U) and Darwin/arm64 (Apple M1 Max);
+> the report was written in commits `5541f83` and `c4a7be0`. It describes the
+> repository at that time and is not maintained. Current results are in
+> [latest.md](../latest.md).
+
 Measured 2026-09-12 on Linux/amd64 with an Intel Core i7-8550U CPU and Go
 1.27.1.
 

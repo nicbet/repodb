@@ -6,7 +6,7 @@ RepoDB is an embedded SQL database for Go that stores and synchronizes applicati
 
 Build agent tools, issue trackers, and dashboards whose data travels with a repository. Write data locally, work offline, and synchronize across clones. SQL transactions are durable immediately; data history is checkpointed to Git when you choose. Source files, index, and code branches are never touched.
 
-**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. The current scope is small tool databases with a documented [SQL subset](docs/sql-m2.md); broader compatibility and scaling are on the roadmap. See the [scorecard](docs/benchmark.md) for measured latency against MySQL 8 and Dolt.
+**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. The current scope is small tool databases with a documented [SQL subset](docs/sql-m2.md); broader compatibility and scaling are on the roadmap. See the [latest benchmark results](docs/benchmarks/latest.md) for measured latency against MySQL 8 and Dolt.
 
 ## Quickstart
 
@@ -126,6 +126,8 @@ go install -tags gms_pure_go github.com/nicbet/repodb/cmd/repodb-server@latest
 
 ## Performance
 
+Measured 2026-09-13 across mixed revisions, before the current code; a fresh run is pending. See [latest results](docs/benchmarks/latest.md) and the [2026-09-13 report](docs/benchmarks/history/2026-09-13-m4.4-scorecard.md).
+
 Journal-mode point reads are sub-millisecond; single-row writes take ~5 ms (one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the journal appends one record regardless of batch size.
 
 | Workload (50k rows) | MySQL 8 |    Dolt | RepoDB Journal |
@@ -138,7 +140,7 @@ Journal-mode point reads are sub-millisecond; single-row writes take ~5 ms (one 
 
 Range queries and full scans are slower because RepoDB decodes rows from a content-addressed tree rather than scanning buffer-pool pages. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
 
-See the [full scorecard](docs/benchmark.md) for methodology, concurrency, sync latency, and the native-Git comparison.
+See the [latest results](docs/benchmarks/latest.md) for concurrency, sync latency, and the native-Git comparison, and the [methodology](docs/benchmark.md) for how they are measured.
 
 ## Development
 
@@ -150,11 +152,11 @@ go test -race -tags gms_pure_go ./common/repository ./engine ./integration
 git diff --check
 ```
 
-Run the [database scorecard](docs/benchmark.md):
+Run the [database scorecard](docs/benchmark.md) ([how results are published](docs/benchmark.md#publishing-results)):
 
 ```sh
-make bench                         # Journal persistence (default)
-make bench BENCH_MODE=native-git   # Native Git persistence
+make bench                         # Native Git persistence (default)
+make bench BENCH_MODE=journal      # Journal persistence
 make bench-external                # MySQL 8 or Dolt baseline
 ```
 
@@ -196,7 +198,7 @@ The current SQL scope supports one database namespace, explicit primary keys, DD
 | [Synchronization](docs/sync-m3.md)         | Enable, tracking refs, and transport                                  |
 | [Merging](docs/merge-m4.md)                | Three-way merge, conflict resolution, and distributed row identity    |
 | [Working state](docs/working-state.md)     | Durable journal, checkpoints, and recovery                            |
-| [Scorecard](docs/benchmark.md)             | Four-way performance comparison and workload contract                 |
+| [Benchmarks](docs/benchmarks/latest.md)    | Latest results; methodology and history linked from there             |
 
 ## Roadmap
 

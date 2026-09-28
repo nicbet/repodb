@@ -165,7 +165,7 @@ reuses existing Git object IDs. Historical commits retain older snapshots.
 M4.1 adds merge root reuse, streaming reconciliation, reuse of loaded snapshots,
 a bounded SQL validation cache, and batched object writes. M4.2 adds point lookup,
 edit overlays, incremental mutation, publication reuse, and shorter sync locks.
-Remaining chunk/tree amplification is measured in [performance.md](performance.md).
+Remaining chunk/tree amplification is measured in [performance.md](benchmarks/history/2026-09-12-m4.2-sql-performance.md).
 M4.3 preserves automatic SQL durability and committed snapshot reachability while
 changing the local persistence mechanism.
 
@@ -337,7 +337,7 @@ Repeat synchronization is idempotent and preserves both histories.
 ### M4.1 — Close the measured merge performance gaps
 
 **Status: complete (2026-09-12).** This focused follow-up was completed before M5. Functional
-M4 acceptance remains satisfied; the [benchmark](m4-bench.md) exposes avoidable
+M4 acceptance remains satisfied; the [benchmark](benchmarks/history/2026-09-12-m4-merge-sync.md) exposes avoidable
 work that should be removed before expanding examples or workload claims.
 
 **Baseline:** on the recorded Linux/amd64 system, a 50,000-row table with disjoint
@@ -414,7 +414,7 @@ Implement and measure in this order:
   corruption tests for previously unseen incoming snapshots and cache-miss paths.
 - Run `go test ./...`, `go test -race ./common/repository ./engine ./integration`,
   `make build`, and `git diff --check`, plus the benchmark command in
-  [m4-bench.md](m4-bench.md). Run MySQL wire tests where loopback binding is allowed;
+  [m4-bench.md](benchmarks/history/2026-09-12-m4-merge-sync.md). Run MySQL wire tests where loopback binding is allowed;
   do not count an environment-blocked run as a pass.
 
 **Exit:** steps 1–3 are implemented with regression coverage; full-sync measurements
@@ -426,7 +426,7 @@ a documented change; a 50,000-row merge microbenchmark alone does not broaden it
 ### M4.2 — Establish database performance and remove the largest avoidable costs
 
 **Status: closed as a bounded investigation (2026-09-12).** Results, incremental
-writes, and the paired Git hardening audit are in [performance.md](performance.md).
+writes, and the paired Git hardening audit are in [performance.md](benchmarks/history/2026-09-12-m4.2-sql-performance.md).
 This is an explicit scope disposition, not a claim that the full matrix ran.
 M4.3 takes durable-save, realistic-read, and recovery comparisons; M5 takes
 application/wire/CLI and contention coverage; M6 takes broader payload, history,
@@ -457,7 +457,7 @@ and excludes Git child-process memory. The many-table fixture has 49 one-row
 tables, remote selection adds a one-row table, and the conflict case has one
 conflicting row. Extend these before making broader workload claims.
 
-**Baseline deliverable:** a reproducible runner and `docs/performance.md`, with
+**Baseline deliverable:** a reproducible runner and `docs/performance.md` (now [history/2026-09-12-m4.2-sql-performance.md](benchmarks/history/2026-09-12-m4.2-sql-performance.md)), with
 raw results, machine/OS/filesystem, Go/Git versions, revision and working-tree
 changes, durability settings, and fixture seeds. Start with a representative
 matrix, then vary dimensions independently rather than testing every combination.
@@ -616,7 +616,7 @@ Row staging, stash/reapply, and separate per-worktree databases are follow-ups.
 Use identical SQL semantics, fixtures, mutation sequences, and declared durability
 assumptions. Keep required flushes enabled; a memory-only journal is not a valid
 comparison. Publish raw samples, settings, exact revision, machine/filesystem,
-commands, and limitations in `docs/m4.3-bench.md`.
+commands, and limitations in `docs/m4.3-bench.md` (now [history/2026-09-13-m4.3-working-state.md](benchmarks/history/2026-09-13-m4.3-working-state.md)).
 
 - Repeat exact-key updates, inserts, and deletes at 1k / 10k / 50k rows with varied
   keys and payloads. Assert that every timed mutation changes durable state and
@@ -756,7 +756,7 @@ the MySQL/Dolt baselines on the scorecard. The journal path is within 10x of
 MySQL for reads and within 5x for writes, or the remaining gap is attributed to
 specific costs with evidence for further deferral. Checkpoint and sync costs are
 reported separately; displaced work must not disappear from measurements. Update
-`docs/benchmark.md` with the new scorecard results before proceeding to M5.
+`docs/benchmark.md` (results now in [benchmarks/latest.md](benchmarks/latest.md)) with the new scorecard results before proceeding to M5.
 
 ### M5 — Complete the accepted integration and prove the tool-author experience
 

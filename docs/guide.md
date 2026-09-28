@@ -52,7 +52,7 @@ because each commit writes objects, updates trees, and advances the ref.
 
 ### 2. Journal (default for embedded, opt-in for server)
 
-SQL commits append to a local journal file (`<git-common-dir>/repodb/working/v1/journal`) with a single `fsync`. Much faster (~5 ms per transaction regardless of batch size), but changes are not in Git history until checkpointed.
+SQL commits append to a local journal file (`<git-common-dir>/repodb/working/v1/journal`) with a single `fsync`. Much faster (one `fsync` per transaction regardless of batch size; see [latest benchmark results](benchmarks/latest.md)), but changes are not in Git history until checkpointed.
 
 ### Switching modes
 

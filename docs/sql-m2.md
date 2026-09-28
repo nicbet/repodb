@@ -98,11 +98,7 @@ uses full-table rebuilds and full snapshot validation at transaction boundaries.
 This is a correctness baseline, not the intended large-table scaling design.
 
 Run `make m2-bench` to recreate `/tmp/repodb-m2` and measure open, begin, bulk
-commit, repeated-update time, heap, live objects, and Git subprocess count. On a
-2026-09-11 macOS development run with Git 2.55, 100 rows and ten autocommit
-updates measured approximately 68 ms open, 60 ms begin, 156 ms bulk commit,
-1.63 seconds for all updates, 4.6 MB heap, four live objects, and 199 Git
-subprocesses. Snapshot object reads are batched and unchanged Git blob IDs are
-reused, but process startup remains a visible cost. M3 or a later performance
-pass should replace more per-operation CLI plumbing before increasing the
-supported workload.
+commit, repeated-update time, heap, live objects, and Git subprocess count. The
+first measurement is recorded in
+[benchmarks/history/2026-09-11-m2-sql-baseline.md](benchmarks/history/2026-09-11-m2-sql-baseline.md);
+current results are in [benchmarks/latest.md](benchmarks/latest.md).

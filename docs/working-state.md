@@ -140,7 +140,8 @@ showed exact reachability traversal dominating larger catalogs. Journal saves no
 retain a conservative object inventory and defer pruning rather than walking the
 whole Prolly graph. Checkpoints currently preserve that safe superset; exact
 checkpoint pruning should be added with compaction. With traversal removed,
-Prolly chunk mutation plus durable flush still exceeds 10 ms at 10k/50k rows,
+Prolly chunk mutation plus durable flush still exceeded 10 ms at 10k/50k rows
+([M4.3 report](benchmarks/history/2026-09-13-m4.3-working-state.md)),
 providing the evidence gate for a typed row/schema edit journal experiment.
 
 This decision preserves the working-state product contract while avoiding a
