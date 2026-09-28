@@ -1,6 +1,6 @@
 module github.com/nicbet/repodb
 
-go 1.27
+go 1.25.0
 
 require (
 	github.com/dolthub/go-mysql-server v0.20.0
@@ -8,8 +8,8 @@ require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/gofrs/flock v0.13.1
 	github.com/shopspring/decimal v1.3.1
-	golang.org/x/sys v0.48.0
-	golang.org/x/term v0.46.0
+	golang.org/x/sys v0.47.0
+	golang.org/x/term v0.45.0
 )
 
 require (
