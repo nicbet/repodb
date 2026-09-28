@@ -63,12 +63,16 @@ type WorkingMetrics struct {
 	PrepareNanos, PreparedBytes                 uint64
 	EncodeNanos, EncodedBytes                   uint64
 	AppendNanos, FlushNanos                     uint64
+	// SnapshotLoads counts snapshots loaded from Git by journal replay and
+	// head reconciliation.
+	SnapshotLoads uint64
 }
 
 type workingMetricCounters struct {
 	loadNanos, loadBytes, loadFrames, cacheHits, fullReplays atomic.Uint64
 	incrementalReplays, prepareNanos, preparedBytes          atomic.Uint64
 	encodeNanos, encodedBytes, appendNanos, flushNanos       atomic.Uint64
+	snapshotLoads                                            atomic.Uint64
 }
 
 type workingCache struct {
@@ -169,6 +173,7 @@ func (w *WorkingState) Metrics() WorkingMetrics {
 		FullReplays: w.metrics.fullReplays.Load(), IncrementalReplays: w.metrics.incrementalReplays.Load(),
 		PrepareNanos: w.metrics.prepareNanos.Load(), PreparedBytes: w.metrics.preparedBytes.Load(),
 		EncodeNanos: w.metrics.encodeNanos.Load(), EncodedBytes: w.metrics.encodedBytes.Load(), AppendNanos: w.metrics.appendNanos.Load(), FlushNanos: w.metrics.flushNanos.Load(),
+		SnapshotLoads: w.metrics.snapshotLoads.Load(),
 	}
 }
 
@@ -185,6 +190,13 @@ func (w *WorkingState) ResetMetrics() {
 	w.metrics.encodedBytes.Store(0)
 	w.metrics.appendNanos.Store(0)
 	w.metrics.flushNanos.Store(0)
+	w.metrics.snapshotLoads.Store(0)
+}
+
+// snapshotCommit loads a data commit's snapshot for replay or reconciliation.
+func (w *WorkingState) snapshotCommit(ctx context.Context, commit string) (*Snapshot, error) {
+	w.metrics.snapshotLoads.Add(1)
+	return w.repo.SnapshotCommit(ctx, commit)
 }
 
 func (w *WorkingState) Dir() string {
@@ -813,15 +825,52 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 			break
 		}
 	}
+	// Replay is lazy. A full replay passes through every historical checkpoint,
+	// and each checkpoint supersedes the transactions before it, so only the
+	// final base and the transactions committed on top of it contribute to the
+	// result. Committed transactions are validated as they are read, but their
+	// edits are applied (and their base snapshot loaded) only when the view is
+	// needed. Eagerly loading every checkpoint's snapshot made replay cost
+	// grow with history.
 	var view workingView
+	var deferred []journalRecord
+	baseLoaded := true
 	if cached != nil {
 		view = cached.view
 	} else {
-		base, err := w.repo.SnapshotCommit(ctx, initial)
-		if err != nil {
-			return workingView{}, err
+		view = workingView{baseCommit: initial}
+		baseLoaded = false
+	}
+	ensureBase := func() error {
+		if baseLoaded {
+			return nil
 		}
-		view = workingView{snapshot: base, baseCommit: initial}
+		base, err := w.snapshotCommit(ctx, view.baseCommit)
+		if err != nil {
+			return err
+		}
+		base.generation = view.generation
+		view.snapshot, baseLoaded = base, true
+		return nil
+	}
+	materialize := func() error {
+		if err := ensureBase(); err != nil {
+			return fmt.Errorf("load base %s: %w", view.baseCommit, err)
+		}
+		for _, prepare := range deferred {
+			if prepare.Kind == "typed-prepare" {
+				view.snapshot, view.pendingEdits = applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, prepare.TypedEdits, prepare.Generation)
+				continue
+			}
+			available := make(map[storage.Hash]struct{}, len(prepare.Manifest.Objects))
+			for _, hash := range prepare.Manifest.Objects {
+				available[hash] = struct{}{}
+			}
+			view.snapshot = workingSnapshot(view.snapshot, *prepare.Manifest, available, prepare.Objects, prepare.Generation)
+			view.pendingEdits = nil
+		}
+		deferred = nil
+		return nil
 	}
 	pending := make(map[string]journalRecord)
 	safeOffset := start
@@ -855,17 +904,11 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				if view.dirty {
 					return workingView{}, fmt.Errorf("%w: transaction base changed while dirty", ErrWorkingCorrupt)
 				}
-				newBase, err := w.repo.SnapshotCommit(ctx, prepare.BaseCommit)
-				if err != nil {
-					return workingView{}, fmt.Errorf("load advanced base %s: %w", prepare.BaseCommit, err)
-				}
-				newBase.generation = view.generation
-				view.snapshot, view.baseCommit = newBase, prepare.BaseCommit
+				view.baseCommit, baseLoaded = prepare.BaseCommit, false
 				view.pendingEdits = nil
+				deferred = nil
 			}
-			if prepare.Kind == "typed-prepare" {
-				view.snapshot, view.pendingEdits = applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, prepare.TypedEdits, prepare.Generation)
-			} else {
+			if prepare.Kind == "prepare" {
 				available := make(map[storage.Hash]struct{}, len(prepare.Manifest.Objects))
 				for _, hash := range prepare.Manifest.Objects {
 					available[hash] = struct{}{}
@@ -873,9 +916,8 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				if err := validateManifestInventory(*prepare.Manifest, available); err != nil {
 					return workingView{}, err
 				}
-				view.snapshot = workingSnapshot(view.snapshot, *prepare.Manifest, available, prepare.Objects, prepare.Generation)
-				view.pendingEdits = nil
 			}
+			deferred = append(deferred, prepare)
 			view.generation, view.dirty = prepare.Generation, true
 			delete(pending, record.TxID)
 			safeOffset = frame.end
@@ -886,13 +928,9 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 			if record.Generation != view.generation {
 				return workingView{}, fmt.Errorf("%w: checkpoint generation differs", ErrWorkingCorrupt)
 			}
-			base, err := w.repo.SnapshotCommit(ctx, record.GitCommit)
-			if err != nil {
-				return workingView{}, err
-			}
-			base.generation = view.generation
-			view.snapshot, view.baseCommit, view.dirty = base, record.GitCommit, false
+			view.baseCommit, view.dirty, baseLoaded = record.GitCommit, false, false
 			view.pendingEdits = nil
+			deferred = nil
 			safeOffset = frame.end
 		default:
 			return workingView{}, fmt.Errorf("%w: unknown record kind %q", ErrWorkingCorrupt, record.Kind)
@@ -906,8 +944,24 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 	} else if view.dirty && !headKnown {
 		head = view.baseCommit
 	}
+	// reconcileHead compares a dirty view's snapshot with the head, so dirty
+	// views are materialized first. For a clean view whose base differs from
+	// the head, reconcileHead loads the head snapshot itself, so the stale base
+	// is never loaded.
+	if view.dirty {
+		if err := materialize(); err != nil {
+			return workingView{}, err
+		}
+	}
+	replayedBase := view.baseCommit
 	view, err = w.reconcileHead(ctx, view, head)
 	if err != nil {
+		return workingView{}, err
+	}
+	if view.baseCommit != replayedBase {
+		baseLoaded = true
+	}
+	if err := materialize(); err != nil {
 		return workingView{}, err
 	}
 	w.cache = &workingCache{view: view, info: info, offset: safeOffset}
@@ -918,7 +972,7 @@ func (w *WorkingState) reconcileHead(ctx context.Context, view workingView, head
 	if view.baseCommit == head {
 		return view, nil
 	}
-	current, err := w.repo.SnapshotCommit(ctx, head)
+	current, err := w.snapshotCommit(ctx, head)
 	if err != nil {
 		return workingView{}, err
 	}

@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 
@@ -419,5 +420,88 @@ func TestWorkingCheckpointRefusesPendingRowEdits(t *testing.T) {
 	got, err := session.Query(ctx, "SELECT COUNT(*) FROM items")
 	if err != nil || len(got.Rows) != 1 || got.Rows[0][0] != int64(2) {
 		t.Fatalf("rows after engine checkpoint = %#v, %v", got.Rows, err)
+	}
+}
+
+// A cold journal replay must not load a snapshot for every historical
+// checkpoint: only the base that transactions build on, and the final one.
+func TestJournalReplayLoadsBoundedSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		dirtyTail bool
+		rebase    bool
+	}{
+		{"clean", false, false},
+		{"dirty-tail", true, false},
+		{"base-change", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := gitRepository(t)
+			if _, err := repository.Init(ctx, root); err != nil {
+				t.Fatal(err)
+			}
+			journal := engine.Options{Persistence: engine.PersistenceJournal}
+			eng, err := engine.OpenWithOptions(ctx, root, journal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, _ := eng.NewSession()
+			if err := session.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			for i := 1; i <= 20; i++ {
+				if err := session.Exec(ctx, "INSERT INTO t VALUES (?)", i); err != nil {
+					t.Fatal(err)
+				}
+				want++
+				if _, err := eng.Checkpoint(ctx, "checkpoint"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = session.Close()
+			_ = eng.Close()
+			if tc.rebase {
+				// Advance the data head outside the journal while it is clean.
+				native, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+				if err != nil {
+					t.Fatal(err)
+				}
+				execAll(t, native, "INSERT INTO t VALUES (100)")
+				want++
+				_ = native.Close()
+			}
+			if tc.dirtyTail {
+				eng, err = engine.OpenWithOptions(ctx, root, journal)
+				if err != nil {
+					t.Fatal(err)
+				}
+				execAll(t, eng, "INSERT INTO t VALUES (200)", "INSERT INTO t VALUES (201)")
+				want += 2
+				_ = eng.Close()
+			}
+
+			repo, err := repository.Open(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			working, _ := repository.OpenWorkingState(repo)
+			if _, err := working.Current(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if loads := working.Metrics().SnapshotLoads; loads > 1 {
+				t.Errorf("cold replay loaded %d snapshots, want <= 1", loads)
+			}
+
+			reopened, err := engine.OpenWithOptions(ctx, root, journal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if got := queryIDs(t, reopened, "SELECT COUNT(*) FROM t"); got != fmt.Sprintf("[[%d]]", want) {
+				t.Fatalf("rows after replay = %s, want %d", got, want)
+			}
+		})
 	}
 }
