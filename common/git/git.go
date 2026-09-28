@@ -168,7 +168,7 @@ func (CLI) FetchRef(ctx context.Context, root, remote, source, destination strin
 }
 
 func (CLI) PushRef(ctx context.Context, root, remote, source, destination string) error {
-	_, err := run(ctx, root, nil, nil, "push", remote, source+":"+destination)
+	_, err := run(ctx, root, nil, nil, "push", "--no-verify", remote, source+":"+destination)
 	if err != nil {
 		return fmt.Errorf("push RepoDB data to %q: %w", remote, err)
 	}
@@ -178,7 +178,7 @@ func (CLI) PushRef(ctx context.Context, root, remote, source, destination string
 // PushCommit publishes one exact commit. A concurrent local ref update cannot
 // change what this invocation sends, and Git still enforces fast-forward rules.
 func (CLI) PushCommit(ctx context.Context, root, remote, commit, destination string) error {
-	_, err := run(ctx, root, nil, nil, "push", remote, commit+":"+destination)
+	_, err := run(ctx, root, nil, nil, "push", "--no-verify", remote, commit+":"+destination)
 	if err != nil {
 		return fmt.Errorf("push RepoDB commit to %q: %w", remote, err)
 	}
