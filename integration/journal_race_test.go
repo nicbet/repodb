@@ -188,3 +188,96 @@ func TestStrandedJournalRecoveryProcedure(t *testing.T) {
 		t.Fatalf("rows after recovery = %s", got)
 	}
 }
+
+// With a checkpoint function, sync checkpoints the journal itself and retries
+// when a journal transaction commits while it publishes, instead of failing.
+func TestSyncWithCheckpointRetriesRacingJournalCommit(t *testing.T) {
+	for _, path := range []string{"fast-forward", "merge"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			a, b := twoClones(t)
+			execNative(t, a, "INSERT INTO items VALUES (2, 'remote')")
+			if _, err := integration.Sync(ctx, a, "origin"); err != nil {
+				t.Fatal(err)
+			}
+			journal, err := engine.OpenWithOptions(ctx, b, engine.Options{Persistence: engine.PersistenceJournal})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer journal.Close()
+			session, _ := journal.NewSession()
+			defer session.Close()
+			if path == "merge" {
+				if err := session.Exec(ctx, "INSERT INTO items VALUES (3, 'local')"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			checkpoints := 0
+			options := integration.SyncOptions{Checkpoint: func(ctx context.Context) error {
+				checkpoints++
+				_, err := journal.Checkpoint(ctx, "checkpoint before sync")
+				return err
+			}}
+			raced := false
+			restore := integration.SetBeforePublish(func() {
+				if !raced {
+					raced = true
+					if err := session.Exec(ctx, "INSERT INTO items VALUES (4, 'racing')"); err != nil {
+						t.Errorf("racing journal commit: %v", err)
+					}
+				}
+			})
+			status, err := integration.SyncWithOptions(ctx, b, "origin", options)
+			restore()
+			if err != nil {
+				t.Fatalf("sync = %#v, %v", status, err)
+			}
+			if checkpoints < 1 {
+				t.Fatal("sync never checkpointed the racing transaction")
+			}
+			want := "[[1 seed] [2 remote] [4 racing]]"
+			if path == "merge" {
+				want = "[[1 seed] [2 remote] [3 local] [4 racing]]"
+			}
+			if got := itemLabels(t, journal); got != want {
+				t.Fatalf("rows = %s, want %s", got, want)
+			}
+			if ws, err := journal.WorkingState().Status(ctx); err != nil || ws.Dirty {
+				t.Fatalf("working status after sync = %#v, %v", ws, err)
+			}
+		})
+	}
+}
+
+// A writer that commits during every attempt makes sync give up after its
+// retries, with the reason.
+func TestSyncWithCheckpointGivesUpOnConstantJournalCommits(t *testing.T) {
+	ctx := context.Background()
+	a, b := twoClones(t)
+	execNative(t, a, "INSERT INTO items VALUES (2, 'remote')")
+	if _, err := integration.Sync(ctx, a, "origin"); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := engine.OpenWithOptions(ctx, b, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	session, _ := journal.NewSession()
+	defer session.Close()
+	next := int64(100)
+	restore := integration.SetBeforePublish(func() {
+		next++
+		if err := session.Exec(ctx, "INSERT INTO items VALUES (?, 'busy')", next); err != nil {
+			t.Errorf("busy journal commit: %v", err)
+		}
+	})
+	defer restore()
+	_, err = integration.SyncWithOptions(ctx, b, "origin", integration.SyncOptions{Checkpoint: func(ctx context.Context) error {
+		_, err := journal.Checkpoint(ctx, "checkpoint before sync")
+		return err
+	}})
+	if !errors.Is(err, integration.ErrWorkingDirty) || !strings.Contains(err.Error(), "did not stabilize") {
+		t.Fatalf("sync error = %v, want retry exhaustion wrapping ErrWorkingDirty", err)
+	}
+}

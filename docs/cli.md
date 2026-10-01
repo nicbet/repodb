@@ -38,11 +38,13 @@ Every SQL write is durable once it returns. The two modes differ in when a write
 | Write latency | Git object, tree, commit and ref work per transaction (see [benchmarks/latest.md](benchmarks/latest.md)) | one journal append and `fsync` |
 | Before `repodb sync` | nothing to do | checkpoint the journal first |
 | Backup | the Git repository | the Git repository **and** the journal, copied at one point |
-| Default for | `repodb start`, `repodb-server` | the Go library (`engine.Open`) |
+| Default | no: opt in with `--persistence native-git` | yes: `repodb start`, `repodb-server` and the Go library (`engine.Open`) |
 
-Native-git is the audit-friendly mode: every transaction appears in `git log refs/repodb/data`. Journal is much faster per write. Making journal the default for the server is tracked in rdb-c56142.
+Journal is the default and much faster per write. Native-git is **audit mode**: every transaction appears in `git log refs/repodb/data`, the Git repository alone is a complete backup, and there is no checkpoint step.
 
-The modes share one repository. A native-git engine refuses to open while the journal has uncheckpointed changes, so run `repodb commit` before switching back to native-git.
+The modes share one repository, and switching needs no migration:
+- **native-git → journal:** open in journal mode; a repository without a journal is clean.
+- **journal → native-git:** a native-git engine refuses to open while the journal has uncheckpointed changes, so run `repodb commit` first.
 
 ## Setting up a repository
 
@@ -67,10 +69,10 @@ Starts the MySQL-compatible server and runs until interrupted (Ctrl-C or `SIGTER
 | --- | --- | --- |
 | `--addr` | `127.0.0.1:3306` | listen address |
 | `--repo` | `.` | a path inside the Git repository |
-| `--persistence` | `native-git` | `native-git` or `journal` |
+| `--persistence` | `journal` | `journal`, or `native-git` for audit mode |
 
 ```sh
-repodb start --persistence journal
+repodb start
 mysql --host=127.0.0.1 --port=3306 --user=root repodb
 ```
 
@@ -150,7 +152,17 @@ Exchanges committed data history with the remote:
 3. If the remote is behind, pushes with an ordinary fast-forward push, never a force push.
 4. If both sides changed, performs a three-way merge and publishes a merge commit with both heads as parents, then pushes it. If the local ref or the remote moved during the merge, it starts again, up to three attempts.
 
-If the journal has uncheckpointed changes, sync refuses to run. In an interactive terminal it first offers to checkpoint (`checkpoint before sync`). Otherwise, run `repodb commit -m <message>` first. If a journal transaction commits while sync is running, sync leaves the local data ref unchanged and fails the same way; checkpoint and sync again.
+Sync exchanges only committed data history, so uncheckpointed journal changes must become a data commit first:
+- `repodb sync --commit -m <message>` checkpoints them with that message, then syncs. If a journal transaction commits while sync is running (for example from a running server), sync checkpoints again and retries, up to three attempts.
+- In an interactive terminal without `--commit`, sync asks whether to checkpoint (`checkpoint before sync`), and then behaves like `--commit`.
+- Otherwise, a dirty journal makes sync fail and leave the data ref unchanged; run it with `--commit -m`, or `repodb commit -m <message>` first. Scripts and CI should use `--commit -m`.
+
+| Flag | Default |
+| --- | --- |
+| `--remote` | the configured remote |
+| `--commit` | off |
+| `-m` | required with `--commit` |
+| `--repo` | `.` |
 
 Output names the action taken: `up-to-date`, `fast-forwarded-local`, `pushed`, `merged`, or `conflicts`. On failure, it names both heads.
 
@@ -191,8 +203,12 @@ There is no atomic link between a source commit and a data commit. Push your cod
 
 ## Backup and recovery
 
-- **Native-git mode**: the Git repository holds every committed transaction. A mirror clone (`git clone --mirror`, which includes `refs/repodb/data`), or a copy of `.git` taken while RepoDB is stopped, is a complete backup. A plain `git clone` does not include RepoDB data.
-- **Journal mode**: uncheckpointed changes exist only in `<git-common-dir>/repodb/working/v1/journal`. Each checkpoint compacts that file down to the work since the checkpoint, so it stays small. Either run `repodb commit` before backing up the Git repository, or copy the Git repository and the journal together while no RepoDB process is writing. A copy of the Git repository alone restores the last checkpoint. Online backup is tracked in rdb-f33cb0.
+- **Journal mode (the default)**: uncheckpointed changes exist only in `<git-common-dir>/repodb/working/v1/journal`; a copy of the Git repository alone restores only the last checkpoint. Back up in one of two ways:
+  1. run `repodb commit -m <message>`, then back up the Git repository as for native-git mode; or
+  2. stop RepoDB and copy the whole repository, including `.git`, which contains the journal.
+
+  Each checkpoint compacts the journal down to the work since the checkpoint, so it stays small. Online backup is tracked in rdb-f33cb0.
+- **Native-git mode (audit mode)**: the Git repository holds every committed transaction. A mirror clone (`git clone --mirror`, which includes `refs/repodb/data`), or a copy of `.git` taken while RepoDB is stopped, is a complete backup. A plain `git clone` does not include RepoDB data.
 - Never delete `<git-common-dir>/repodb/working/`, `locks/` or `conflicts/` while RepoDB is running.
 
 ### Recovering a stranded journal

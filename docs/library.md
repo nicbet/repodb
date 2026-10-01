@@ -194,13 +194,24 @@ log.Println(status.Action, status.LocalHead, status.RemoteHead)
 
 - **`Status`** reports `Remote`, `TrackingRef`, `LocalHead`, `RemoteHead` and `Action` (for example `up-to-date`, `pushed`, `merged`, `conflicts`).
 - **`Sync` errors:**
-  - `integration.ErrWorkingDirty` when the journal has uncheckpointed changes: call `Checkpoint` first;
+  - `integration.ErrWorkingDirty` when the journal has uncheckpointed changes: call `Checkpoint` first, or use `SyncWithOptions` (below);
   - `integration.ErrNotEnabled` before `Enable`;
   - `integration.ErrRemoteRequired` when no remote is given or configured;
   - `*integration.MergeConflictError` when the merge stopped on conflicts. `integration.Conflicts` reloads the saved conflict set later.
 - **`Resolve`** takes `engine.TakeLocal`, `TakeRemote`, `TakeBase` or `TakeDelete`. It returns a `*MergeConflictError` while conflicts remain, and publishes and pushes the merge once none do.
 
 If a journal transaction commits while `Sync` runs, `Sync` leaves the local data ref unchanged and returns `integration.ErrWorkingDirty`: checkpoint and call `Sync` again.
+
+`integration.SyncWithOptions(ctx, path, remote, integration.SyncOptions{Checkpoint: f})` does that itself. Before each attempt it calls `f` if the journal is dirty, and a transaction that commits during the attempt makes it retry instead of fail, up to three attempts. `f` usually wraps `eng.Checkpoint`:
+
+```go
+status, err := integration.SyncWithOptions(ctx, ".", "origin", integration.SyncOptions{
+	Checkpoint: func(ctx context.Context) error {
+		_, err := eng.Checkpoint(ctx, "checkpoint before sync")
+		return err
+	},
+})
+```
 
 ## Embedding the MySQL server
 
@@ -224,7 +235,7 @@ if err := srv.Serve(ctx); err != nil { // returns when ctx is cancelled
 ```
 
 - **Lifecycle.** `Start` serves in the calling goroutine until `Close`, and `Serve(ctx)` wraps `Start` and `Close` around a context.
-- **Defaults.** `Config.Persistence` defaults to journal, like the library (the `repodb start` command defaults to native-git). The server exposes one database, named by the repository's manifest (`repodb`).
+- **Defaults.** `Config.Persistence` defaults to journal, like the library and `repodb start`. The server exposes one database, named by the repository's manifest (`repodb`).
 - **Security.** The server has no authentication or TLS. See [sql.md](sql.md#server-access).
 
 ## Client

@@ -196,14 +196,14 @@ Commits are optimistic and repository-wide: any commit since a transaction's sna
 ## Sync and merge
 
 `integration.Sync`:
-1. refuses a dirty journal;
+1. refuses a dirty journal (with `SyncOptions.Checkpoint`, it checkpoints it instead);
 2. fetches the remote's `refs/repodb/data` into the tracking ref;
 3. validates the fetched snapshot and its SQL data;
 4. compares ancestry with the local head.
 
 It then does one of the following:
 
-- **Fast-forward local.** Under `working.lock` and `publish.lock`, the local ref moves to the fetched commit, unless a journal transaction committed since step 1 (`ErrWorkingDirty`).
+- **Fast-forward local.** Under `working.lock` and `publish.lock`, the local ref moves to the fetched commit, unless a journal transaction committed since step 1 (`ErrWorkingDirty`; with `SyncOptions.Checkpoint`, sync checkpoints and retries).
 - **Push.** The local commit is pushed to the remote's `refs/repodb/data` as an ordinary fast-forward push, without force. The push does not hold `publish.lock`, so local SQL commits continue during a slow push.
 - **Merge.** A three-way merge between the local head, the fetched head and their Git merge base.
 

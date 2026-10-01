@@ -131,15 +131,30 @@ func run(ctx context.Context, args []string) error {
 		set := flag.NewFlagSet("sync", flag.ContinueOnError)
 		remote := set.String("remote", "", "explicit Git remote name")
 		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		commit := set.Bool("commit", false, "commit (checkpoint) uncommitted journal changes before syncing, retrying if more arrive")
+		message := set.String("m", "", "data commit message for --commit")
 		if err := set.Parse(args[1:]); err != nil {
 			return err
 		}
-		if term.IsTerminal(int(os.Stdin.Fd())) {
-			if err := promptCheckpointIfDirty(ctx, *repoPath); err != nil {
+		var options integration.SyncOptions
+		switch {
+		case *commit:
+			if strings.TrimSpace(*message) == "" {
+				return errors.New("sync --commit requires -m <message>")
+			}
+			options.Checkpoint = checkpointFunc(*repoPath, *message)
+		case *message != "":
+			return errors.New("-m requires --commit")
+		case term.IsTerminal(int(os.Stdin.Fd())):
+			confirmed, err := promptCheckpointIfDirty(ctx, *repoPath)
+			if err != nil {
 				return err
 			}
+			if confirmed {
+				options.Checkpoint = checkpointFunc(*repoPath, "checkpoint before sync")
+			}
 		}
-		status, err := integration.Sync(ctx, *repoPath, *remote)
+		status, err := integration.SyncWithOptions(ctx, *repoPath, *remote, options)
 		if err != nil {
 			if status.LocalHead != "" || status.RemoteHead != "" {
 				fmt.Fprintf(os.Stderr, "local: %s\nremote tracking: %s (%s)\n", status.LocalHead, status.TrackingRef, status.RemoteHead)
@@ -196,22 +211,19 @@ func run(ctx context.Context, args []string) error {
 		fmt.Printf("RepoDB conflict resolved and synchronized: %s (%s)\n", status.Action, status.LocalHead)
 		return nil
 	case "start":
-		set := flag.NewFlagSet("start", flag.ContinueOnError)
-		address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")
-		repoPath := set.String("repo", ".", "path inside the Git worktree")
-		persistence := set.String("persistence", string(engine.PersistenceNativeGit), "persistence mode: native-git or journal")
-		if err := set.Parse(args[1:]); err != nil {
-			return err
-		}
-		repo, err := repository.Open(ctx, *repoPath)
+		opts, err := parseStartOptions(args[1:])
 		if err != nil {
 			return err
 		}
-		srv, err := repodbserver.New(repodbserver.Config{Address: *address, Repository: repo, Persistence: engine.PersistenceMode(*persistence)})
+		repo, err := repository.Open(ctx, opts.repoPath)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("RepoDB listening on %s (repository %s)\n", srv.Address(), repo.Root)
+		srv, err := repodbserver.New(repodbserver.Config{Address: opts.address, Repository: repo, Persistence: opts.persistence})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("RepoDB listening on %s (repository %s, %s persistence)\n", srv.Address(), repo.Root, opts.persistence)
 		return srv.Serve(ctx)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -225,39 +237,70 @@ func conflictValue(present bool, value []byte) string {
 	return string(value)
 }
 
-func promptCheckpointIfDirty(ctx context.Context, repoPath string) error {
+type startOptions struct {
+	address, repoPath string
+	persistence       engine.PersistenceMode
+}
+
+func parseStartOptions(args []string) (startOptions, error) {
+	set := flag.NewFlagSet("start", flag.ContinueOnError)
+	address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")
+	repoPath := set.String("repo", ".", "path inside the Git worktree")
+	persistence := set.String("persistence", string(engine.PersistenceJournal), "persistence mode: journal (default) or native-git (audit mode: every transaction is a Git commit)")
+	if err := set.Parse(args); err != nil {
+		return startOptions{}, err
+	}
+	return startOptions{address: *address, repoPath: *repoPath, persistence: engine.PersistenceMode(*persistence)}, nil
+}
+
+// promptCheckpointIfDirty asks whether to commit a dirty journal before
+// syncing. It reports true when the user agreed; a clean journal needs no
+// answer.
+func promptCheckpointIfDirty(ctx context.Context, repoPath string) (bool, error) {
 	repo, err := repository.Open(ctx, repoPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	working, err := repository.OpenWorkingState(repo)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !working.Exists() {
-		return nil
+		return false, nil
 	}
 	ws, err := working.Status(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ws.Dirty {
-		return nil
+		return false, nil
 	}
 	fmt.Fprintf(os.Stderr, "Journal has uncommitted changes at generation %d. Checkpoint before syncing? [y/N] ", ws.Generation)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
-		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", integration.ErrWorkingDirty, ws.Generation)
+		return false, dirtySyncError(ws.Generation)
 	}
 	if answer := strings.TrimSpace(line); answer != "y" && answer != "Y" {
-		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", integration.ErrWorkingDirty, ws.Generation)
+		return false, dirtySyncError(ws.Generation)
 	}
-	result, err := checkpoint(ctx, repoPath, "checkpoint before sync")
-	if err != nil {
-		return err
+	return true, nil
+}
+
+func dirtySyncError(generation uint64) error {
+	return fmt.Errorf("%w at generation %d; run repodb sync --commit -m <message>, or repodb diff and repodb commit -m <message> first", integration.ErrWorkingDirty, generation)
+}
+
+// checkpointFunc returns a checkpoint step for SyncWithOptions that reports
+// each data commit it makes.
+func checkpointFunc(repoPath, message string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		result, err := checkpoint(ctx, repoPath, message)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "RepoDB data commit: %s\n", result.Commit)
+		return nil
 	}
-	fmt.Fprintf(os.Stderr, "RepoDB data commit: %s\n", result.Commit)
-	return nil
 }
 
 // checkpoint publishes the journal through the engine, which materializes

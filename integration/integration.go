@@ -109,7 +109,23 @@ func Enable(ctx context.Context, start, remote string) (Status, error) {
 	return Status{Remote: remote, TrackingRef: tracking, LocalHead: localHead, RemoteHead: remoteHead, Action: action}, nil
 }
 
+// SyncOptions adjusts Sync.
+type SyncOptions struct {
+	// Checkpoint, when set, publishes the journal's uncheckpointed
+	// transactions (for example through engine.Checkpoint). Sync then calls it
+	// whenever the journal is dirty instead of failing with ErrWorkingDirty,
+	// and retries when a journal transaction commits while it publishes.
+	Checkpoint func(context.Context) error
+}
+
+// Sync exchanges data history with remote. A dirty journal fails with
+// ErrWorkingDirty; see SyncWithOptions to checkpoint instead.
 func Sync(ctx context.Context, start, remote string) (Status, error) {
+	return SyncWithOptions(ctx, start, remote, SyncOptions{})
+}
+
+// SyncWithOptions is Sync with options.
+func SyncWithOptions(ctx context.Context, start, remote string, options SyncOptions) (Status, error) {
 	cli, info, remote, tracking, err := resolveRemote(ctx, start, remote)
 	if err != nil {
 		return Status{}, err
@@ -129,14 +145,16 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	if err := requireCleanWorkingState(ctx, repo); err != nil {
-		return Status{}, err
+	if options.Checkpoint == nil {
+		if err := requireCleanWorkingState(ctx, repo); err != nil {
+			return Status{}, err
+		}
 	}
 	const maxAttempts = 3
 	var last Status
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err := requireCleanWorkingState(ctx, repo); err != nil {
+		if err := cleanWorkingState(ctx, repo, options); err != nil {
 			return last, err
 		}
 		localHead, err := repo.Head(ctx)
@@ -150,6 +168,12 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 			return last, err
 		}
 		if err := requireCleanWorkingState(ctx, repo); err != nil {
+			if options.Checkpoint != nil {
+				// A transaction committed during the fetch: checkpoint it
+				// and start over from the new local head.
+				lastErr, last.Action = err, "working-dirty-retry"
+				continue
+			}
 			last.Action = "working-dirty"
 			return last, err
 		}
@@ -229,6 +253,10 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 				return err
 			})
 			if errors.Is(err, repository.ErrWorkingStateDirty) {
+				if options.Checkpoint != nil {
+					lastErr, last.Action = journalCommittedDuringSync(err), "working-dirty-retry"
+					continue
+				}
 				last.Action = "working-dirty"
 				return last, journalCommittedDuringSync(err)
 			}
@@ -302,6 +330,10 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 		beforePublish()
 		result, err := writer.CommitWithOutcome(ctx, manifest)
 		if errors.Is(err, repository.ErrWorkingStateDirty) {
+			if options.Checkpoint != nil {
+				lastErr, last.Action = journalCommittedDuringSync(err), "working-dirty-retry"
+				continue
+			}
 			last.Action = "working-dirty"
 			return last, journalCommittedDuringSync(err)
 		}
@@ -335,6 +367,20 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	return last, fmt.Errorf("RepoDB synchronization did not stabilize after %d attempts; both local and tracking histories are preserved: %w", maxAttempts, lastErr)
 }
 
+// cleanWorkingState makes sure the journal is clean before an attempt: it
+// checkpoints a dirty journal when options allow, and otherwise fails with
+// ErrWorkingDirty.
+func cleanWorkingState(ctx context.Context, repo *repository.Repository, options SyncOptions) error {
+	err := requireCleanWorkingState(ctx, repo)
+	if err == nil || options.Checkpoint == nil || !errors.Is(err, ErrWorkingDirty) {
+		return err
+	}
+	if err := options.Checkpoint(ctx); err != nil {
+		return fmt.Errorf("checkpoint before sync: %w", err)
+	}
+	return nil
+}
+
 // journalCommittedDuringSync reports a journal transaction that committed
 // after sync's clean check; the publication refused to move the head under it.
 func journalCommittedDuringSync(err error) error {
@@ -358,7 +404,7 @@ func requireCleanWorkingState(ctx context.Context, repo *repository.Repository) 
 		return err
 	}
 	if status.Dirty {
-		return fmt.Errorf("%w at generation %d; run repodb diff and repodb commit -m <message> before sync", ErrWorkingDirty, status.Generation)
+		return fmt.Errorf("%w at generation %d; run repodb sync --commit -m <message>, or repodb diff and repodb commit -m <message> first", ErrWorkingDirty, status.Generation)
 	}
 	return nil
 }

@@ -52,7 +52,7 @@ repodb sync
 
 `enable` adopts existing remote database history or initializes an empty catalog if neither side has one. It is safe to repeat and does not start a server. On a fresh clone, run `enable` before creating a separate local database with `init`.
 
-`sync` fetches and publishes database changes, merging independent row edits. If the journal has uncommitted changes, `sync` prompts to checkpoint before proceeding. Competing edits are preserved for explicit resolution:
+`sync` fetches and publishes database changes, merging independent row edits. Writes first land in a local journal; `repodb sync --commit -m '<message>'` turns them into a data commit and syncs (in a terminal, plain `repodb sync` offers to do this). Competing edits are preserved for explicit resolution:
 
 ```sh
 repodb conflicts
@@ -70,13 +70,13 @@ After `enable`, all sync commands default to the configured remote. Pass `--remo
 | Command                       | Description                                                                |
 | ----------------------------- | -------------------------------------------------------------------------- |
 | `repodb init [path]`          | Initialize a RepoDB data namespace in a Git repository                     |
-| `repodb start`                | Start a MySQL-compatible server (`--addr`, `--persistence`)                |
+| `repodb start`                | Start a MySQL-compatible server (`--addr`, `--persistence journal\|native-git`) |
 | `repodb sql '<statement>'`    | Execute a SQL statement against a running server (`--addr`, `--database`)  |
 | `repodb status`               | Show the data head, format version, object/table counts, and working state |
 | `repodb diff`                 | Show uncommitted data changes (table-level change list)                    |
 | `repodb commit -m '<msg>'`    | Checkpoint working data into a Git data commit                             |
 | `repodb enable`               | Set up sync for a remote (`--remote`); safe to repeat                      |
-| `repodb sync`                 | Fetch and publish data history; prompts to checkpoint uncommitted changes  |
+| `repodb sync`                 | Fetch and publish data history (`--commit -m` checkpoints first)           |
 | `repodb conflicts`            | List unresolved merge conflicts after a sync                               |
 | `repodb resolve`              | Resolve a conflict (`--id`, `--take local\|remote\|base\|delete`)          |
 
@@ -103,7 +103,7 @@ session.Exec(ctx, "INSERT INTO events VALUES (?, ?)", 1, payload)
 result, _ := session.Query(ctx, "SELECT data FROM events WHERE id = ?", 1)
 ```
 
-The engine defaults to journal persistence: SQL commits are durable immediately in a local journal, without creating a Git snapshot per transaction. Call `engine.Checkpoint` to publish accumulated changes to Git history, then `integration.Sync` to exchange them with a remote. No server process, no background service.
+The engine, like the CLI and server, defaults to journal persistence: SQL commits are durable immediately in a local journal, without creating a Git snapshot per transaction. Call `engine.Checkpoint` to publish accumulated changes to Git history, then `integration.Sync` to exchange them with a remote. No server process, no background service.
 
 ## Installation
 
@@ -184,7 +184,7 @@ Go application          MySQL client
 ```
 
 - **One engine, two entry points.** Embedded sessions and MySQL connections share the same catalog, table adapters, and transaction implementation.
-- **Journal persistence.** SQL commits append their row edits to a local journal with one `fsync`. Checkpoint materializes Prolly trees and publishes a Git data commit. Native-Git mode is available for workloads that need every transaction in Git history.
+- **Journal persistence.** SQL commits append their row edits to a local journal with one `fsync`. Checkpoint materializes Prolly trees and publishes a Git data commit. It is the default for the library, the CLI and the server. Native-Git (audit) mode makes every transaction a Git data commit, for workloads that need each one in Git history.
 - **Snapshot isolation.** Transactions read a pinned snapshot plus their own writes. Stale writers receive a conflict instead of overwriting newer data.
 - **Explicit synchronization.** Remote data is fetched into separate tracking refs. Sync validates, fast-forwards, or three-way-merges. Conflicts remain inspectable across restarts.
 

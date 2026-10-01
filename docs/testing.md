@@ -73,7 +73,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - the native-git open guard, and native-git commits rejected while another engine's journal is dirty;
   - journal commits, checkpoints and native-git commits racing without deadlock or a stranded journal;
   - a rejected `COMMIT` ends the transaction, and the retry succeeds (native-git and journal);
-  - `Diff` listing row-only inserts, updates and deletes, new tables, and pending edits after a reopen.
+  - `Diff` listing row-only inserts, updates and deletes, new tables, and pending edits after a reopen;
+  - switching between native-git and journal in both directions, and a stopped copy of the repository keeping uncheckpointed rows (`persistence_modes_test.go`).
 - **Cross-engine visibility** (`cross_engine_test.go`). Readers see other engines' writes in every mode, including external `git update-ref` and `pack-refs` changes, without a restart.
 - **Range queries** (`range_test.go`). Indexed range and `ORDER BY … LIMIT` results are compared with a forced full scan. The comparison runs over native-git, journal with pending edits, and open transactions, and over signed-integer, decimal, collated-string and datetime keys, using seeded random data. Tests also cover integer extremes, and that plans use `IndexedTableAccess` without a sort.
 - **Journal index overlay** (`journal_index_test.go`). Inserts, updates and deletes are visible through persisted indexes, with a random-operation model test (150 steps, checkpoints and reopens, one or two engines).
@@ -95,6 +96,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - sync refuses a dirty journal;
   - a journal commit racing sync's fast-forward or merge publication makes sync fail with the ref unchanged, and a checkpoint plus a second sync merges it (`journal_race_test.go`, through a test hook before publication);
   - the documented recovery of a stranded journal (head moved by `git update-ref`) brings back every acknowledged row;
+  - `SyncWithOptions` with a checkpoint step checkpoints a racing journal commit and retries until it merges, and gives up with `ErrWorkingDirty` when every attempt is raced;
   - sync does not hold the publication lock while pushing (a remote hook stalls the push while a SQL commit completes);
   - incompatible schema changes are reported as schema conflicts;
   - `enable` rejects an invalid fetched SQL graph;
@@ -103,7 +105,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 ### Server and CLI
 
 - **`server`.** A MySQL-protocol round trip with the Go client: exec, query, parameters, `EXPLAIN` as a plan, `DESCRIBE`, and restart. Also commit-outcome errors carried over the wire and recovered with `RecoverCommit`. A write in a read-only transaction returns MySQL error 1792, and the connection keeps working.
-- **`cmd/repodb`.** `init`, then `commit`: journal rows are checkpointed and the journal is clean afterwards.
+- **`cmd/repodb`.** `init`, then `commit`: journal rows are checkpointed and the journal is clean afterwards. `start` defaults to journal persistence. `sync --commit -m` checkpoints and pushes from a dirty journal; without it, a dirty journal fails with a message naming `--commit -m`. `cmd/repodb-server` checks its persistence default.
 - **`experiments/dbbench`.** The scorecard harness's bookkeeping: rejected-attempt counting, partial reports, percentiles, tolerance of files removed by Git's auto-gc, and fixture repositories that disable automatic Git housekeeping.
 
 ## Test infrastructure
@@ -148,7 +150,7 @@ These are known holes in the test surface:
 - **Platforms.** The suite runs on macOS only. Linux shares the Unix code paths but is not run. On Windows only build, `vet` and staticcheck run. The Windows-only code (`LockFileEx` locking, retried renames) is never executed, and several tests assume `/bin/sh` and Unix file modes.
 - **No CI.** Nothing runs the suite automatically.
 - **Race detector.** It is not part of `make test`.
-- **CLI.** Only `init` and `commit` are tested; argument handling, output and exit codes are not. `cmd/repodb-server` has no tests.
+- **CLI.** Only `init`, `commit`, `sync --commit` and the persistence defaults are tested; other commands, output and exit codes are not.
 - **Client.** `client` has no tests of its own; it is exercised only through the server tests.
 - **Journal faults.** `BeforeJournalAppend` and `BeforeJournalFlush` are never injected, and no test kills a process during a journal append or checkpoint.
 - **Sync faults.** No faults are injected during sync, fetch or push beyond a stalled push and a journal commit racing the publication.

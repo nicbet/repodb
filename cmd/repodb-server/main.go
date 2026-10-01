@@ -14,27 +14,42 @@ import (
 	repodbserver "github.com/nicbet/repodb/server"
 )
 
-func main() {
-	address := flag.String("addr", "127.0.0.1:3306", "MySQL listen address")
-	repoPath := flag.String("repo", ".", "path inside the Git worktree")
-	persistence := flag.String("persistence", string(engine.PersistenceNativeGit), "persistence mode: native-git or journal")
-	flag.Parse()
+type options struct {
+	address, repoPath string
+	persistence       engine.PersistenceMode
+}
 
+func parseOptions(args []string) (options, error) {
+	set := flag.NewFlagSet("repodb-server", flag.ContinueOnError)
+	address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")
+	repoPath := set.String("repo", ".", "path inside the Git worktree")
+	persistence := set.String("persistence", string(engine.PersistenceJournal), "persistence mode: journal (default) or native-git (audit mode: every transaction is a Git commit)")
+	if err := set.Parse(args); err != nil {
+		return options{}, err
+	}
+	return options{address: *address, repoPath: *repoPath, persistence: engine.PersistenceMode(*persistence)}, nil
+}
+
+func main() {
+	opts, err := parseOptions(os.Args[1:])
+	if err != nil {
+		os.Exit(2)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	repo, err := repository.Open(ctx, *repoPath)
+	repo, err := repository.Open(ctx, opts.repoPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	srv, err := repodbserver.New(repodbserver.Config{
-		Address:     *address,
+		Address:     opts.address,
 		Repository:  repo,
-		Persistence: engine.PersistenceMode(*persistence),
+		Persistence: opts.persistence,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("RepoDB listening on %s (repository %s)\n", srv.Address(), repo.Root)
+	fmt.Printf("RepoDB listening on %s (repository %s, %s persistence)\n", srv.Address(), repo.Root, opts.persistence)
 	if err := srv.Serve(ctx); err != nil {
 		log.Fatal(err)
 	}
