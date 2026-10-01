@@ -26,7 +26,7 @@ All paths are under the repository's common Git directory (`git rev-parse --git-
 | --- | --- | --- |
 | `refs/repodb/data` | the local data head: the latest published data commit | authoritative |
 | `refs/repodb/remotes/<remote>/data` | the last fetched data head of a remote | fetched copy, never written locally |
-| `repodb/working/v1/journal` | the journal: transactions not yet checkpointed | authoritative in journal mode |
+| `repodb/working/v1/journal` | the journal: an anchor for the last checkpoint, then the transactions since | authoritative in journal mode |
 | `repodb/locks/publish.lock` | serializes updates of `refs/repodb/data` | coordination |
 | `repodb/locks/working.lock` | serializes journal appends and checkpoints; every update of `refs/repodb/data` takes it before `publish.lock` | coordination |
 | `repodb/conflicts/<remote>.json` | an interrupted merge's conflicts and chosen resolutions | local coordination state |
@@ -163,21 +163,22 @@ The journal is an append-only file of framed records:
 - per table, a new schema object or a drop;
 - the changed rows as encoded key and value, or delete.
 
-Each transaction gets a random transaction ID and the next generation number. Git is not touched.
+Each transaction gets the next generation number and a transaction ID of the form `<generation>-<random>`. Git is not touched.
 
 **Replay** loads the last checkpointed commit and applies matched prepare/commit pairs after it. Only the base snapshot and the transactions after the last checkpoint are loaded:
 - A short final frame is an incomplete tail. It is ignored, and truncated before the next append.
 - A bad checksum or out-of-order history in complete frames is corruption (`ErrWorkingCorrupt`).
-- A long-lived engine remembers the verified offset and the file's identity. It reads only new frames, and falls back to a full replay if the file was replaced or shortened.
+- A long-lived engine remembers the verified offset and the file's identity: its inode and its first frame header. It reads only new frames, and falls back to a full replay if the file was replaced or shortened. The header check catches a replacement that reuses the old inode number.
 
 **Pending edits.** Pending row edits are kept as an overlay on the checkpointed trees, and reads merge them in. They become Prolly trees only at checkpoint.
 
 **Checkpoint** (`repodb commit`, `Engine.Checkpoint`), under `working.lock`:
 1. applies the pending edits to the trees;
 2. publishes one data commit through the native-git path;
-3. appends a `checkpoint` record linking the generation to the Git commit.
+3. appends a `checkpoint` record linking the generation to the Git commit;
+4. compacts the journal: writes a new file holding a single **anchor** (the `checkpoint` record, plus the IDs of the transactions it replaces), `fsync`s it, renames it over the journal and `fsync`s the directory.
 
-If the process dies after publishing but before the record, the next open sees that the published snapshot equals the working state and treats the journal as clean.
+If the process dies after publishing but before the record, the next open sees that the published snapshot equals the working state and treats the journal as clean. Compaction comes after the checkpoint is published and recorded, so a crash or error during it leaves the old journal, which is still valid, and the next checkpoint compacts it. A failure doesn't fail the checkpoint; `WorkingMetrics.JournalCompactionFailures` counts it. A replay that starts with an anchor continues from the anchor's generation.
 
 **Guards.** A dirty journal's transactions are based on the current data head, so the head must not move until a checkpoint publishes them:
 - Every update of `refs/repodb/data` takes `working.lock` and then `publish.lock`, and holds both until the ref update. Only a checkpoint may publish while the journal is dirty.
@@ -185,7 +186,7 @@ If the process dies after publishing but before the record, the next open sees t
 - A native-git engine also refuses to open while the journal is dirty.
 - If the data head moves under a dirty journal anyway, for example through an external `git update-ref`, loading fails with `ErrWorkingBaseChanged`, naming the journal's base and the head. [cli.md](cli.md#recovering-a-stranded-journal) describes the recovery.
 
-**Growth.** The journal is never compacted and grows with every transaction (rdb-515fae).
+**Growth.** The journal holds only the work since the last checkpoint, plus the anchor, so its size doesn't grow with the repository's age. Retention policies, archiving and a manual `repodb compact` are tracked in rdb-515fae.
 
 ### Concurrency limits
 
@@ -229,7 +230,7 @@ Row conflicts are compared on whole encoded rows, so fields are never merged. Un
 - `committed`: published, even if a later check failed;
 - `unknown`: RepoDB could not tell, for example when the ref update was interrupted.
 
-A `committed` or `unknown` outcome carries the candidate commit ID. `Repository.RecoverCommit` settles an `unknown` outcome by checking whether the candidate is the data head or an ancestor of it. SQL exposes the same check as `repodb_recover_commit`. A journal commit that fails after its records reached disk returns `committed` with the transaction ID, and `WorkingState.RecoverTransaction` settles uncertain journal outcomes.
+A `committed` or `unknown` outcome carries the candidate commit ID. `Repository.RecoverCommit` settles an `unknown` outcome by checking whether the candidate is the data head or an ancestor of it. SQL exposes the same check as `repodb_recover_commit`. A journal commit that fails after its records reached disk returns `committed` with the transaction ID, and `WorkingState.RecoverTransaction` settles uncertain journal outcomes. After compaction it still answers exactly for transactions from the current and the previous checkpoint interval; for older ones it returns `unknown` with `ErrWorkingHistoryTruncated`, never a wrong `rejected`.
 
 **Repository states:**
 

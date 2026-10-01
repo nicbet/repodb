@@ -140,7 +140,7 @@ Most commit errors mean nothing was written. Two error types carry an explicit o
 - **`*repository.CommitError`** (native-git publication) has `Outcome` (`OutcomeRejected`, `OutcomeCommitted`, `OutcomeUnknown`) and `Commit`, the candidate commit ID.
   - `OutcomeCommitted` with an error means the data commit was published but a later check failed. Don't treat it as a rollback.
   - `OutcomeUnknown` (wrapping `repository.ErrCommitUnknown`) means RepoDB could not tell. Resolve it with `Repository.RecoverCommit(ctx, candidate)` or SQL `repodb_recover_commit('<candidate>')`.
-- **`*repository.WorkingCommitError`** (journal append) has `Outcome` and `TransactionID`. Resolve an unknown outcome with `WorkingState.RecoverTransaction(ctx, transactionID)`.
+- **`*repository.WorkingCommitError`** (journal append) has `Outcome` and `TransactionID`. Resolve an unknown outcome with `WorkingState.RecoverTransaction(ctx, transactionID)`, preferably before the next checkpoint. Each checkpoint compacts the journal; transactions more than one checkpoint old come back as `unknown` with `repository.ErrWorkingHistoryTruncated`.
 
 ```go
 var commitErr *repository.CommitError

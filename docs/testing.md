@@ -66,7 +66,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - recovery after a fault following the flush;
   - recovery of a checkpoint published before its bookkeeping;
   - separate engines observing each other;
-  - incremental replay from a cached offset, and detection of a replaced journal file;
+  - incremental replay from a cached offset, and detection of a replaced journal file, including one that reuses the old inode;
+  - compaction at checkpoint: bounded journal size over 20 checkpoints, a second engine following the other's compactions, faults before and after the rename, and `RecoverTransaction` answers across compactions (`journal_compaction_test.go`);
   - bounded snapshot loading during replay;
   - the native-git open guard, and native-git commits rejected while another engine's journal is dirty;
   - journal commits, checkpoints and native-git commits racing without deadlock or a stranded journal;

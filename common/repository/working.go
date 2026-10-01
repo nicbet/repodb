@@ -38,6 +38,9 @@ const (
 	BeforeJournalFlush  WorkingFaultPoint = "before-journal-flush"
 	AfterJournalFlush   WorkingFaultPoint = "after-journal-flush"
 	AfterCheckpointRef  WorkingFaultPoint = "after-checkpoint-ref"
+	// Journal compaction after a checkpoint (see compactLocked).
+	BeforeJournalCompactionRename WorkingFaultPoint = "before-journal-compaction-rename"
+	AfterJournalCompactionRename  WorkingFaultPoint = "after-journal-compaction-rename"
 )
 
 // WorkingState is the durable journal used by journal persistence. Its files
@@ -68,6 +71,9 @@ type WorkingMetrics struct {
 	// SnapshotLoads counts snapshots loaded from Git by journal replay and
 	// head reconciliation.
 	SnapshotLoads uint64
+	// JournalCompactions and JournalCompactionFailures count the journal
+	// rewrites that follow checkpoints.
+	JournalCompactions, JournalCompactionFailures uint64
 }
 
 type workingMetricCounters struct {
@@ -75,12 +81,17 @@ type workingMetricCounters struct {
 	incrementalReplays, prepareNanos, preparedBytes          atomic.Uint64
 	encodeNanos, encodedBytes, appendNanos, flushNanos       atomic.Uint64
 	snapshotLoads                                            atomic.Uint64
+	compactions, compactionFailures                          atomic.Uint64
 }
 
 type workingCache struct {
 	view   workingView
 	info   os.FileInfo
 	offset int64
+	// first is the journal's first frame header. Compaction replaces the
+	// file, and a later file can reuse the inode number, so file identity
+	// alone cannot tell journals apart.
+	first [journalHeaderSize]byte
 }
 
 type WorkingStatus struct {
@@ -122,6 +133,11 @@ type journalRecord struct {
 	Manifest   *Manifest               `json:"manifest,omitempty"`
 	Objects    map[storage.Hash][]byte `json:"objects,omitempty"`
 	TypedEdits []TypedTableEdit        `json:"typed_edits,omitempty"`
+	// An anchor (a checkpoint record that starts a compacted journal) lists
+	// the transactions committed in the journal it replaced, which covered
+	// generations above FromGeneration.
+	CheckpointedTxIDs []string `json:"checkpointed_tx_ids,omitempty"`
+	FromGeneration    uint64   `json:"from_generation,omitempty"`
 }
 
 type TypedTableEdit struct {
@@ -169,6 +185,7 @@ func OpenWorkingState(repo *Repository) (*WorkingState, error) {
 
 type journalDirtyScan struct {
 	info   os.FileInfo
+	first  [journalHeaderSize]byte
 	offset int64
 	dirty  bool
 }
@@ -192,10 +209,15 @@ func (w *WorkingState) journalDirtyLocked() (bool, error) {
 	} else if info.Size() == scan.offset {
 		return scan.dirty, nil
 	}
-	frames, _, err := readJournalFrames(w.JournalPath(), scan.offset)
+	frames, _, first, err := readJournalFrames(w.JournalPath(), scan.offset, &scan.first)
+	if errors.Is(err, errJournalReplaced) {
+		scan = journalDirtyScan{}
+		frames, _, first, err = readJournalFrames(w.JournalPath(), 0, nil)
+	}
 	if err != nil {
 		return false, err
 	}
+	scan.first = first
 	for _, frame := range frames {
 		switch frame.record.Kind {
 		case "commit":
@@ -218,7 +240,8 @@ func (w *WorkingState) Metrics() WorkingMetrics {
 		FullReplays: w.metrics.fullReplays.Load(), IncrementalReplays: w.metrics.incrementalReplays.Load(),
 		PrepareNanos: w.metrics.prepareNanos.Load(), PreparedBytes: w.metrics.preparedBytes.Load(),
 		EncodeNanos: w.metrics.encodeNanos.Load(), EncodedBytes: w.metrics.encodedBytes.Load(), AppendNanos: w.metrics.appendNanos.Load(), FlushNanos: w.metrics.flushNanos.Load(),
-		SnapshotLoads: w.metrics.snapshotLoads.Load(),
+		SnapshotLoads:      w.metrics.snapshotLoads.Load(),
+		JournalCompactions: w.metrics.compactions.Load(), JournalCompactionFailures: w.metrics.compactionFailures.Load(),
 	}
 }
 
@@ -236,6 +259,8 @@ func (w *WorkingState) ResetMetrics() {
 	w.metrics.appendNanos.Store(0)
 	w.metrics.flushNanos.Store(0)
 	w.metrics.snapshotLoads.Store(0)
+	w.metrics.compactions.Store(0)
+	w.metrics.compactionFailures.Store(0)
 }
 
 // snapshotCommit loads a data commit's snapshot for replay or reconciliation.
@@ -386,11 +411,11 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 	for _, data := range objects {
 		w.metrics.preparedBytes.Add(uint64(len(data)))
 	}
-	txid, err := randomID()
+	generation := view.generation + 1
+	txid, err := newTransactionID(generation)
 	if err != nil {
 		return nil, "", err
 	}
-	generation := view.generation + 1
 	prepare := journalRecord{Version: workingFormatVersion, Kind: "prepare", TxID: txid, Generation: generation, BaseCommit: view.baseCommit, Manifest: &manifest, Objects: objects}
 	marker := journalRecord{Version: workingFormatVersion, Kind: "commit", TxID: txid, Generation: generation, BaseCommit: view.baseCommit}
 	if w.fault != nil {
@@ -408,7 +433,7 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 	}
 	snapshot := workingSnapshot(writer.base, manifest, available, objects, generation)
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
-		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit}, info: info, offset: info.Size()}
+		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit}, info: info, offset: info.Size(), first: w.firstHeaderAfterAppend()}
 	}
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
@@ -437,11 +462,11 @@ func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edi
 	if base.Generation() != view.generation || base.Commit != view.snapshot.Commit {
 		return nil, "", ErrConflict
 	}
-	txid, err := randomID()
+	generation := view.generation + 1
+	txid, err := newTransactionID(generation)
 	if err != nil {
 		return nil, "", err
 	}
-	generation := view.generation + 1
 	prepare := journalRecord{Version: workingFormatVersion, Kind: "typed-prepare", TxID: txid, Generation: generation, BaseCommit: view.baseCommit, TypedEdits: edits}
 	marker := journalRecord{Version: workingFormatVersion, Kind: "commit", TxID: txid, Generation: generation, BaseCommit: view.baseCommit}
 	if w.fault != nil {
@@ -469,7 +494,7 @@ func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edi
 	}
 	snapshot, newPending := applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, edits, generation)
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
-		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit, pendingEdits: newPending}, info: info, offset: info.Size()}
+		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit, pendingEdits: newPending}, info: info, offset: info.Size(), first: w.firstHeaderAfterAppend()}
 	}
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
@@ -548,6 +573,17 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: objectSet, objectOIDs: base.objectOIDs, cache: cache, pendingEdits: snapshotEdits}, pending
 }
 
+// firstHeaderAfterAppend returns the journal's first frame header after an
+// append under the lock. The load that preceded the append already recorded
+// it, unless the journal was empty until now.
+func (w *WorkingState) firstHeaderAfterAppend() [journalHeaderSize]byte {
+	if w.cache != nil && w.cache.first != ([journalHeaderSize]byte{}) {
+		return w.cache.first
+	}
+	first, _ := journalFirstHeader(w.JournalPath())
+	return first
+}
+
 func (w *WorkingState) truncateIncompleteTail() error {
 	if w.cache == nil || w.cache.info == nil {
 		return nil
@@ -575,6 +611,10 @@ func (w *WorkingState) RecoverTransaction(ctx context.Context, transactionID str
 	}
 	result := WorkingCommitResult{Outcome: OutcomeRejected, TransactionID: transactionID}
 	prepared := false
+	var anchor *journalRecord
+	if len(records) > 0 && records[0].Kind == "checkpoint" {
+		anchor = &records[0]
+	}
 	for _, record := range records {
 		if record.TxID != transactionID {
 			continue
@@ -589,7 +629,11 @@ func (w *WorkingState) RecoverTransaction(ctx context.Context, transactionID str
 			}
 		}
 	}
-	return result, nil
+	if prepared {
+		// Prepared in the current journal but never committed.
+		return result, nil
+	}
+	return recoverFromAnchor(anchor, result)
 }
 
 // Checkpoint captures the current durable generation as one Git data commit.
@@ -664,9 +708,7 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 		}
 	}
 	checkpointSnapshot.generation = view.generation
-	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
-		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
-	}
+	w.compactAfterCheckpoint(marker, workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit})
 	return result, err
 }
 
@@ -714,9 +756,7 @@ func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, w
 		}
 	}
 	checkpointSnapshot.generation = view.generation
-	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
-		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
-	}
+	w.compactAfterCheckpoint(rec, workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit})
 	return result, err
 }
 
@@ -827,7 +867,17 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 	} else {
 		cached = nil
 	}
-	frames, bytesRead, err := readJournalFrames(w.JournalPath(), start)
+	var expectFirst *[journalHeaderSize]byte
+	if cached != nil {
+		expectFirst = &cached.first
+	}
+	frames, bytesRead, first, err := readJournalFrames(w.JournalPath(), start, expectFirst)
+	if errors.Is(err, errJournalReplaced) {
+		// Same inode, different file: compaction replaced the journal and
+		// the inode number was reused. Replay the new file from the start.
+		cached, start = nil, 0
+		frames, bytesRead, first, err = readJournalFrames(w.JournalPath(), 0, nil)
+	}
 	if err != nil {
 		return workingView{}, err
 	}
@@ -927,8 +977,13 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 	}
 	pending := make(map[string]journalRecord)
 	safeOffset := start
-	for _, frame := range frames {
+	for i, frame := range frames {
 		record := frame.record
+		if i == 0 && start == 0 && record.Kind == "checkpoint" {
+			// An anchor: compaction dropped the history before this
+			// checkpoint, so replay continues from its generation.
+			view.generation = record.Generation
+		}
 		switch record.Kind {
 		case "prepare":
 			if record.Manifest == nil || record.TxID == "" {
@@ -1017,7 +1072,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 	if err := materialize(); err != nil {
 		return workingView{}, err
 	}
-	w.cache = &workingCache{view: view, info: info, offset: safeOffset}
+	w.cache = &workingCache{view: view, info: info, offset: safeOffset, first: first}
 	return view, nil
 }
 
@@ -1113,7 +1168,7 @@ func (w *WorkingState) recordWriteMetrics(metrics journalWriteMetrics) {
 }
 
 func readJournal(path string) ([]journalRecord, error) {
-	frames, _, err := readJournalFrames(path, 0)
+	frames, _, _, err := readJournalFrames(path, 0, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1124,17 +1179,50 @@ func readJournal(path string) ([]journalRecord, error) {
 	return records, nil
 }
 
-func readJournalFrames(path string, start int64) ([]journalFrame, int64, error) {
+// errJournalReplaced reports that the journal file is not the one a cached
+// offset refers to.
+var errJournalReplaced = errors.New("journal file was replaced")
+
+// journalFirstHeader returns the first frame header of the journal, or zeros
+// if the journal is absent or shorter than a header.
+func journalFirstHeader(path string) ([journalHeaderSize]byte, error) {
+	var first [journalHeaderSize]byte
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, 0, nil
+		return first, nil
 	}
 	if err != nil {
-		return nil, 0, err
+		return first, err
 	}
 	defer file.Close()
+	if _, err := file.ReadAt(first[:], 0); err != nil && !errors.Is(err, io.EOF) {
+		return first, err
+	}
+	return first, nil
+}
+
+// readJournalFrames reads the complete frames from start onward. It also
+// returns the file's first frame header, which identifies the file. With
+// expectFirst set and start > 0, a different first header means the cached
+// offset belongs to a replaced journal, and it returns errJournalReplaced.
+func readJournalFrames(path string, start int64, expectFirst *[journalHeaderSize]byte) ([]journalFrame, int64, [journalHeaderSize]byte, error) {
+	var first [journalHeaderSize]byte
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, first, nil
+	}
+	if err != nil {
+		return nil, 0, first, err
+	}
+	defer file.Close()
+	if _, err := file.ReadAt(first[:], 0); err != nil && !errors.Is(err, io.EOF) {
+		return nil, 0, first, err
+	}
+	if expectFirst != nil && start > 0 && first != *expectFirst {
+		return nil, 0, first, errJournalReplaced
+	}
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return nil, 0, err
+		return nil, 0, first, err
 	}
 	var frames []journalFrame
 	offset := start
@@ -1142,38 +1230,38 @@ func readJournalFrames(path string, start int64) ([]journalFrame, int64, error) 
 		header := make([]byte, 12)
 		_, err := io.ReadFull(file, header)
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return frames, offset - start, nil
+			return frames, offset - start, first, nil
 		}
 		if err != nil {
-			return nil, offset - start, err
+			return nil, offset - start, first, err
 		}
 		if string(header[:4]) != "RDBJ" {
-			return nil, offset - start, fmt.Errorf("%w: invalid frame magic", ErrWorkingCorrupt)
+			return nil, offset - start, first, fmt.Errorf("%w: invalid frame magic", ErrWorkingCorrupt)
 		}
 		length := binary.BigEndian.Uint32(header[4:8])
 		if length == 0 || length > 1<<30 {
-			return nil, offset - start, fmt.Errorf("%w: invalid frame length", ErrWorkingCorrupt)
+			return nil, offset - start, first, fmt.Errorf("%w: invalid frame length", ErrWorkingCorrupt)
 		}
 		data := make([]byte, length)
 		if _, err := io.ReadFull(file, data); errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return frames, offset - start, nil
+			return frames, offset - start, first, nil
 		} else if err != nil {
-			return nil, offset - start, err
+			return nil, offset - start, first, err
 		}
 		if crc32.Checksum(data, journalCRC) != binary.BigEndian.Uint32(header[8:12]) {
-			return nil, offset - start, fmt.Errorf("%w: checksum mismatch", ErrWorkingCorrupt)
+			return nil, offset - start, first, fmt.Errorf("%w: checksum mismatch", ErrWorkingCorrupt)
 		}
 		var record journalRecord
 		decoder := json.NewDecoder(strings.NewReader(string(data)))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&record); err != nil {
-			return nil, offset - start, fmt.Errorf("%w: %v", ErrWorkingCorrupt, err)
+			return nil, offset - start, first, fmt.Errorf("%w: %v", ErrWorkingCorrupt, err)
 		}
 		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			return nil, offset - start, fmt.Errorf("%w: trailing frame content", ErrWorkingCorrupt)
+			return nil, offset - start, first, fmt.Errorf("%w: trailing frame content", ErrWorkingCorrupt)
 		}
 		if record.Version != workingFormatVersion {
-			return nil, offset - start, fmt.Errorf("unsupported working journal format %d", record.Version)
+			return nil, offset - start, first, fmt.Errorf("unsupported working journal format %d", record.Version)
 		}
 		offset += int64(len(header)) + int64(length)
 		frames = append(frames, journalFrame{record: record, end: offset})
