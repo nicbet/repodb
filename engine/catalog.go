@@ -925,6 +925,12 @@ func (t *table) IndexedAccess(_ *sql.Context, lookup sql.IndexLookup) sql.Indexe
 
 func (*table) PreciseMatch() bool { return true }
 
+// IsTemporary reports that RepoDB tables are never temporary. go-mysql-server's
+// read-only transaction check calls it on every table a write touches and
+// dereferences a nil interface for tables that do not implement
+// sql.TemporaryTable.
+func (*table) IsTemporary() bool { return false }
+
 func (t *table) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
 	if lookup.IsEmptyRange {
 		return sql.PartitionsToPartitionIter(pointPartition{}), nil
@@ -2298,4 +2304,5 @@ var _ sql.DeletableTable = (*table)(nil)
 var _ sql.AlterableTable = (*table)(nil)
 var _ sql.CheckTable = (*table)(nil)
 var _ sql.CheckAlterableTable = (*table)(nil)
+var _ sql.TemporaryTable = (*table)(nil)
 var _ sql.TransactionSession = (*session)(nil)

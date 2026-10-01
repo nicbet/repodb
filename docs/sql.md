@@ -90,7 +90,7 @@ A duplicate primary key is reported as a unique-key error. The error shows the e
 - **Failed statements.** A statement that fails inside an explicit transaction undoes only its own changes; the transaction stays open.
 - **DDL.** DDL commits implicitly, as in MySQL: a `CREATE TABLE` inside a transaction survives `ROLLBACK`.
 - **Savepoints** are not supported (`RepoDB M2 does not support savepoints`).
-- **Read-only transactions.** `START TRANSACTION READ ONLY` is accepted, but a write inside one currently crashes the process instead of returning an error (rdb-ff5432). Don't write in read-only transactions.
+- **Read-only transactions.** `START TRANSACTION READ ONLY` allows reads. Any `INSERT`, `UPDATE` or `DELETE` inside it fails with `cannot execute statement in a READ ONLY transaction` (MySQL error 1792), and the transaction stays open.
 - **Uncertain commit outcomes.** If a commit's outcome is uncertain (for example, the process failed while updating the Git ref), the error carries the candidate commit ID. `SELECT repodb_recover_commit('<candidate>')` returns `committed`, `rejected` or `unknown`. Use it instead of re-running the transaction. See [library.md](library.md#commit-outcomes).
 
 ## Functions added by RepoDB

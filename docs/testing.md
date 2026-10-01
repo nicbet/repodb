@@ -74,6 +74,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 - **Journal index overlay** (`journal_index_test.go`). Inserts, updates and deletes are visible through persisted indexes, with a random-operation model test (150 steps, checkpoints and reopens, one or two engines).
 - **Merge** (`merge_performance_test.go`). A merge spawns no Git processes, unchanged table roots are reused, secondary indexes are rebuilt, and point lookups do bounded work.
 - **Codecs.** `rowcodec_test.go` covers every type at its extremes, canonical bytes, compact integers, and rejection of truncated or trailing bytes. `keycodec_test.go` checks that encoded key order equals SQL order for each key type (random and edge values), composite key order, and rejection of non-key values.
+- **Read-only transactions** (`readonly_test.go`). Writes are rejected with the read-only error, reads still work, and the session can write again after `COMMIT`.
 - **EXPLAIN rewriting** (`explain_test.go`).
 
 ### Sync and merge (`integration`)
@@ -94,7 +95,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 
 ### Server and CLI
 
-- **`server`.** A MySQL-protocol round trip with the Go client: exec, query, parameters, `EXPLAIN` as a plan, `DESCRIBE`, and restart. Also commit-outcome errors carried over the wire and recovered with `RecoverCommit`.
+- **`server`.** A MySQL-protocol round trip with the Go client: exec, query, parameters, `EXPLAIN` as a plan, `DESCRIBE`, and restart. Also commit-outcome errors carried over the wire and recovered with `RecoverCommit`. A write in a read-only transaction returns MySQL error 1792, and the connection keeps working.
 - **`cmd/repodb`.** `init`, then `commit`: journal rows are checkpointed and the journal is clean afterwards.
 - **`experiments/dbbench`.** The scorecard harness's bookkeeping: rejected-attempt counting, partial reports, percentiles, and tolerance of files removed by Git's auto-gc.
 
@@ -146,7 +147,6 @@ These are known holes in the test surface:
 - **Sync faults.** No faults are injected during sync, fetch or push beyond a stalled push. The sync/journal race (rdb-e0c717) has no test.
 - **SQL compatibility.**
   - Nothing compares RepoDB's SQL results with MySQL's (rdb-686c51).
-  - Read-only transactions are untested (a write inside one crashes: rdb-ff5432).
   - Statements accepted but not honored are untested (rdb-5f12a3).
 - **Git object formats.** Only one test uses a SHA-256 repository.
 - **Load.** There are no stress or soak tests beyond two-writer races and the 150-step index model.
