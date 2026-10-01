@@ -171,7 +171,7 @@ With nothing to checkpoint, it returns the current data head and creates no comm
 
 `eng.WorkingState()` exposes the journal:
 - `Status(ctx)` returns the base and head commits, the generation, and `Dirty`;
-- `Diff(ctx)` lists changed tables. It currently misses row-only changes (rdb-53214c).
+- `Diff(ctx)` lists tables changed since the last checkpoint as `TableChange{Table, Change}`, with `added`, `modified` or `deleted`. Row-only changes count as `modified`.
 
 It is `nil` in native-git mode. Use `repository.OpenWorkingState(repo)` to inspect a repository's journal without an engine.
 

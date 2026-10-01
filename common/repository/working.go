@@ -271,7 +271,9 @@ func (w *WorkingState) Status(ctx context.Context) (WorkingStatus, error) {
 	return WorkingStatus{BaseCommit: view.baseCommit, HeadCommit: head, Generation: view.generation, Dirty: view.dirty}, nil
 }
 
-// Diff reports table-root changes since the last intentional data commit.
+// Diff reports tables changed since the last intentional data commit: table
+// roots that differ, and tables with pending journal row edits, which leave
+// the manifest's data root untouched until a checkpoint.
 func (w *WorkingState) Diff(ctx context.Context) ([]TableChange, error) {
 	release, err := w.lock(ctx)
 	if err != nil {
@@ -303,7 +305,7 @@ func (w *WorkingState) Diff(ctx context.Context) ([]TableChange, error) {
 			change = "added"
 		case !afterOK:
 			change = "deleted"
-		case before.Equal(after):
+		case before.Equal(after) && !hasPendingRows(view.pendingEdits[name]):
 			continue
 		}
 		changes = append(changes, TableChange{Table: name, Change: change})
@@ -669,6 +671,10 @@ func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, w
 		w.cache = &workingCache{view: workingView{snapshot: checkpointSnapshot, generation: view.generation, baseCommit: result.Commit}, info: info, offset: info.Size()}
 	}
 	return result, err
+}
+
+func hasPendingRows(edits *pendingTableEdits) bool {
+	return edits != nil && len(edits.rows) > 0
 }
 
 // PendingEdits returns the accumulated typed edits from the current working

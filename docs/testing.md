@@ -68,7 +68,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - separate engines observing each other;
   - incremental replay from a cached offset, and detection of a replaced journal file;
   - bounded snapshot loading during replay;
-  - the native-git open guard.
+  - the native-git open guard;
+  - `Diff` listing row-only inserts, updates and deletes, new tables, and pending edits after a reopen.
 - **Cross-engine visibility** (`cross_engine_test.go`). Readers see other engines' writes in every mode, including external `git update-ref` and `pack-refs` changes, without a restart.
 - **Range queries** (`range_test.go`). Indexed range and `ORDER BY … LIMIT` results are compared with a forced full scan. The comparison runs over native-git, journal with pending edits, and open transactions, and over signed-integer, decimal, collated-string and datetime keys, using seeded random data. Tests also cover integer extremes, and that plans use `IndexedTableAccess` without a sort.
 - **Journal index overlay** (`journal_index_test.go`). Inserts, updates and deletes are visible through persisted indexes, with a random-operation model test (150 steps, checkpoints and reopens, one or two engines).
@@ -150,4 +151,3 @@ These are known holes in the test surface:
   - Statements accepted but not honored are untested (rdb-5f12a3).
 - **Git object formats.** Only one test uses a SHA-256 repository.
 - **Load.** There are no stress or soak tests beyond two-writer races and the 150-step index model.
-- **Row-level diff.** `WorkingState.Diff` is untested and misses row-only changes (rdb-53214c).

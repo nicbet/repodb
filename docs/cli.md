@@ -109,7 +109,7 @@ Prints the data head commit, the storage format version, and the number of objec
 
 Lists tables that differ between the journal's working state and the last checkpoint, one `<change>\t<table>` line each, with `added`, `modified` or `deleted`. It prints `No uncommitted data changes.` when nothing differs.
 
-It reports tables, not rows. Row-only changes to a table that already existed at the last checkpoint are currently not listed (rdb-53214c); `repodb status` shows whether the journal is dirty.
+It reports tables, not rows: a table with any inserted, updated or deleted row since the last checkpoint is `modified`, or `added` if the table is new. A row change that was later undone, such as an insert followed by a delete of the same key, still counts, just as it keeps `repodb status` dirty.
 
 ### `repodb commit -m <message>`
 

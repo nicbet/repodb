@@ -505,3 +505,95 @@ func TestJournalReplayLoadsBoundedSnapshots(t *testing.T) {
 		})
 	}
 }
+
+func TestJournalDiffListsRowOnlyChanges(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	repo, err := repository.Init(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _ := eng.NewSession()
+	exec := func(statement string) {
+		t.Helper()
+		if err := session.Exec(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	checkpoint := func() {
+		t.Helper()
+		if _, err := eng.Checkpoint(ctx, "checkpoint"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	diff := func(working *repository.WorkingState) string {
+		t.Helper()
+		changes, err := working.Diff(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprint(changes)
+	}
+
+	exec("CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT)")
+	exec("INSERT INTO t VALUES (1, 'a')")
+	checkpoint()
+	if got := diff(eng.WorkingState()); got != "[]" {
+		t.Fatalf("diff after checkpoint = %s, want []", got)
+	}
+	for _, statement := range []string{
+		"INSERT INTO t VALUES (2, 'b')",
+		"UPDATE t SET v = 'c' WHERE id = 1",
+		"DELETE FROM t WHERE id = 2",
+	} {
+		exec(statement)
+		if got := diff(eng.WorkingState()); got != "[{t modified}]" {
+			t.Fatalf("diff after %s = %s, want [{t modified}]", statement, got)
+		}
+		checkpoint()
+	}
+
+	// Native-git writes publish immediately and leave nothing for Diff.
+	native, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeSession, _ := native.NewSession()
+	if err := nativeSession.Exec(ctx, "INSERT INTO t VALUES (10, 'native')"); err != nil {
+		t.Fatal(err)
+	}
+	_ = nativeSession.Close()
+	_ = native.Close()
+	if got := diff(eng.WorkingState()); got != "[]" {
+		t.Fatalf("diff after native-git write = %s, want []", got)
+	}
+
+	// A table created since the checkpoint is listed once, as added.
+	exec("CREATE TABLE u (id BIGINT PRIMARY KEY)")
+	exec("INSERT INTO u VALUES (1)")
+	exec("INSERT INTO t VALUES (3, 'd')")
+	if got := diff(eng.WorkingState()); got != "[{t modified} {u added}]" {
+		t.Fatalf("diff with new table = %s", got)
+	}
+
+	// Pending row edits are still reported after replaying the journal from disk.
+	_ = session.Close()
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := repository.OpenWorkingState(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := diff(reopened); got != "[{t modified} {u added}]" {
+		t.Fatalf("diff after reopen = %s", got)
+	}
+	status, err := reopened.Status(ctx)
+	if err != nil || !status.Dirty {
+		t.Fatalf("status after reopen = %#v, %v; want dirty", status, err)
+	}
+}
