@@ -398,10 +398,21 @@ func (s *session) CommitTransaction(ctx *sql.Context, opaque sql.Transaction) er
 		}
 		return nil
 	}
+	var err error
 	if s.db.working != nil {
-		return s.commitTypedEdits(ctx, tx)
+		err = s.commitTypedEdits(ctx, tx)
+	} else {
+		err = s.commitNativeGit(ctx, tx)
 	}
-	return s.commitNativeGit(ctx, tx)
+	if err != nil {
+		// go-mysql-server clears the transaction only after a successful
+		// commit, but a RepoDB transaction cannot commit twice. Drop it, as
+		// MySQL rolls back a failed commit, so the next statement (or the
+		// application's retry) starts fresh on the current snapshot.
+		ctx.SetTransaction(nil)
+		ctx.SetIgnoreAutoCommit(false)
+	}
+	return err
 }
 
 func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {

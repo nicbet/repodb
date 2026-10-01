@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
@@ -595,5 +597,198 @@ func TestJournalDiffListsRowOnlyChanges(t *testing.T) {
 	status, err := reopened.Status(ctx)
 	if err != nil || !status.Dirty {
 		t.Fatalf("status after reopen = %#v, %v; want dirty", status, err)
+	}
+}
+
+// A native-git commit while another engine's journal holds uncheckpointed
+// transactions is rejected instead of moving the head under the journal.
+func TestNativeGitCommitRejectedWhileJournalDirty(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	native, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer native.Close()
+	nativeSession, _ := native.NewSession()
+	defer nativeSession.Close()
+	if err := nativeSession.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	journalSession, _ := journal.NewSession()
+	defer journalSession.Close()
+	if err := journalSession.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err := repository.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headBefore, _ := repo.Head(ctx)
+	if err := nativeSession.Exec(ctx, "INSERT INTO t VALUES (2)"); !errors.Is(err, repository.ErrWorkingStateDirty) {
+		t.Fatalf("native commit under dirty journal: err = %v, want ErrWorkingStateDirty", err)
+	}
+	if head, _ := repo.Head(ctx); head != headBefore {
+		t.Fatalf("native commit moved the head: %s -> %s", headBefore, head)
+	}
+	working, _ := repository.OpenWorkingState(repo)
+	if status, err := working.Status(ctx); err != nil || !status.Dirty {
+		t.Fatalf("working status = %#v, %v; want dirty", status, err)
+	}
+
+	if _, err := journal.Checkpoint(ctx, "journal rows"); err != nil {
+		t.Fatal(err)
+	}
+	if err := nativeSession.Exec(ctx, "INSERT INTO t VALUES (2)"); err != nil {
+		t.Fatalf("native commit after checkpoint: %v", err)
+	}
+	result, err := journalSession.Query(ctx, "SELECT id FROM t ORDER BY id")
+	if err != nil || fmt.Sprint(result.Rows) != "[[1] [2]]" {
+		t.Fatalf("rows = %v, %v", result.Rows, err)
+	}
+}
+
+// After a rejected COMMIT the session drops the dead transaction: it sees only
+// published rows, and retrying the transaction succeeds (rdb-ed0738).
+func TestRejectedCommitStartsFreshTransaction(t *testing.T) {
+	for _, mode := range []engine.PersistenceMode{engine.PersistenceNativeGit, engine.PersistenceJournal} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			root := gitRepository(t)
+			if _, err := repository.Init(ctx, root); err != nil {
+				t.Fatal(err)
+			}
+			open := func() *engine.Session {
+				eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: mode})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { eng.Close() })
+				s, _ := eng.NewSession()
+				t.Cleanup(func() { s.Close() })
+				return s
+			}
+			s1, s2 := open(), open()
+			if err := s1.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range []string{"START TRANSACTION", "INSERT INTO t VALUES (2)"} {
+				if err := s2.Exec(ctx, statement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s1.Exec(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s2.Exec(ctx, "COMMIT"); !errors.Is(err, repository.ErrConflict) {
+				t.Fatalf("COMMIT = %v, want ErrConflict", err)
+			}
+			rows := func() string {
+				t.Helper()
+				result, err := s2.Query(ctx, "SELECT id FROM t ORDER BY id")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return fmt.Sprint(result.Rows)
+			}
+			if got := rows(); got != "[[1]]" {
+				t.Fatalf("rows after rejected COMMIT = %s, want [[1]]", got)
+			}
+			for _, statement := range []string{"START TRANSACTION", "INSERT INTO t VALUES (2)", "COMMIT"} {
+				if err := s2.Exec(ctx, statement); err != nil {
+					t.Fatalf("retry %s: %v", statement, err)
+				}
+			}
+			if got := rows(); got != "[[1] [2]]" {
+				t.Fatalf("rows after retry = %s", got)
+			}
+		})
+	}
+}
+
+// Journal commits, checkpoints and native-git commits racing on one
+// repository never strand the journal and never deadlock.
+func TestConcurrentJournalAndNativeCommitsKeepWorkingStateLoadable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	native, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceNativeGit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer native.Close()
+	nativeSession, _ := native.NewSession()
+	defer nativeSession.Close()
+	if err := nativeSession.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY, writer TEXT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	journalSession, _ := journal.NewSession()
+	defer journalSession.Close()
+
+	const rounds = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, 3*rounds)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			err := journalSession.Exec(ctx, "INSERT INTO t VALUES (?, 'journal')", int64(i))
+			if err != nil && !errors.Is(err, repository.ErrConflict) {
+				errs <- fmt.Errorf("journal insert %d: %w", i, err)
+			}
+			if i%5 == 4 {
+				if _, err := journal.Checkpoint(ctx, "checkpoint"); err != nil && !errors.Is(err, repository.ErrConflict) {
+					errs <- fmt.Errorf("checkpoint %d: %w", i, err)
+				}
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			err := nativeSession.Exec(ctx, "INSERT INTO t VALUES (?, 'native')", int64(1000+i))
+			if err != nil && !errors.Is(err, repository.ErrWorkingStateDirty) && !errors.Is(err, repository.ErrConflict) {
+				errs <- fmt.Errorf("native insert %d: %w", i, err)
+			}
+		}
+	}()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("writers deadlocked")
+	}
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if _, err := journal.Checkpoint(ctx, "final"); err != nil {
+		t.Fatalf("final checkpoint: %v", err)
+	}
+	repo, err := repository.Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	working, _ := repository.OpenWorkingState(repo)
+	if status, err := working.Status(ctx); err != nil || status.Dirty {
+		t.Fatalf("working status = %#v, %v; want loadable and clean", status, err)
 	}
 }

@@ -69,7 +69,9 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - separate engines observing each other;
   - incremental replay from a cached offset, and detection of a replaced journal file;
   - bounded snapshot loading during replay;
-  - the native-git open guard;
+  - the native-git open guard, and native-git commits rejected while another engine's journal is dirty;
+  - journal commits, checkpoints and native-git commits racing without deadlock or a stranded journal;
+  - a rejected `COMMIT` ends the transaction, and the retry succeeds (native-git and journal);
   - `Diff` listing row-only inserts, updates and deletes, new tables, and pending edits after a reopen.
 - **Cross-engine visibility** (`cross_engine_test.go`). Readers see other engines' writes in every mode, including external `git update-ref` and `pack-refs` changes, without a restart.
 - **Range queries** (`range_test.go`). Indexed range and `ORDER BY … LIMIT` results are compared with a forced full scan. The comparison runs over native-git, journal with pending edits, and open transactions, and over signed-integer, decimal, collated-string and datetime keys, using seeded random data. Tests also cover integer extremes, and that plans use `IndexedTableAccess` without a sort.
@@ -90,6 +92,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - a clean source worktree at the end.
 - **Other cases:**
   - sync refuses a dirty journal;
+  - a journal commit racing sync's fast-forward or merge publication makes sync fail with the ref unchanged, and a checkpoint plus a second sync merges it (`journal_race_test.go`, through a test hook before publication);
+  - the documented recovery of a stranded journal (head moved by `git update-ref`) brings back every acknowledged row;
   - sync does not hold the publication lock while pushing (a remote hook stalls the push while a SQL commit completes);
   - incompatible schema changes are reported as schema conflicts;
   - `enable` rejects an invalid fetched SQL graph;
@@ -146,7 +150,7 @@ These are known holes in the test surface:
 - **CLI.** Only `init` and `commit` are tested; argument handling, output and exit codes are not. `cmd/repodb-server` has no tests.
 - **Client.** `client` has no tests of its own; it is exercised only through the server tests.
 - **Journal faults.** `BeforeJournalAppend` and `BeforeJournalFlush` are never injected, and no test kills a process during a journal append or checkpoint.
-- **Sync faults.** No faults are injected during sync, fetch or push beyond a stalled push. The sync/journal race (rdb-e0c717) has no test.
+- **Sync faults.** No faults are injected during sync, fetch or push beyond a stalled push and a journal commit racing the publication.
 - **SQL compatibility.** Nothing compares RepoDB's SQL results with MySQL's (rdb-686c51).
 - **Git object formats.** Only one test uses a SHA-256 repository.
 - **Load.** There are no stress or soak tests beyond two-writer races and the 150-step index model.

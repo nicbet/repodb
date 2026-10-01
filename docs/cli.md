@@ -150,7 +150,7 @@ Exchanges committed data history with the remote:
 3. If the remote is behind, pushes with an ordinary fast-forward push, never a force push.
 4. If both sides changed, performs a three-way merge and publishes a merge commit with both heads as parents, then pushes it. If the local ref or the remote moved during the merge, it starts again, up to three attempts.
 
-If the journal has uncheckpointed changes, sync refuses to run. In an interactive terminal it first offers to checkpoint (`checkpoint before sync`). Otherwise, run `repodb commit -m <message>` first.
+If the journal has uncheckpointed changes, sync refuses to run. In an interactive terminal it first offers to checkpoint (`checkpoint before sync`). Otherwise, run `repodb commit -m <message>` first. If a journal transaction commits while sync is running, sync leaves the local data ref unchanged and fails the same way; checkpoint and sync again.
 
 Output names the action taken: `up-to-date`, `fast-forwarded-local`, `pushed`, `merged`, or `conflicts`. On failure, it names both heads.
 
@@ -194,5 +194,14 @@ There is no atomic link between a source commit and a data commit. Push your cod
 - **Native-git mode**: the Git repository holds every committed transaction. A mirror clone (`git clone --mirror`, which includes `refs/repodb/data`), or a copy of `.git` taken while RepoDB is stopped, is a complete backup. A plain `git clone` does not include RepoDB data.
 - **Journal mode**: uncheckpointed changes exist only in `<git-common-dir>/repodb/working/v1/journal`. Either run `repodb commit` before backing up the Git repository, or copy the Git repository and the journal together while no RepoDB process is writing. A copy of the Git repository alone restores the last checkpoint. Online backup is tracked in rdb-f33cb0.
 - `<git-common-dir>/repodb/cache/` is disposable and rebuilt on demand. Never delete `working/`, `locks/` or `conflicts/` while RepoDB is running.
+
+### Recovering a stranded journal
+
+RepoDB never moves the data head while the journal has uncheckpointed transactions. If something outside RepoDB does, for example `git update-ref refs/repodb/data`, every open fails with `RepoDB committed head changed while working state is dirty: journal base <base>, data head <head>`. The journal's transactions are intact; they are based on `<base>`. To recover:
+
+1. Make sure `<head>` is not lost: if it exists only in this repository, keep its ID (it is also in the reflog of `refs/repodb/data`).
+2. `git update-ref refs/repodb/data <base>` puts the head back on the journal's base.
+3. `repodb commit -m <message>` checkpoints the journal's transactions on that base.
+4. `repodb sync` merges them with the remote through the usual three-way merge. If `<head>` came from the remote, this brings it back. Conflicts are reported and resolved as in any sync.
 
 Linked Git worktrees share one data ref, one journal and one set of locks. RepoDB state belongs to the repository, not to a worktree.

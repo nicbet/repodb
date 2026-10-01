@@ -65,7 +65,7 @@ eng, err := engine.OpenWithOptions(ctx, ".", engine.Options{
 
 `engine.New(repo)` and `engine.NewWithOptions(repo, options)` do the same for a `*repository.Repository` you already opened. The trade-offs between the two modes are in [cli.md](cli.md#persistence-modes).
 
-A native-git engine refuses to open while the journal has uncheckpointed changes (`repository.ErrWorkingStateDirty`). Checkpoint in journal mode first.
+A native-git engine refuses to open while the journal has uncheckpointed changes (`repository.ErrWorkingStateDirty`). Checkpoint in journal mode first. A native-git engine that is already open fails its commits with the same error while another engine's journal is dirty, and nothing is written.
 
 Within a process, share one `Engine` per repository. Separate engines, whether in this process, other processes or a server, can use the same repository at the same time: every transaction boundary re-checks the journal and the data ref, so each sees the others' commits.
 
@@ -200,7 +200,7 @@ log.Println(status.Action, status.LocalHead, status.RemoteHead)
   - `*integration.MergeConflictError` when the merge stopped on conflicts. `integration.Conflicts` reloads the saved conflict set later.
 - **`Resolve`** takes `engine.TakeLocal`, `TakeRemote`, `TakeBase` or `TakeDelete`. It returns a `*MergeConflictError` while conflicts remain, and publishes and pushes the merge once none do.
 
-Don't run `Sync` while a journal transaction may commit in the same repository: that race can leave the working state stuck (rdb-e0c717).
+If a journal transaction commits while `Sync` runs, `Sync` leaves the local data ref unchanged and returns `integration.ErrWorkingDirty`: checkpoint and call `Sync` again.
 
 ## Embedding the MySQL server
 

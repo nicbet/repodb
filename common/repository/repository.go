@@ -113,6 +113,10 @@ type Repository struct {
 	head      string
 	headStamp refStamp
 	headKnown bool
+
+	// working guards head publications: see lockForPublication.
+	workingOnce sync.Once
+	working     *WorkingState
 }
 
 type PublicationPoint string
@@ -167,6 +171,9 @@ type Writer struct {
 	parents    []string
 	committed  bool
 	mu         sync.RWMutex
+	// workingLockHeld marks a checkpoint's writer: its caller already holds
+	// working.lock and is publishing the dirty journal on purpose.
+	workingLockHeld bool
 }
 
 // Init creates the initial empty catalog commit. It is idempotent when the data
@@ -323,7 +330,7 @@ type LockedPublication struct{ repo *Repository }
 
 // WithPublicationLock serializes integration reconciliation with SQL commits.
 func (r *Repository) WithPublicationLock(ctx context.Context, fn func(*LockedPublication) error) error {
-	release, err := r.lock(ctx)
+	release, err := r.lockForPublication(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -354,6 +361,9 @@ func (p *LockedPublication) FastForward(ctx context.Context, expected, target st
 func (p *LockedPublication) FastForwardSnapshot(ctx context.Context, expected string, snapshot *Snapshot) (*Snapshot, error) {
 	if snapshot == nil || snapshot.repo != p.repo {
 		return nil, errors.New("fast-forward snapshot belongs to a different repository")
+	}
+	if err := p.repo.requireCleanJournalLocked(); err != nil {
+		return nil, err
 	}
 	target := snapshot.Commit
 	actual, err := p.Head(ctx)
@@ -618,7 +628,12 @@ func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest
 	publicationMetrics.inventory.Add(uint64(time.Since(inventoryStarted)))
 
 	lockStarted := time.Now()
-	release, err := w.repo.lock(ctx)
+	var release func()
+	if w.workingLockHeld {
+		release, err = w.repo.lock(ctx)
+	} else {
+		release, err = w.repo.lockForPublication(ctx, true)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -976,6 +991,44 @@ func sortedHashSet(objects map[storage.Hash]struct{}) []storage.Hash {
 
 func objectPath(hash storage.Hash) string {
 	return "objects/sha256/" + string(hash[:2]) + "/" + string(hash[2:])
+}
+
+// lockForPublication takes working.lock, then publish.lock: the order every
+// head publication follows, checkpoints included. With requireClean it
+// refuses while the journal holds uncheckpointed transactions, whose base
+// would otherwise stop being the head. Holding working.lock until the ref
+// update also keeps journal commits from landing on the old head meanwhile.
+func (r *Repository) lockForPublication(ctx context.Context, requireClean bool) (func(), error) {
+	r.workingOnce.Do(func() { r.working = &WorkingState{repo: r} })
+	releaseWorking, err := r.working.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if requireClean {
+		if err := r.requireCleanJournalLocked(); err != nil {
+			releaseWorking()
+			return nil, err
+		}
+	}
+	releasePublish, err := r.lock(ctx)
+	if err != nil {
+		releaseWorking()
+		return nil, err
+	}
+	return func() { releasePublish(); releaseWorking() }, nil
+}
+
+// requireCleanJournalLocked fails with ErrWorkingStateDirty when the journal
+// has uncheckpointed transactions. The caller holds working.lock.
+func (r *Repository) requireCleanJournalLocked() error {
+	dirty, err := r.working.journalDirtyLocked()
+	if err != nil {
+		return err
+	}
+	if dirty {
+		return fmt.Errorf("%w; checkpoint it (repodb commit -m <message>) before moving the data head", ErrWorkingStateDirty)
+	}
+	return nil
 }
 
 func (r *Repository) lock(ctx context.Context) (func(), error) {

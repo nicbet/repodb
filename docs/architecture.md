@@ -28,7 +28,7 @@ All paths are under the repository's common Git directory (`git rev-parse --git-
 | `refs/repodb/remotes/<remote>/data` | the last fetched data head of a remote | fetched copy, never written locally |
 | `repodb/working/v1/journal` | the journal: transactions not yet checkpointed | authoritative in journal mode |
 | `repodb/locks/publish.lock` | serializes updates of `refs/repodb/data` | coordination |
-| `repodb/locks/working.lock` | serializes journal appends and checkpoints | coordination |
+| `repodb/locks/working.lock` | serializes journal appends and checkpoints; every update of `refs/repodb/data` takes it before `publish.lock` | coordination |
 | `repodb/conflicts/<remote>.json` | an interrupted merge's conflicts and chosen resolutions | local coordination state |
 | `repodb/tmp/` | the temporary Git index used to build data trees | scratch |
 | Git config `remote.<remote>.fetch`, `repodb.remote` | the data fetch refspec and the default sync remote | configuration |
@@ -143,7 +143,7 @@ A transaction collects its row and schema edits in memory. A failing statement u
 
 1. The engine applies each changed table's edits to its trees with `prolly.Apply`, in memory. A table is rebuilt only when DDL rewrote it.
 2. It validates the new snapshot's object inventory.
-3. Under `publish.lock`, it:
+3. Under `working.lock`, it checks that the journal has no uncheckpointed transactions, or fails with `ErrWorkingStateDirty`. Then, also under `publish.lock`, it:
    1. writes the new objects as Git blobs through a temporary index;
    2. writes a tree and a commit;
    3. advances `refs/repodb/data` with `git update-ref <new> <expected-old>`.
@@ -179,15 +179,17 @@ Each transaction gets a random transaction ID and the next generation number. Gi
 
 If the process dies after publishing but before the record, the next open sees that the published snapshot equals the working state and treats the journal as clean.
 
-**Guards:**
-- A native-git engine refuses to open while the journal is dirty (`ErrWorkingStateDirty`).
-- If the data head moves under a dirty journal, loading fails with `ErrWorkingBaseChanged`. Sync can currently cause this (rdb-e0c717).
+**Guards.** A dirty journal's transactions are based on the current data head, so the head must not move until a checkpoint publishes them:
+- Every update of `refs/repodb/data` takes `working.lock` and then `publish.lock`, and holds both until the ref update. Only a checkpoint may publish while the journal is dirty.
+- Native-git commits and sync's fast-forward and merge publications check the journal under `working.lock` and fail with `ErrWorkingStateDirty` while it is dirty. The check reads only the record kinds appended since its last call, so an unchanged journal costs one `stat`.
+- A native-git engine also refuses to open while the journal is dirty.
+- If the data head moves under a dirty journal anyway, for example through an external `git update-ref`, loading fails with `ErrWorkingBaseChanged`, naming the journal's base and the head. [cli.md](cli.md#recovering-a-stranded-journal) describes the recovery.
 
 **Growth.** The journal is never compacted and grows with every transaction (rdb-515fae).
 
 ### Concurrency limits
 
-Commits are optimistic and repository-wide: any commit since a transaction's snapshot rejects that transaction, whichever rows it touched. Within one repository, commits are serialized by `working.lock` (journal) or `publish.lock` (native-git), and each journal commit does its own `fsync`. Together these bound concurrent write throughput. Per-key conflict detection, group commit and automatic retry are tracked in rdb-df092b.
+Commits are optimistic and repository-wide: any commit since a transaction's snapshot rejects that transaction, whichever rows it touched. Within one repository, commits are serialized by `working.lock` (journal) or by `working.lock` and `publish.lock` (native-git), and each journal commit does its own `fsync`. Together these bound concurrent write throughput. Per-key conflict detection, group commit and automatic retry are tracked in rdb-df092b.
 
 ## Sync and merge
 
@@ -199,7 +201,7 @@ Commits are optimistic and repository-wide: any commit since a transaction's sna
 
 It then does one of the following:
 
-- **Fast-forward local.** Under `publish.lock`, the local ref moves to the fetched commit.
+- **Fast-forward local.** Under `working.lock` and `publish.lock`, the local ref moves to the fetched commit, unless a journal transaction committed since step 1 (`ErrWorkingDirty`).
 - **Push.** The local commit is pushed to the remote's `refs/repodb/data` as an ordinary fast-forward push, without force. The push does not hold `publish.lock`, so local SQL commits continue during a slow push.
 - **Merge.** A three-way merge between the local head, the fetched head and their Git merge base.
 
@@ -212,7 +214,7 @@ It then does one of the following:
 
 Row conflicts are compared on whole encoded rows, so fields are never merged. Unchanged tables are recognized by equal roots and reused without reading their rows. Merged trees are streamed through a sorted builder, and secondary indexes are rebuilt from the merged rows. Every merged row is decoded and checked before publication.
 
-**Publishing a merge.** A merge without conflicts is published under `publish.lock` as a two-parent commit and pushed. If the local ref moved or the push was rejected, sync fetches and merges again, up to three attempts.
+**Publishing a merge.** A merge without conflicts is published as a two-parent commit, under the same locks and journal check as a fast-forward, and pushed. If the local ref moved or the push was rejected, sync fetches and merges again, up to three attempts.
 
 **Conflicts.** A merge with conflicts writes `conflicts/<remote>.json` (the three heads, each conflict and any chosen resolutions) and leaves the local ref unchanged. `Resolve` records one choice at a time. When every conflict has one, it re-checks that both heads are unchanged, merges with those choices, publishes and pushes, then deletes the conflict file. If a head moved, the next sync computes new conflicts.
 

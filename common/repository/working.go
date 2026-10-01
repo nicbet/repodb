@@ -48,6 +48,8 @@ type WorkingState struct {
 	mu      sync.Mutex
 	cache   *workingCache
 	metrics workingMetricCounters
+	// dirtyScan caches journalDirtyLocked's position in the journal.
+	dirtyScan journalDirtyScan
 
 	groupMu    sync.Mutex
 	groupQueue []groupCommitEntry
@@ -163,6 +165,49 @@ func OpenWorkingState(repo *Repository) (*WorkingState, error) {
 		return nil, errors.New("repository is required")
 	}
 	return &WorkingState{repo: repo}, nil
+}
+
+type journalDirtyScan struct {
+	info   os.FileInfo
+	offset int64
+	dirty  bool
+}
+
+// journalDirtyLocked reports whether the journal holds committed transactions
+// that no checkpoint has published. The caller holds w's lock. Unlike load, it
+// reads only record kinds, never snapshots or the data head, so publications
+// can afford it: an unchanged journal costs one stat.
+func (w *WorkingState) journalDirtyLocked() (bool, error) {
+	info, err := os.Stat(w.JournalPath())
+	if errors.Is(err, os.ErrNotExist) {
+		w.dirtyScan = journalDirtyScan{}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	scan := w.dirtyScan
+	if scan.info == nil || !os.SameFile(scan.info, info) || info.Size() < scan.offset {
+		scan = journalDirtyScan{}
+	} else if info.Size() == scan.offset {
+		return scan.dirty, nil
+	}
+	frames, _, err := readJournalFrames(w.JournalPath(), scan.offset)
+	if err != nil {
+		return false, err
+	}
+	for _, frame := range frames {
+		switch frame.record.Kind {
+		case "commit":
+			scan.dirty = true
+		case "checkpoint":
+			scan.dirty = false
+		}
+		scan.offset = frame.end
+	}
+	scan.info = info
+	w.dirtyScan = scan
+	return scan.dirty, nil
 }
 
 func (w *WorkingState) SetFaultInjector(inject func(WorkingFaultPoint) error) { w.fault = inject }
@@ -579,6 +624,7 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 	if err != nil {
 		return CommitResult{Outcome: OutcomeRejected}, err
 	}
+	writer.workingLockHeld = true
 	for _, hash := range view.snapshot.Manifest.Objects {
 		if _, present := base.objectSet[hash]; present {
 			continue
@@ -643,6 +689,7 @@ func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, w
 	if !view.dirty {
 		return CommitResult{Outcome: OutcomeCommitted, Commit: view.snapshot.Commit, Snapshot: view.snapshot}, nil
 	}
+	writer.workingLockHeld = true
 	result, err := writer.CommitWithOutcomeMessage(ctx, manifest, message)
 	if err != nil && result.Outcome != OutcomeCommitted {
 		return result, err
@@ -983,7 +1030,7 @@ func (w *WorkingState) reconcileHead(ctx context.Context, view workingView, head
 		return workingView{}, err
 	}
 	if view.dirty && !reflect.DeepEqual(current.Manifest, view.snapshot.Manifest) {
-		return workingView{}, ErrWorkingBaseChanged
+		return workingView{}, fmt.Errorf("%w: journal base %s, data head %s; see \"Recovering a stranded journal\" in docs/cli.md", ErrWorkingBaseChanged, view.baseCommit, head)
 	}
 	current.generation = view.generation
 	view.snapshot, view.baseCommit, view.dirty = current, head, false

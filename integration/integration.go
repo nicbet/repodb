@@ -223,10 +223,15 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 			if err := engine.ValidateSnapshot(ctx, remoteSnapshot); err != nil {
 				return last, fmt.Errorf("validate fetched RepoDB SQL graph: %w", err)
 			}
+			beforePublish()
 			err = repo.WithPublicationLock(ctx, func(publication *repository.LockedPublication) error {
 				_, err := publication.FastForwardSnapshot(ctx, localHead, remoteSnapshot)
 				return err
 			})
+			if errors.Is(err, repository.ErrWorkingStateDirty) {
+				last.Action = "working-dirty"
+				return last, journalCommittedDuringSync(err)
+			}
 			if errors.Is(err, repository.ErrConflict) {
 				lastErr, last.Action = err, "publication-retry"
 				continue
@@ -294,7 +299,12 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 		if err := writer.RetainOnly(hashes); err != nil {
 			return last, err
 		}
+		beforePublish()
 		result, err := writer.CommitWithOutcome(ctx, manifest)
+		if errors.Is(err, repository.ErrWorkingStateDirty) {
+			last.Action = "working-dirty"
+			return last, journalCommittedDuringSync(err)
+		}
 		if errors.Is(err, repository.ErrConflict) {
 			lastErr, last.Action = err, "publication-retry"
 			continue
@@ -324,6 +334,16 @@ func Sync(ctx context.Context, start, remote string) (Status, error) {
 	last.Action = "retry-exhausted"
 	return last, fmt.Errorf("RepoDB synchronization did not stabilize after %d attempts; both local and tracking histories are preserved: %w", maxAttempts, lastErr)
 }
+
+// journalCommittedDuringSync reports a journal transaction that committed
+// after sync's clean check; the publication refused to move the head under it.
+func journalCommittedDuringSync(err error) error {
+	return fmt.Errorf("%w: a journal transaction committed during sync; run repodb diff and repodb commit -m <message>, then sync again (%w)", ErrWorkingDirty, err)
+}
+
+// beforePublish runs just before sync advances the local data head. Tests
+// replace it to interleave other writers with that window.
+var beforePublish = func() {}
 
 func requireCleanWorkingState(ctx context.Context, repo *repository.Repository) error {
 	working, err := repository.OpenWorkingState(repo)
