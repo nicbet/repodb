@@ -52,7 +52,7 @@ objects/sha256/ab/cdef…   # one blob per RepoDB object, named by its SHA-256
 
 **Identities.** RepoDB identifies objects by SHA-256 of their content. The Git blob ID is a separate identity, so a repository may use Git's SHA-1 or SHA-256 object format.
 
-**Commit parents.** A data commit's parent is the previous data head, and merges have two parents. SQL commits in native-git mode use the subject `RepoDB snapshot v3`; checkpoints use the given message.
+**Commit parents.** A data commit's parent is the previous data head, and merges have two parents. SQL commits in native-git mode use the subject `RepoDB snapshot v4` (the storage format version); checkpoints use the given message.
 
 **Opening a snapshot.** It must pass these checks before any use, or it fails with `repository.ErrCorrupt`:
 - the manifest decodes strictly and the format version matches;
@@ -76,12 +76,13 @@ Each table has three kinds of object:
 
 A Prolly tree is a B-tree-like structure whose node boundaries depend only on content:
 - Nodes are JSON, stored as content-addressed objects.
-- Entries are split into chunks by a rolling hash over their FNV-64 fingerprints. A chunk ends once it has at least 32 entries and the rolling hash's low 6 bits are zero, or at 128 entries.
-- Interior levels chunk their child links the same way.
+- Entries are split into chunks by a per-entry boundary hash: the FNV-64 hash of the entry's **key**. A chunk ends after an entry once it has at least 32 entries and that entry's hash has its low 6 bits zero, or at 128 entries.
+- Interior levels chunk their child links the same way, hashing each link's maximum key.
+- The decision never looks at values, child hashes or earlier entries. So an update never moves a boundary, and an insert or delete moves at most the boundaries up to the next key-hash boundary.
 
 The same set of entries always produces the same root, whatever order of edits built it. That property makes whole-table comparison cheap (equal roots mean equal tables) and lets unchanged subtrees be shared between commits.
 
-Writes use `prolly.Apply`, which rewrites only the chunks an edit touches. Merge uses a streaming sorted builder. Reads use iterators that can seek to a key and keep one node per level in memory.
+Writes use `prolly.Apply`, which rewrites only the chunks an edit touches: for an update, one leaf and its path to the root. Merge uses a streaming sorted builder. Reads use iterators that can seek to a key and keep one node per level in memory.
 
 ### Key encoding
 

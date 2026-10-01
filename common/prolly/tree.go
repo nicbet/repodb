@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"math/bits"
 	"sort"
 
 	"github.com/nicbet/repodb/common/storage"
@@ -74,20 +73,18 @@ type iteratorFrame struct {
 // SortedBuilder incrementally constructs the same canonical tree as Build from
 // strictly ordered entries. It buffers at most one chunk per tree level.
 type SortedBuilder struct {
-	ctx         context.Context
-	store       storage.Store
-	options     Options
-	leaves      []Entry
-	leafRolling uint64
-	levels      []linkBuffer
-	lastKey     []byte
-	haveKey     bool
-	finished    bool
+	ctx      context.Context
+	store    storage.Store
+	options  Options
+	leaves   []Entry
+	levels   []linkBuffer
+	lastKey  []byte
+	haveKey  bool
+	finished bool
 }
 
 type linkBuffer struct {
-	links   []link
-	rolling uint64
+	links []link
 }
 
 func Open(store storage.Store, root storage.Hash) (*Tree, error) {
@@ -238,15 +235,13 @@ type leafChunker struct {
 	store   storage.Store
 	options Options
 	entries []Entry
-	rolling uint64
 	links   *[]link
 }
 
 func (c *leafChunker) add(entry Entry) error {
 	item := Entry{Key: clone(entry.Key), Value: clone(entry.Value)}
 	c.entries = append(c.entries, item)
-	c.rolling = bits.RotateLeft64(c.rolling, 1) ^ entryFingerprint(item)
-	if shouldCut(len(c.entries), c.rolling, c.options) {
+	if shouldCut(len(c.entries), entryBoundaryHash(item), c.options) {
 		return c.flush()
 	}
 	return nil
@@ -258,7 +253,6 @@ func (c *leafChunker) flush() error {
 	}
 	group := c.entries
 	c.entries = nil
-	c.rolling = 0
 	hash, err := writeNode(c.ctx, c.store, node{Level: 0, Entries: group})
 	if err != nil {
 		return err
@@ -342,8 +336,7 @@ func (b *SortedBuilder) Add(entry Entry) error {
 	b.leaves = append(b.leaves, item)
 	b.lastKey = clone(entry.Key)
 	b.haveKey = true
-	b.leafRolling = bits.RotateLeft64(b.leafRolling, 1) ^ entryFingerprint(item)
-	if shouldCut(len(b.leaves), b.leafRolling, b.options) {
+	if shouldCut(len(b.leaves), entryBoundaryHash(item), b.options) {
 		return b.flushLeaf()
 	}
 	return nil
@@ -382,7 +375,6 @@ func (b *SortedBuilder) Finish() (*Tree, error) {
 func (b *SortedBuilder) flushLeaf() error {
 	group := b.leaves
 	b.leaves = nil
-	b.leafRolling = 0
 	hash, err := writeNode(b.ctx, b.store, node{Level: 0, Entries: group})
 	if err != nil {
 		return err
@@ -396,8 +388,7 @@ func (b *SortedBuilder) addLink(level int, item link) error {
 	}
 	buffer := &b.levels[level]
 	buffer.links = append(buffer.links, item)
-	buffer.rolling = bits.RotateLeft64(buffer.rolling, 1) ^ linkFingerprint(item)
-	if shouldCut(len(buffer.links), buffer.rolling, b.options) {
+	if shouldCut(len(buffer.links), linkBoundaryHash(item), b.options) {
 		return b.flushLinks(level)
 	}
 	return nil
@@ -407,7 +398,6 @@ func (b *SortedBuilder) flushLinks(level int) error {
 	buffer := &b.levels[level]
 	group := buffer.links
 	buffer.links = nil
-	buffer.rolling = 0
 	hash, err := writeNode(b.ctx, b.store, node{Level: uint8(level + 1), Children: group})
 	if err != nil {
 		return err
@@ -648,48 +638,47 @@ func (o Options) validate() error {
 
 func chunkEntries(entries []Entry, options Options) [][]Entry {
 	return chunk(len(entries), options, func(i int) uint64 {
-		return entryFingerprint(entries[i])
+		return entryBoundaryHash(entries[i])
 	}, func(start, end int) []Entry { return entries[start:end] })
 }
 
 func chunkLinks(links []link, options Options) [][]link {
 	return chunk(len(links), options, func(i int) uint64 {
-		return linkFingerprint(links[i])
+		return linkBoundaryHash(links[i])
 	}, func(start, end int) []link { return links[start:end] })
 }
 
-func entryFingerprint(entry Entry) uint64 {
+// Chunk boundaries are content-local: whether a chunk may end after an item
+// depends only on that item's key (a leaf entry's key, or a link's MaxKey)
+// and on the chunk's size. Hashing values or child hashes, or accumulating a
+// hash across items, would let one edit move every later boundary, and Apply
+// would then rewrite chunks until the boundaries happened to realign.
+func entryBoundaryHash(entry Entry) uint64 {
 	h := fnv.New64a()
 	h.Write(entry.Key)
-	h.Write([]byte{0})
-	h.Write(entry.Value)
 	return h.Sum64()
 }
 
-func linkFingerprint(item link) uint64 {
+func linkBoundaryHash(item link) uint64 {
 	h := fnv.New64a()
 	h.Write(item.MaxKey)
-	h.Write([]byte(item.Hash))
 	return h.Sum64()
 }
 
-func shouldCut(size int, rolling uint64, options Options) bool {
+// shouldCut reports whether a chunk of size entries ends at an item whose
+// boundary hash is hash.
+func shouldCut(size int, hash uint64, options Options) bool {
 	mask := uint64(1)<<options.BoundaryBits - 1
-	return size >= options.MaxChunkEntries || (size >= options.MinChunkEntries && rolling&mask == 0)
+	return size >= options.MaxChunkEntries || (size >= options.MinChunkEntries && hash&mask == 0)
 }
 
-func chunk[T any](length int, options Options, fingerprint func(int) uint64, slice func(int, int) []T) [][]T {
+func chunk[T any](length int, options Options, boundaryHash func(int) uint64, slice func(int, int) []T) [][]T {
 	var groups [][]T
 	start := 0
-	var rolling uint64
-	mask := uint64(1)<<options.BoundaryBits - 1
 	for i := 0; i < length; i++ {
-		rolling = bits.RotateLeft64(rolling, 1) ^ fingerprint(i)
-		size := i - start + 1
-		if size >= options.MaxChunkEntries || (size >= options.MinChunkEntries && rolling&mask == 0) {
+		if shouldCut(i-start+1, boundaryHash(i), options) {
 			groups = append(groups, slice(start, i+1))
 			start = i + 1
-			rolling = 0
 		}
 	}
 	if start < length {

@@ -29,6 +29,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - rejection of duplicate and unordered keys;
   - the streaming builder matching a bulk build;
   - history independence: `Apply` of any edit sequence gives the same root as a fresh build, from 0 to 10k entries and for distant edits;
+  - edit locality: in a 10k-entry tree, an update writes at most one node per level, and an insert or delete a small constant;
   - seeking iterators at exact keys, between keys, past the end, and on empty trees.
 - **`common/git`.** Durability auditing: which Git commands flush objects and refs, under `fsync` and `batch` methods. Also that pushing the data ref skips the host repository's `pre-push` hook.
 - **`common/robustio`.** The retry loop: success after transient failures, stopping on permanent errors, and the timeout.

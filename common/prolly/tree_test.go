@@ -435,3 +435,103 @@ func TestIteratorFromPrefixScanPattern(t *testing.T) {
 		t.Fatalf("got %d matches %v, want 3", len(matched), matched)
 	}
 }
+
+// newNodeStore counts the nodes a write adds that the store didn't already
+// hold.
+type newNodeStore struct {
+	storage.Store
+	added map[storage.Hash]struct{}
+}
+
+func (s *newNodeStore) Put(ctx context.Context, data []byte) (storage.Hash, error) {
+	hash := storage.Sum(data)
+	if _, err := s.Store.Get(ctx, hash); err != nil {
+		s.added[hash] = struct{}{}
+	}
+	return s.Store.Put(ctx, data)
+}
+
+// Chunk boundaries depend only on each entry's key (and each link's max key),
+// so an edit rewrites its own leaf and that leaf's path, not the chunks after
+// it.
+func TestApplyRewritesOnlyTouchedChunks(t *testing.T) {
+	ctx := context.Background()
+	base := storage.NewMemory()
+	const n = 10_000
+	entries := make([]prolly.Entry, n)
+	for i := range entries {
+		entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%06d", i)), Value: []byte(fmt.Sprintf("value-%06d-0123456789abcdef0123456789abcdef", i))}
+	}
+	tree, err := prolly.Build(ctx, base, entries, prolly.DefaultOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 10k entries of ~80 per leaf: leaves, one interior level and a root.
+	const depth = 3
+	apply := func(edits []prolly.Edit) int {
+		t.Helper()
+		store := &newNodeStore{Store: base, added: map[storage.Hash]struct{}{}}
+		applied, err := prolly.Apply(ctx, store, tree, edits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The result must still be the canonical tree for its contents.
+		want := append([]prolly.Entry(nil), entries...)
+		for _, edit := range edits {
+			i := sortSearchKey(want, edit.Key)
+			switch {
+			case edit.Delete:
+				want = append(want[:i], want[i+1:]...)
+			case i < len(want) && string(want[i].Key) == string(edit.Key):
+				want[i].Value = edit.Value
+			default:
+				want = append(want[:i], append([]prolly.Entry{{Key: edit.Key, Value: edit.Value}}, want[i:]...)...)
+			}
+		}
+		rebuilt, err := prolly.Build(ctx, storage.NewMemory(), want, prolly.DefaultOptions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if applied.Root() != rebuilt.Root() {
+			t.Fatalf("Apply root differs from a fresh Build")
+		}
+		return len(store.added)
+	}
+	for _, i := range []int{0, n / 2, n - 1} {
+		key := entries[i].Key
+		if got := apply([]prolly.Edit{{Key: key, Value: []byte("updated")}}); got > depth {
+			t.Errorf("update at %d wrote %d nodes, want at most %d", i, got, depth)
+		}
+		// Inserts and deletes change a chunk's size, which can move the
+		// size-based cuts up to the next key-hash boundary: a few leaves at
+		// most (measured: median 3 nodes, worst 8 over 271 positions).
+		if got := apply([]prolly.Edit{{Key: key, Delete: true}}); got > 3*depth {
+			t.Errorf("delete at %d wrote %d nodes, want at most %d", i, got, 3*depth)
+		}
+		if got := apply([]prolly.Edit{{Key: append(append([]byte(nil), key...), '+'), Value: []byte("inserted")}}); got > 3*depth {
+			t.Errorf("insert after %d wrote %d nodes, want at most %d", i, got, 3*depth)
+		}
+	}
+	for _, k := range []int{2, 10, 100} {
+		edits := make([]prolly.Edit, k)
+		for i := range edits {
+			edits[i] = prolly.Edit{Key: entries[i].Key, Value: []byte("updated")}
+		}
+		if got := apply(edits); got > k*depth {
+			t.Errorf("updating %d adjacent keys wrote %d nodes, want at most %d", k, got, k*depth)
+		}
+	}
+}
+
+func sortSearchKey(entries []prolly.Entry, key []byte) int {
+	lo, hi := 0, len(entries)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if string(entries[mid].Key) < string(key) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
