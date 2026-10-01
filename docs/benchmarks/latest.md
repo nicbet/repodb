@@ -2,7 +2,8 @@
 
 This file is the one canonical source for RepoDB's current performance. The
 methodology and the process for replacing this file are in
-[benchmark.md](../benchmark.md). Past reports are in [history/](history/).
+[benchmark.md](../benchmark.md). Earlier results are in this file's Git history
+(`git log -p docs/benchmarks/latest.md`).
 
 **Measured 2026-09-28 at `c1aa399`** (clean tree), scorecard suite v1 with default
 configuration: 1k/10k/50k rows, 1/4/16 clients, 30 requests per client per
@@ -69,7 +70,7 @@ Wall time: native-git 12 min, journal 9 min, MySQL 11 s, Dolt 13 s.
 
 ## Changes since `57a0cd8`
 
-The [previous scorecard](history/2026-09-28-57a0cd8-scorecard.md) used the same
+The previous scorecard (this file as of commit `d4b1ac6`) used the same
 machine, environment, suite and commands, so the runs compare directly. Three
 changes landed in between: lazy journal replay (rdb-92b9e2), order-preserving keys
 with range and ordered-scan pushdown (rdb-586f81), and a binary row encoding

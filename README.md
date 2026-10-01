@@ -6,7 +6,7 @@ RepoDB is an embedded SQL database for Go that stores and synchronizes applicati
 
 Build agent tools, issue trackers, and dashboards whose data travels with a repository. Write data locally, work offline, and synchronize across clones. SQL transactions are durable immediately; data history is checkpointed to Git when you choose. Source files, index, and code branches are never touched.
 
-**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. RepoDB is aimed at local-first, version-controlled relational workloads with a documented [SQL subset](docs/sql-m2.md). At the sizes measured so far (up to 50k rows) it serves point and indexed-range reads in well under a millisecond, full scans in tens of milliseconds, 100-row write batches in under 10 ms (journal mode), and cross-clone merges in 2–3 s. Concurrent writers are the main limitation: write transactions conflict whenever another commits first. Broader compatibility, write concurrency and scaling are on the roadmap. See the [latest benchmark results](docs/benchmarks/latest.md) for measured latency against MySQL 8 and Dolt.
+**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. RepoDB is aimed at local-first, version-controlled relational workloads with a documented [SQL subset](docs/sql.md). At the sizes measured so far (up to 50k rows) it serves point and indexed-range reads in well under a millisecond, full scans in tens of milliseconds, 100-row write batches in under 10 ms (journal mode), and cross-clone merges in 2–3 s. Concurrent writers are the main limitation: write transactions conflict whenever another commits first. Broader compatibility, write concurrency and scaling are on the roadmap. See the [latest benchmark results](docs/benchmarks/latest.md) for measured latency against MySQL 8 and Dolt.
 
 ## Quickstart
 
@@ -59,7 +59,7 @@ repodb conflicts
 repodb resolve --id '<conflict-id>' --take local
 ```
 
-Resolution choices are `local`, `remote`, `base`, and `delete`. See the [merge guide](docs/merge-m4.md) for row and schema conflict behavior.
+Resolution choices are `local`, `remote`, `base`, and `delete`. See [cli.md](docs/cli.md#synchronizing-with-a-remote) for row and schema conflict behavior.
 
 After `enable`, all sync commands default to the configured remote. Pass `--remote` only to override.
 
@@ -107,7 +107,7 @@ The engine defaults to journal persistence: SQL commits are durable immediately 
 
 ## Installation
 
-Build from source with **Go 1.26 or newer**, Git, and Make. The tested baseline is macOS with Git 2.55. Windows builds and passes `go vet` on every `make test`, but the test suite has not been run on Windows yet. See [storage and durability assumptions](docs/storage-format.md).
+Build from source with **Go 1.26 or newer**, Git, and Make. The tested baseline is macOS with Git 2.55. Windows builds and passes `go vet` on every `make test`, but the test suite has not been run on Windows yet. See [durability and platforms](docs/architecture.md#durability-and-recovery).
 
 ```sh
 git clone https://github.com/nicbet/repodb.git
@@ -184,36 +184,45 @@ Go application          MySQL client
 ```
 
 - **One engine, two entry points.** Embedded sessions and MySQL connections share the same catalog, table adapters, and transaction implementation.
-- **Journal persistence.** SQL commits append typed row edits (~1 KB per transaction) to a local journal with one `fsync`. Checkpoint materializes Prolly trees and publishes a Git data commit. Native-Git mode is available for workloads that need every transaction in Git history.
+- **Journal persistence.** SQL commits append their row edits to a local journal with one `fsync`. Checkpoint materializes Prolly trees and publishes a Git data commit. Native-Git mode is available for workloads that need every transaction in Git history.
 - **Snapshot isolation.** Transactions read a pinned snapshot plus their own writes. Stale writers receive a conflict instead of overwriting newer data.
 - **Explicit synchronization.** Remote data is fetched into separate tracking refs. Sync validates, fast-forwards, or three-way-merges. Conflicts remain inspectable across restarts.
 
 The current SQL scope supports one database namespace, explicit primary keys, DDL/DML (including `ALTER TABLE`), secondary indexes (unique and non-unique), `CHECK` constraints, `DEFAULT` values, and collation-aware string comparisons. Persisted types include integers, floats, `TEXT`, `BLOB`, `BOOL`, `ENUM`, `DECIMAL`/`NUMERIC`, `JSON`, `DATE`, `TIME`, `DATETIME`, and `TIMESTAMP`. Auto-increment and foreign keys are not yet supported.
 
-| Documentation                              | Covers                                                                |
-| ------------------------------------------ | --------------------------------------------------------------------- |
-| [User guide](docs/guide.md)                | Setup, CLI reference, persistence modes, sync workflow, and backup    |
-| [SQL and embedded API](docs/sql-m2.md)     | Supported types, transactions, commit recovery, and workload bounds   |
-| [Storage format](docs/storage-format.md)   | Snapshots, key encoding, object inventories, locking, and durability  |
-| [Git integration](docs/git-integration.md) | Ref layout and ordinary Git command behavior                          |
-| [Synchronization](docs/sync-m3.md)         | Enable, tracking refs, and transport                                  |
-| [Merging](docs/merge-m4.md)                | Three-way merge, conflict resolution, and distributed row identity    |
-| [Working state](docs/working-state.md)     | Durable journal, checkpoints, and recovery                            |
-| [Benchmarks](docs/benchmarks/latest.md)    | Latest results; methodology and history linked from there             |
+| Documentation                                | Covers                                                                          |
+| -------------------------------------------- | ------------------------------------------------------------------------------- |
+| [Command line](docs/cli.md)                  | Setup, server, persistence modes, checkpoints, sync, conflicts, backup          |
+| [Go library](docs/library.md)                | Engine, sessions, transactions, commit outcomes, sync API, server and client    |
+| [SQL reference](docs/sql.md)                 | Supported types, statements, indexes, transactions, and what is unsupported     |
+| [Architecture](docs/architecture.md)         | Storage format, persistence modes, concurrency, sync and merge, durability      |
+| [Testing](docs/testing.md)                   | Test suites and what they protect, fuzzing, benchmarks, and known gaps          |
+| [Benchmarks](docs/benchmarks/latest.md)      | Latest results against MySQL and Dolt; [methodology](docs/benchmark.md)         |
 
 ## Roadmap
 
-- [x] **M0-M4:** Git storage, persistent SQL, sync, merging, journal persistence, and performance optimization.
-- [x] **M5:** CLI commands, example applications, and tool-author validation.
-- [x] **M6 (partial):** Secondary indexes, `ALTER TABLE`, expanded types and constraints, collation-aware comparisons.
-- [ ] **M6 (remaining):** Auto-increment, foreign keys, and operational hardening.
+Done
+- [x] Git-backed storage, persistent SQL, sync and three-way merging, journal persistence
+- [x] CLI, embedded library, and MySQL-compatible server
+- [x] Secondary indexes, `ALTER TABLE`, expanded types and constraints, collations
+- [x] Indexed range and ordered-scan queries, compact binary row storage
 
-See [the implementation plan](docs/plan.md) for milestone scope and acceptance criteria.
+Now: finish the performance envelope
+- [ ] Reverse index scans for `ORDER BY … DESC LIMIT`; fewer Git subprocesses per sync; append-heavy workload profiling
+- [ ] Concurrent writers: per-key conflict detection, group commit, safe automatic retry, MySQL-compatible conflict errors
+
+Next: a standalone Git-native relational database
+- [ ] Version-controlled data: snapshot addressing, history, historical queries, diffs, named branches, switching, merging, restore, revert
+- [ ] Secure server: configuration and secrets, authentication and TLS, roles and privileges, observability
+- [ ] Application compatibility: `AUTO_INCREMENT`, foreign keys, driver and ORM metadata, a published compatibility profile
+- [ ] Operational durability: backup and restore, corruption recovery, journal compaction, history retention, format migration
+
+The roadmap is maintained as the project's issue backlog (see [Contributing](#contributing)).
 
 ## Contributing
 
-Issues and pull requests are welcome. For substantial changes, open an issue to discuss the use case and approach first; the [implementation plan](docs/plan.md) is the starting point for scope and priorities.
+Issues and pull requests are welcome. For substantial changes, open an issue to discuss the use case and approach first. [docs/architecture.md](docs/architecture.md) describes how the system works today.
 
-Issues are tracked with [Exponential](https://go-exponential.dev) and travel with this repository.
+Issues, including the roadmap, are tracked with [Exponential](https://go-exponential.dev) and travel with this repository (`.xpo/`).
 
-Keep pull requests focused, format changed Go files with `gofmt`, and add tests for behavioral changes. Run the development checks above and update documentation when changing SQL behavior, storage, or synchronization.
+Keep pull requests focused, format changed Go files with `gofmt`, and add tests for behavioral changes. Run the development checks above ([testing.md](docs/testing.md)). The documents in `docs/` describe current behavior only: a change that alters behavior updates them in the same change.

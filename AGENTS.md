@@ -228,3 +228,10 @@ may use different naming conventions). The table uses the base tool names.
 | `artifact` | Manage generic artifacts attached to an issue |
 
 <!-- xpo:end -->
+
+## Documentation
+
+- `docs/` describes RepoDB as it works **now**: `cli.md`, `library.md`, `sql.md`, `architecture.md`, `testing.md`, and `benchmark.md` (methodology). It contains no plans, milestone contracts or dated measurements.
+- `docs/benchmarks/latest.md` is the only performance record. Replace it in place when publishing a new scorecard (see `docs/benchmark.md`).
+- The roadmap is the xpo backlog. Design history and rationale live in xpo specs and walkthroughs; search them with the `rationale` tool, not `docs/`.
+- A change that alters behavior, storage, the CLI, the public Go API or the SQL surface updates the affected `docs/` pages in the same issue. Where a doc names a limitation that a backlog issue addresses, cite the issue ID. Verify commands, flags and identifiers against the code rather than copying older text.

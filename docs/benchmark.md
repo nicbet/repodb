@@ -1,19 +1,16 @@
 # Database scorecard: methodology
 
-This document describes how RepoDB is benchmarked. It deliberately contains no
-results:
-
-- **Current results:** [benchmarks/latest.md](benchmarks/latest.md), the one
-  canonical source for how RepoDB performs today.
-- **Past results:** [benchmarks/history/](benchmarks/history/), dated reports that
-  describe the repository as it was when they were measured.
+This document describes how RepoDB is benchmarked. It contains no results:
+[benchmarks/latest.md](benchmarks/latest.md) is the one place that states how
+RepoDB performs today. Earlier results are in that file's Git history
+(`git log -p docs/benchmarks/latest.md`).
 
 `make bench` is the whole-database benchmark entry point. It executes one
 versioned workload suite against the current checkout and prints a consolidated
 table at the end, with raw observations and metadata in `dbbench.json`. It
-defaults to native-Git persistence (`BENCH_MODE=native-git`). Go microbenchmarks
-(`make m4.2-bench`, `make m4.3-bench`, `go test -bench`) are diagnostic tools,
-not the scorecard.
+defaults to native-Git persistence (`BENCH_MODE=native-git`). Go benchmarks
+(`go test -bench`, listed in [testing.md](testing.md#benchmarks)) are diagnostic
+tools, not the scorecard.
 
 ```sh
 make bench
@@ -136,7 +133,7 @@ writer contention, live SQL latency during checkpoint/compaction, realistic boar
 requests, or independent history-depth scaling. Crash/fault correctness remains
 in the existing test suite.
 Add future dimensions here and to the same runner, rather than introducing another
-milestone-specific headline benchmark. Change the suite version when workload
+headline benchmark. Change the suite version when workload
 semantics change, and never compare different suite versions as matched results.
 
 ## Publishing results
@@ -151,25 +148,16 @@ To publish a new scorecard:
    state, from the same commit with no local changes. Each JSON report records
    `revision` and `working_tree_status`: all revisions must match, and the status must
    be empty.
-2. **Archive the previous latest.** `git mv docs/benchmarks/latest.md
-   docs/benchmarks/history/<date>-<short-rev>-scorecard.md` and move its JSON
-   directory alongside it (`docs/benchmarks/history/<date>-<short-rev>-scorecard/`).
-   Add the history banner (below) and fix relative links. Change nothing else in
-   the archived report.
+2. **Replace latest.md and `docs/benchmarks/latest/*.json` in place.** The previous
+   version stays in Git history; do not copy it elsewhere in `docs/`.
 3. **Write the new latest.md** from the new runs. State the revision, date, machine,
    OS, filesystem, Go, Git, MySQL and Dolt versions, and the exact commands. Link the
    raw JSON in `docs/benchmarks/latest/`. Use the table order in latest.md: single-client
    SQL latency, then concurrency, then sync.
-4. **Update the README table** from latest.md, including its measurement date.
+4. **Compare with the previous run** (`git show <previous-commit>:docs/benchmarks/latest/<file>.json`)
+   in a "Changes since `<previous revision>`" section. Use the unchanged MySQL and Dolt
+   runs as the noise reference, and claim only changes well beyond it.
+5. **Update the README table** from latest.md, including its measurement date.
 
-Milestone or diagnostic reports (for example a Go microbenchmark study) go straight
-into `docs/benchmarks/history/<date>-<topic>.md` with the banner. They never become
-latest.md.
-
-Every history file starts with this banner, filled in:
-
-```markdown
-> **Historical record.** <What was measured>, measured <date> at <revision(s)> on
-> <machine>. It describes the repository at that time and is not maintained.
-> Current results are in [latest.md](../latest.md).
-```
+Diagnostic measurements, such as a Go benchmark study for one change, belong in
+that change's xpo issue (comment or walkthrough), not in `docs/`.
