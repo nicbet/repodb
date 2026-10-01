@@ -31,7 +31,7 @@ A table-level `COLLATE` or `CHARSET` is ignored: only column collations are stor
 | `CHAR(n)`, `VARCHAR(n)`, `TEXT` | length (default 65535) and collation |
 | `BINARY(n)`, `VARBINARY(n)`, `BLOB` | length (default 65535) |
 | `DATE`, `DATETIME(p)`, `TIMESTAMP(p)` | fractional-second precision 0–6. Values are stored as UTC microseconds. |
-| `TIME` | fractional precision is not stored: `TIME(3)` becomes `TIME` (rdb-5f12a3) |
+| `TIME(p)` | fractional-second precision 0–6. Values are stored as microseconds. |
 | `ENUM(…)` | the value list and collation. Values sort by definition order. |
 | `JSON` | stored as canonical JSON text; invalid JSON is rejected |
 
@@ -41,10 +41,10 @@ These types are not supported, and the error is `unsupported M2 SQL type <type>`
 
 ### Keys and indexes
 
-- **Key columns.** Primary keys, `UNIQUE` constraints and secondary indexes can use any type above except `JSON`. `FLOAT`/`DOUBLE` keys reject NaN. A JSON primary key is currently accepted by `CREATE TABLE`, but every insert then fails with `column type json cannot be part of a key` (rdb-5f12a3).
+- **Key columns.** Primary keys, `UNIQUE` constraints and secondary indexes can use any type above except `JSON`. `FLOAT`/`DOUBLE` keys reject NaN. DDL that would put a `JSON` column in a key is rejected.
 - **Uniqueness.** `UNIQUE` indexes allow multiple NULLs, as in MySQL. Uniqueness and key lookups follow the column collation: under a `_ci` collation, `'alice'` and `'Alice'` are the same key. `CHAR` keys ignore trailing spaces.
 - **Index DDL.** `CREATE [UNIQUE] INDEX`, `ALTER TABLE … ADD [UNIQUE] INDEX`, `DROP INDEX` and `RENAME INDEX` are supported. Adding a `UNIQUE` index over existing duplicates is rejected. Index names are case-sensitive.
-- **Not supported.** Prefix lengths such as `(v(5))` are accepted but ignored, so the whole column is indexed (rdb-5f12a3). `FULLTEXT` and `SPATIAL` indexes are not supported.
+- **Not supported.** Prefix lengths such as `(v(5))` are rejected with `index prefix lengths are not supported`, in indexes and primary keys. `FULLTEXT` indexes are rejected with `table does not support FULLTEXT indexes`. `SPATIAL` indexes are not supported.
 
 Index-using queries:
 - **Point lookups** use the primary key or a secondary index.
@@ -62,7 +62,7 @@ Index-using queries:
 | `ALTER TABLE … MODIFY` / `CHANGE COLUMN`, `RENAME COLUMN` | yes | Converts existing values and fails on values that don't fit, on NULLs under a new `NOT NULL`, and on new unique-key duplicates. Changing a key column's type re-keys the rows. |
 | `ALTER TABLE … ADD/DROP CHECK` / `CONSTRAINT` | yes | Adding a check that existing rows violate is rejected. |
 | `DROP TABLE` | yes | |
-| `ALTER TABLE … ADD/DROP PRIMARY KEY` | no | |
+| `ALTER TABLE … ADD/DROP PRIMARY KEY` | no | Rejected: every RepoDB table keeps the primary key it was created with. |
 | `RENAME TABLE`, `ALTER TABLE … RENAME TO` | no | |
 | `TRUNCATE TABLE` | no | Use `DELETE FROM t`. |
 | `CREATE TEMPORARY TABLE` | no | |
@@ -70,7 +70,7 @@ Index-using queries:
 | Generated columns | no | Same error as `AUTO_INCREMENT`. |
 | `FOREIGN KEY` | no (rdb-48af2f) | |
 | Triggers, stored procedures | no | |
-| `CREATE VIEW` | no | The statement succeeds, but the view exists only in the creating session and is not stored (rdb-5f12a3). |
+| `CREATE VIEW` | no (rdb-5c1808) | Rejected with `views are not supported`. |
 
 ## Reading and writing rows
 

@@ -224,7 +224,7 @@ if err := srv.Serve(ctx); err != nil { // returns when ctx is cancelled
 ```
 
 - **Lifecycle.** `Start` serves in the calling goroutine until `Close`, and `Serve(ctx)` wraps `Start` and `Close` around a context.
-- **Defaults.** `Config.Persistence` defaults to journal, like the library (the `repodb start` command defaults to native-git). `Config.DatabaseName` currently has no effect (rdb-5f12a3).
+- **Defaults.** `Config.Persistence` defaults to journal, like the library (the `repodb start` command defaults to native-git). The server exposes one database, named by the repository's manifest (`repodb`).
 - **Security.** The server has no authentication or TLS. See [sql.md](sql.md#server-access).
 
 ## Client

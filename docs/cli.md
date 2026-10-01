@@ -3,7 +3,7 @@
 RepoDB ships two programs:
 
 - `repodb`: initializes a repository, runs the MySQL-compatible server, checkpoints journal changes, and synchronizes data with a Git remote.
-- `repodb-server`: a server-only binary with the same persistence options as `repodb start`, plus `--database`.
+- `repodb-server`: a server-only binary with the same flags as `repodb start`.
 
 Both work on the Git repository that contains the current directory, or the one named by `--repo` where a command accepts it. RepoDB data lives on its own ref, `refs/repodb/data`. It never changes your branches, index or working tree. See [architecture.md](architecture.md) for how the data is stored.
 
@@ -78,7 +78,7 @@ The database is named `repodb`. The server performs no authentication and has no
 
 ### `repodb-server`
 
-Takes the same `--addr`, `--repo` and `--persistence` flags. It also accepts `--database`, but the flag currently has no effect: the database is always named `repodb` (rdb-5f12a3).
+Takes the same `--addr`, `--repo` and `--persistence` flags. The server exposes one database, named by the repository's manifest (`repodb`).
 
 ### `repodb sql <statement>`
 

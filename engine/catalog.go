@@ -112,6 +112,9 @@ func (d *database) CreateTable(ctx *sql.Context, name string, schema sql.Primary
 	if err := validateSchema(schema); err != nil {
 		return err
 	}
+	if err := validateKeyColumns(schema.Schema, schema.PkOrdinals); err != nil {
+		return err
+	}
 	tx.tables[name] = &tableState{schema: copySchema(schema), rows: make(map[string]sql.Row), dirty: true}
 	tx.dirty = true
 	return nil
@@ -851,6 +854,9 @@ func (t *table) CreateIndex(ctx *sql.Context, def sql.IndexDef) error {
 		if !found {
 			return fmt.Errorf("column %s not found", col.Name)
 		}
+	}
+	if err := rejectIndexPrefixes(def.Columns); err != nil {
+		return err
 	}
 	idx := indexDisk{Name: def.Name, Columns: ordinals, Unique: def.IsUnique()}
 	if def.IsUnique() {
@@ -1898,6 +1904,9 @@ func encodeSchema(schema sql.PrimaryKeySchema, checks []sql.CheckDefinition, ind
 		if dt, ok := col.Type.(sql.DatetimeType); ok {
 			cd.Precision = dt.Precision()
 		}
+		if tt, ok := col.Type.(types.TimeType); ok {
+			cd.Precision = tt.Precision()
+		}
 		if dec, ok := col.Type.(sql.DecimalType); ok {
 			cd.Precision = int(dec.Precision())
 			cd.Scale = int(dec.Scale())
@@ -1999,7 +2008,7 @@ func decodeType(t querypb.Type, length int64, precision int, scale int, enumValu
 	case querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
 		return types.CreateDatetimeType(t, precision)
 	case querypb.Type_TIME:
-		return types.Time, nil
+		return types.CreateTimespanType(precision)
 	case querypb.Type_JSON:
 		return types.JSON, nil
 	case querypb.Type_DECIMAL:
@@ -2029,6 +2038,9 @@ func validateSchema(schema sql.PrimaryKeySchema) error {
 		var precision int
 		if dt, ok := col.Type.(sql.DatetimeType); ok {
 			precision = dt.Precision()
+		}
+		if tt, ok := col.Type.(types.TimeType); ok {
+			precision = tt.Precision()
 		}
 		var scale int
 		if dec, ok := col.Type.(sql.DecimalType); ok {

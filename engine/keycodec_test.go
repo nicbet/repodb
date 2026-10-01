@@ -196,3 +196,23 @@ func TestKeyPrefixEnd(t *testing.T) {
 		}
 	}
 }
+
+// keyable must agree with appendKeyColumn for every column type RepoDB stores:
+// all are keyable except JSON.
+func TestKeyableMatchesStoredTypes(t *testing.T) {
+	for code := range querypb.Type_name {
+		typ, err := decodeType(querypb.Type(code), 0, 0, 0, []string{"a"}, sql.Collation_Default)
+		if err != nil {
+			continue
+		}
+		want := typ.Type() != querypb.Type_JSON
+		if keyable(typ) != want {
+			t.Errorf("keyable(%s) = %v, want %v", typ, !want, want)
+		}
+		if want {
+			if _, err := appendKeyColumn(nil, typ, typ.Zero()); err != nil {
+				t.Errorf("appendKeyColumn(%s, zero): %v", typ, err)
+			}
+		}
+	}
+}

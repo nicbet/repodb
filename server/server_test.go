@@ -31,9 +31,8 @@ func TestMySQLWireRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv, err := server.New(server.Config{
-		Address:      "127.0.0.1:0",
-		DatabaseName: "repodb",
-		Repository:   repo,
+		Address:    "127.0.0.1:0",
+		Repository: repo,
 	})
 	if err != nil {
 		t.Fatal(err)

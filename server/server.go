@@ -15,10 +15,9 @@ import (
 )
 
 type Config struct {
-	Address      string
-	DatabaseName string
-	Repository   *repository.Repository
-	Persistence  engine.PersistenceMode
+	Address     string
+	Repository  *repository.Repository
+	Persistence engine.PersistenceMode
 }
 
 type Server struct {
@@ -36,9 +35,6 @@ func New(config Config) (*Server, error) {
 	}
 	if config.Address == "" {
 		config.Address = "127.0.0.1:3306"
-	}
-	if config.DatabaseName == "" {
-		config.DatabaseName = "repodb"
 	}
 
 	persistent, err := engine.NewWithOptions(config.Repository, engine.Options{Persistence: config.Persistence})

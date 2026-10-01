@@ -58,6 +58,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - temporal, JSON, DECIMAL and ENUM types;
   - collations (case-insensitive comparison, ordering and key uniqueness);
   - `UNIQUE` constraints and secondary indexes, including how they are maintained on update and delete.
+- **Unsupported DDL** (`ddl_honored_test.go`). Views, JSON key columns, index prefix lengths, `FULLTEXT` indexes and primary-key changes fail with clear errors; `TIME(p)` precision persists across reopen in both modes. `keycodec_test.go` checks that `keyable` agrees with the key codec for every stored type.
 - **Journal** (`working_test.go`):
   - rows survive a restart without advancing Git;
   - one checkpoint publishes one snapshot;
@@ -146,8 +147,6 @@ These are known holes in the test surface:
 - **Client.** `client` has no tests of its own; it is exercised only through the server tests.
 - **Journal faults.** `BeforeJournalAppend` and `BeforeJournalFlush` are never injected, and no test kills a process during a journal append or checkpoint.
 - **Sync faults.** No faults are injected during sync, fetch or push beyond a stalled push. The sync/journal race (rdb-e0c717) has no test.
-- **SQL compatibility.**
-  - Nothing compares RepoDB's SQL results with MySQL's (rdb-686c51).
-  - Statements accepted but not honored are untested (rdb-5f12a3).
+- **SQL compatibility.** Nothing compares RepoDB's SQL results with MySQL's (rdb-686c51).
 - **Git object formats.** Only one test uses a SHA-256 repository.
 - **Load.** There are no stress or soak tests beyond two-writer races and the 150-step index model.

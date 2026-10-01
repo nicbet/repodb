@@ -41,6 +41,38 @@ const (
 	decimalPositive byte = 0x03
 )
 
+// keyable reports whether appendKeyColumn can encode values of typ. Keep it in
+// step with appendKeyColumn's cases.
+func keyable(typ sql.Type) bool {
+	switch typ.Type() {
+	case querypb.Type_INT8, querypb.Type_INT16, querypb.Type_INT24, querypb.Type_INT32, querypb.Type_INT64,
+		querypb.Type_UINT8, querypb.Type_UINT16, querypb.Type_UINT24, querypb.Type_UINT32, querypb.Type_UINT64,
+		querypb.Type_FLOAT32, querypb.Type_FLOAT64,
+		querypb.Type_DECIMAL,
+		querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP,
+		querypb.Type_TIME,
+		querypb.Type_ENUM,
+		querypb.Type_BLOB, querypb.Type_VARBINARY, querypb.Type_BINARY,
+		querypb.Type_VARCHAR, querypb.Type_CHAR, querypb.Type_TEXT:
+		return true
+	}
+	return false
+}
+
+// validateKeyColumns rejects primary-key columns whose type cannot be encoded
+// as a key, so CREATE TABLE fails instead of every later write. go-mysql-server
+// itself rejects JSON in composite keys, indexes and ALTER TABLE, but not a
+// single-column JSON PRIMARY KEY.
+func validateKeyColumns(schema sql.Schema, ordinals []int) error {
+	for _, ord := range ordinals {
+		col := schema[ord]
+		if !keyable(col.Type) {
+			return fmt.Errorf("column %s of type %s cannot be part of a key", col.Name, col.Type)
+		}
+	}
+	return nil
+}
+
 // appendKeyColumn appends the order-preserving encoding of one non-NULL value
 // of the given column type.
 func appendKeyColumn(dst []byte, typ sql.Type, value any) ([]byte, error) {

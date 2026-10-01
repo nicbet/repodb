@@ -16,7 +16,6 @@ import (
 
 func main() {
 	address := flag.String("addr", "127.0.0.1:3306", "MySQL listen address")
-	database := flag.String("database", "repodb", "default database name")
 	repoPath := flag.String("repo", ".", "path inside the Git worktree")
 	persistence := flag.String("persistence", string(engine.PersistenceNativeGit), "persistence mode: native-git or journal")
 	flag.Parse()
@@ -28,10 +27,9 @@ func main() {
 		log.Fatal(err)
 	}
 	srv, err := repodbserver.New(repodbserver.Config{
-		Address:      *address,
-		DatabaseName: *database,
-		Repository:   repo,
-		Persistence:  engine.PersistenceMode(*persistence),
+		Address:     *address,
+		Repository:  repo,
+		Persistence: engine.PersistenceMode(*persistence),
 	})
 	if err != nil {
 		log.Fatal(err)
