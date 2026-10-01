@@ -30,7 +30,6 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - the streaming builder matching a bulk build;
   - history independence: `Apply` of any edit sequence gives the same root as a fresh build, from 0 to 10k entries and for distant edits;
   - seeking iterators at exact keys, between keys, past the end, and on empty trees.
-- **`common/storage`.** The filesystem store: round trips, 16 concurrent writers of one object, a writer that loses a rename race, and rename failure. The Windows-style races are simulated through a replaceable `rename` function.
 - **`common/git`.** Durability auditing: which Git commands flush objects and refs, under `fsync` and `batch` methods. Also that pushing the data ref skips the host repository's `pre-push` hook.
 - **`common/robustio`.** The retry loop: success after transient failures, stopping on permanent errors, and the timeout.
 
@@ -133,12 +132,12 @@ All fuzz targets are in `engine` (`fuzz_test.go`, `rowcodec_test.go`). A plain `
 | Area | Benchmarks |
 | --- | --- |
 | SQL latency | `BenchmarkSQLTransactionBeginRollback`, `BenchmarkSQLWarmReads`, `BenchmarkSQLWriteBatches`, `BenchmarkSQLExactKeyUpdate`, `BenchmarkSQLAutocommitPointRead`, `BenchmarkSQLAutocommitScans` |
-| Journal | `BenchmarkM43DurableSave`, `…JournalCheckpoint`, `…JournalReplayGrowth`, `…JournalFirstSaveAfterCheckpoint`, `…TypedEditJournal`, `…TypedEditCheckpoint`, `BenchmarkJournalIndexedInsertWithPending` |
+| Durable saves and journal | `BenchmarkDurableSave` (both modes), `BenchmarkJournalCheckpoint`, `…JournalReplayGrowth`, `…JournalFirstSaveAfterCheckpoint`, `…JournalTypedEdit`, `…JournalTypedEditCheckpoint`, `…JournalIndexedInsertWithPending` |
 | Git durability | `BenchmarkGitDurabilityStrategies` (fsync vs batch; uses `cp -R`, Unix only) |
 | Merge and sync | `BenchmarkMergeSnapshotsSparseChanges`, `BenchmarkMergeSnapshotsUnchangedTable`, `BenchmarkSyncUpToDateWarm`, `BenchmarkSyncDivergent` |
 | Codec | `BenchmarkRowCodec` |
 
-The end-to-end comparison with MySQL and Dolt is `experiments/dbbench` ([benchmark.md](benchmark.md)). Current results are in [benchmarks/latest.md](benchmarks/latest.md).
+`make bench-go` runs the SQL-latency and sync benchmarks; `make bench-journal` runs the durable-save and journal benchmarks, each with fixed `-benchtime` and `-count` settings. The end-to-end comparison with MySQL and Dolt is `experiments/dbbench` ([benchmark.md](benchmark.md)). Current results are in [benchmarks/latest.md](benchmarks/latest.md).
 
 ## Gaps
 

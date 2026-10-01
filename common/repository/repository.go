@@ -252,10 +252,6 @@ func discover(ctx context.Context, start string) (*Repository, error) {
 	}, nil
 }
 
-func (r *Repository) CacheDir() string {
-	return filepath.Join(r.CommonDir, "repodb", "cache", fmt.Sprintf("v%d", FormatVersion))
-}
-
 // Identity is stable for repository-scoped caches and includes the object
 // format so cache entries cannot cross incompatible Git repositories.
 func (r *Repository) Identity() string { return r.CommonDir + "\x00" + r.ObjectFormat }
@@ -452,19 +448,6 @@ func (r *Repository) BeginMergeSnapshots(local, remote *Snapshot) (*Writer, erro
 func (s *Snapshot) Store() storage.Store { return &snapshotStore{snapshot: s} }
 
 func (w *Writer) BaseSnapshot() *Snapshot { return w.base }
-
-// PendingHashes returns the immutable objects added by this writer. It is used
-// by the journal prototype to retain a conservative object superset without an
-// exact reachability walk on every SQL save.
-func (w *Writer) PendingHashes() []storage.Hash {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	hashes := make([]storage.Hash, 0, len(w.objects))
-	for hash := range w.objects {
-		hashes = append(hashes, hash)
-	}
-	return hashes
-}
 
 func (w *Writer) Put(_ context.Context, data []byte) (storage.Hash, error) {
 	hash := storage.Sum(data)

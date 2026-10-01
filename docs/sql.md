@@ -10,7 +10,7 @@ There is one database, `repodb`, plus the read-only `information_schema`. Every 
 
 ## Tables
 
-Every table needs an explicit `PRIMARY KEY`, which may be composite. A primary-key column can never be NULL. `CREATE TABLE` without one fails with `RepoDB M2 requires an explicit PRIMARY KEY`.
+Every table needs an explicit `PRIMARY KEY`, which may be composite. A primary-key column can never be NULL. `CREATE TABLE` without one fails with `RepoDB requires an explicit PRIMARY KEY`.
 
 `CREATE TABLE` supports:
 - `NOT NULL`;
@@ -35,7 +35,7 @@ A table-level `COLLATE` or `CHARSET` is ignored: only column collations are stor
 | `ENUM(…)` | the value list and collation. Values sort by definition order. |
 | `JSON` | stored as canonical JSON text; invalid JSON is rejected |
 
-These types are not supported, and the error is `unsupported M2 SQL type <type>`:
+These types are not supported, and the error is `unsupported SQL type <type>`:
 - `YEAR`, `SET`, `BIT`;
 - spatial types and `VECTOR`.
 
@@ -66,7 +66,7 @@ Index-using queries:
 | `RENAME TABLE`, `ALTER TABLE … RENAME TO` | no | |
 | `TRUNCATE TABLE` | no | Use `DELETE FROM t`. |
 | `CREATE TEMPORARY TABLE` | no | |
-| `AUTO_INCREMENT` | no (rdb-a2d28e) | Rejected with `column <c> uses unsupported M2 schema behavior`. |
+| `AUTO_INCREMENT` | no (rdb-a2d28e) | Rejected with `column <c> uses AUTO_INCREMENT or a generated column, which RepoDB does not support`. |
 | Generated columns | no | Same error as `AUTO_INCREMENT`. |
 | `FOREIGN KEY` | no (rdb-48af2f) | |
 | Triggers, stored procedures | no | |
@@ -89,7 +89,7 @@ A duplicate primary key is reported as a unique-key error. The error shows the e
 - **Commit conflicts.** A write transaction commits only if nothing else committed since its snapshot was taken, even if the other commit changed different rows. Otherwise `COMMIT` fails with `RepoDB data head changed` (`repository.ErrConflict`), and the application should retry the whole transaction. A failed `COMMIT` ends the transaction, as in MySQL: the session is back in autocommit mode on the current data, so the retry starts fresh. RepoDB never replays statements itself. Per-row conflict detection, automatic retry of single statements and MySQL deadlock error codes are tracked in rdb-df092b.
 - **Failed statements.** A statement that fails inside an explicit transaction undoes only its own changes; the transaction stays open.
 - **DDL.** DDL commits implicitly, as in MySQL: a `CREATE TABLE` inside a transaction survives `ROLLBACK`.
-- **Savepoints** are not supported (`RepoDB M2 does not support savepoints`).
+- **Savepoints** are not supported (`RepoDB does not support savepoints`).
 - **Read-only transactions.** `START TRANSACTION READ ONLY` allows reads. Any `INSERT`, `UPDATE` or `DELETE` inside it fails with `cannot execute statement in a READ ONLY transaction` (MySQL error 1792), and the transaction stays open.
 - **Uncertain commit outcomes.** If a commit's outcome is uncertain (for example, the process failed while updating the Git ref), the error carries the candidate commit ID. `SELECT repodb_recover_commit('<candidate>')` returns `committed`, `rejected` or `unknown`. Use it instead of re-running the transaction. See [library.md](library.md#commit-outcomes).
 

@@ -60,15 +60,6 @@ func TestSnapshotRoundTripTransferAndCleanSourceState(t *testing.T) {
 	}
 	assertSourceState(t, root, beforeHead, beforeStatus)
 
-	if err := os.MkdirAll(repo.CacheDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo.CacheDir(), "discardable"), []byte("cache"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(repo.CacheDir()); err != nil {
-		t.Fatal(err)
-	}
 	git(t, root, "gc", "--prune=now")
 
 	reopened, err := repository.Open(ctx, root)
@@ -482,9 +473,6 @@ func TestLinkedWorktreeSharesRepositoryIdentity(t *testing.T) {
 	}
 	if fromLinked.CommonDir != repo.CommonDir {
 		t.Fatalf("common dir = %q, want %q", fromLinked.CommonDir, repo.CommonDir)
-	}
-	if fromLinked.CacheDir() != repo.CacheDir() {
-		t.Fatalf("cache dir = %q, want %q", fromLinked.CacheDir(), repo.CacheDir())
 	}
 }
 

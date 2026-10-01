@@ -40,8 +40,8 @@ const (
 	AfterCheckpointRef  WorkingFaultPoint = "after-checkpoint-ref"
 )
 
-// WorkingState is the opt-in M4.3 durable journal prototype. Its files are
-// authoritative and live beneath the repository's common Git directory.
+// WorkingState is the durable journal used by journal persistence. Its files
+// are authoritative and live beneath the repository's common Git directory.
 type WorkingState struct {
 	repo    *Repository
 	fault   func(WorkingFaultPoint) error
@@ -418,9 +418,9 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 	return snapshot, txid, nil
 }
 
-// CommitTypedEdits durably appends typed row/schema edits to the journal.
-// This is the M4.4 compact persistence path: journal bytes per save drop from
-// ~1.5 MB (full Prolly chunks) to ~200 bytes (encoded key + value).
+// CommitTypedEdits durably appends typed row/schema edits to the journal. A
+// save records only encoded keys and values (about 200 bytes per row), not
+// Prolly chunks; trees are built at checkpoint.
 func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edits []TypedTableEdit) (*Snapshot, string, error) {
 	if base == nil {
 		return nil, "", errors.New("typed-edit base snapshot is required")
@@ -593,8 +593,8 @@ func (w *WorkingState) RecoverTransaction(ctx context.Context, transactionID str
 }
 
 // Checkpoint captures the current durable generation as one Git data commit.
-// Writers are serialized for the prototype so later generations cannot be
-// accidentally marked clean.
+// It holds working.lock throughout, so no later generation can be marked clean
+// by mistake.
 func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitResult, error) {
 	release, err := w.lock(ctx)
 	if err != nil {

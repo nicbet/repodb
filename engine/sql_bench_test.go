@@ -15,7 +15,7 @@ import (
 	"github.com/nicbet/repodb/engine"
 )
 
-func BenchmarkM43DurableSave(b *testing.B) {
+func BenchmarkDurableSave(b *testing.B) {
 	for _, mode := range []engine.PersistenceMode{engine.PersistenceNativeGit, engine.PersistenceJournal} {
 		for _, rows := range []int{1_000, 10_000, 50_000} {
 			for _, batch := range []int{1, 10, 100} {
@@ -111,7 +111,7 @@ func BenchmarkM43DurableSave(b *testing.B) {
 	}
 }
 
-func BenchmarkM43JournalCheckpoint(b *testing.B) {
+func BenchmarkJournalCheckpoint(b *testing.B) {
 	for _, batch := range []int{1, 10, 100} {
 		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
 			b.StopTimer()
@@ -133,7 +133,7 @@ func BenchmarkM43JournalCheckpoint(b *testing.B) {
 					b.Fatal(err)
 				}
 				b.StartTimer()
-				if _, err := eng.Checkpoint(context.Background(), "M4.3 benchmark checkpoint"); err != nil {
+				if _, err := eng.Checkpoint(context.Background(), "benchmark checkpoint"); err != nil {
 					b.Fatal(err)
 				}
 				b.StopTimer()
@@ -143,7 +143,7 @@ func BenchmarkM43JournalCheckpoint(b *testing.B) {
 	}
 }
 
-func BenchmarkM43JournalReplayGrowth(b *testing.B) {
+func BenchmarkJournalReplayGrowth(b *testing.B) {
 	for _, generations := range []int{1, 10, 100} {
 		b.Run(fmt.Sprintf("generations=%d", generations), func(b *testing.B) {
 			eng, repo := sqlBenchmarkEngineWithRepository(b, 1_000, 64, 1)
@@ -194,7 +194,7 @@ func BenchmarkM43JournalReplayGrowth(b *testing.B) {
 	}
 }
 
-func BenchmarkM43JournalFirstSaveAfterCheckpoint(b *testing.B) {
+func BenchmarkJournalFirstSaveAfterCheckpoint(b *testing.B) {
 	for _, rows := range []int{1_000, 10_000, 50_000} {
 		b.Run(fmt.Sprintf("rows=%d", rows), func(b *testing.B) {
 			b.StopTimer()

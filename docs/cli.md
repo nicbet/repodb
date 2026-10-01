@@ -193,7 +193,7 @@ There is no atomic link between a source commit and a data commit. Push your cod
 
 - **Native-git mode**: the Git repository holds every committed transaction. A mirror clone (`git clone --mirror`, which includes `refs/repodb/data`), or a copy of `.git` taken while RepoDB is stopped, is a complete backup. A plain `git clone` does not include RepoDB data.
 - **Journal mode**: uncheckpointed changes exist only in `<git-common-dir>/repodb/working/v1/journal`. Either run `repodb commit` before backing up the Git repository, or copy the Git repository and the journal together while no RepoDB process is writing. A copy of the Git repository alone restores the last checkpoint. Online backup is tracked in rdb-f33cb0.
-- `<git-common-dir>/repodb/cache/` is disposable and rebuilt on demand. Never delete `working/`, `locks/` or `conflicts/` while RepoDB is running.
+- Never delete `<git-common-dir>/repodb/working/`, `locks/` or `conflicts/` while RepoDB is running.
 
 ### Recovering a stranded journal
 

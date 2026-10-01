@@ -102,7 +102,7 @@ func (d *database) CreateTable(ctx *sql.Context, name string, schema sql.Primary
 		return err
 	}
 	if len(schema.PkOrdinals) == 0 {
-		return errors.New("RepoDB M2 requires an explicit PRIMARY KEY")
+		return errors.New("RepoDB requires an explicit PRIMARY KEY")
 	}
 	for existing := range tx.tables {
 		if strings.EqualFold(existing, name) {
@@ -692,13 +692,13 @@ func buildIndexTreeForDef(ctx context.Context, writer storage.Store, state *tabl
 
 func (s *session) Rollback(*sql.Context, sql.Transaction) error { return nil }
 func (s *session) CreateSavepoint(*sql.Context, sql.Transaction, string) error {
-	return errors.New("RepoDB M2 does not support savepoints")
+	return errors.New("RepoDB does not support savepoints")
 }
 func (s *session) RollbackToSavepoint(*sql.Context, sql.Transaction, string) error {
-	return errors.New("RepoDB M2 does not support savepoints")
+	return errors.New("RepoDB does not support savepoints")
 }
 func (s *session) ReleaseSavepoint(*sql.Context, sql.Transaction, string) error {
-	return errors.New("RepoDB M2 does not support savepoints")
+	return errors.New("RepoDB does not support savepoints")
 }
 
 func transactionFrom(ctx *sql.Context) (*transaction, error) {
@@ -2031,14 +2031,14 @@ func decodeType(t querypb.Type, length int64, precision int, scale int, enumValu
 	case querypb.Type_ENUM:
 		return types.CreateEnumType(enumValues, collation)
 	default:
-		return nil, fmt.Errorf("unsupported M2 SQL type %s", t.String())
+		return nil, fmt.Errorf("unsupported SQL type %s", t.String())
 	}
 }
 
 func validateSchema(schema sql.PrimaryKeySchema) error {
 	for _, col := range schema.Schema {
 		if col.AutoIncrement || col.Generated != nil {
-			return fmt.Errorf("column %s uses unsupported M2 schema behavior", col.Name)
+			return fmt.Errorf("column %s uses AUTO_INCREMENT or a generated column, which RepoDB does not support", col.Name)
 		}
 		var length int64
 		collation := sql.Collation_Default

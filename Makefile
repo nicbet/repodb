@@ -1,4 +1,4 @@
-.PHONY: build test lint cross-windows fmt bench bench-external m0 m2-bench m4.2-bench m4.3-bench
+.PHONY: build test lint cross-windows fmt bench bench-external bench-go bench-journal
 .DEFAULT_GOAL := build
 
 # go-mysql-server's default regex backend needs cgo and ICU4C; use its pure-Go one.
@@ -38,18 +38,14 @@ lint:
 fmt:
 	gofmt -w client cmd common engine experiments integration server
 
-m0:
-	go run ./experiments/gitstorage -root /tmp/repodb-m0
-
-m2-bench:
-	go run ./experiments/m2bench -root /tmp/repodb-m2
-
-m4.2-bench:
+# Go micro-benchmarks: SQL reads/writes per persistence mode, and sync.
+bench-go:
 	go test ./engine -run '^$$' -bench '^BenchmarkSQL' -benchmem -benchtime=500ms -count=5
 	go test ./integration -run '^$$' -bench '^(BenchmarkSyncUpToDateWarm|BenchmarkSyncDivergent)$$' -benchmem -benchtime=1x -count=1
 
-m4.3-bench:
-	go test ./engine -run '^$$' -bench '^BenchmarkM43(DurableSave|JournalReplayGrowth)$$' -benchmem -benchtime=30x -count=5
-	go test ./engine -run '^$$' -bench '^BenchmarkM43JournalFirstSaveAfterCheckpoint$$' -benchmem -benchtime=10x -count=5
-	go test ./engine -run '^$$' -bench '^BenchmarkM43JournalCheckpoint$$' -benchmem -benchtime=1x -count=5
-	go test ./engine -run '^$$' -bench '^BenchmarkM43TypedEdit(Journal|Checkpoint)$$' -benchmem -benchtime=30x -count=5
+# Durable saves, journal replay growth and checkpoints.
+bench-journal:
+	go test ./engine -run '^$$' -bench '^Benchmark(DurableSave|JournalReplayGrowth)$$' -benchmem -benchtime=30x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkJournalFirstSaveAfterCheckpoint$$' -benchmem -benchtime=10x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkJournalCheckpoint$$' -benchmem -benchtime=1x -count=5
+	go test ./engine -run '^$$' -bench '^BenchmarkJournalTypedEdit(Checkpoint)?$$' -benchmem -benchtime=30x -count=5

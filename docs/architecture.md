@@ -12,7 +12,7 @@ This page describes how the pieces work today. Usage is in [cli.md](cli.md) and 
 | `common/repository` | Repositories and snapshots: manifests, object inventories, publication to Git with commit outcomes and recovery, locking, and the journal (`WorkingState`). |
 | `common/prolly` | Immutable, content-addressed Prolly trees: build, sorted streaming build, incremental `Apply`, seekable iterators, reachability. |
 | `common/git` | Runs the `git` executable: object and tree writes with explicit fsync settings, `cat-file --batch` reads, ref updates, fetch and push. |
-| `common/storage` | The content-addressed `Store` interface and SHA-256 hashes (`storage.Sum`). It also has in-memory and filesystem stores, which only tests use. |
+| `common/storage` | The content-addressed `Store` interface and SHA-256 hashes (`storage.Sum`), plus an in-memory store. |
 | `common/robustio` | Rename and remove with retries for Windows sharing violations. |
 | `integration` | `Enable`, `Sync`, `Conflicts`, `Resolve`: remote configuration, transport, merge and conflict records. |
 | `server`, `client` | The MySQL wire server around an engine, and a Go client that decodes RepoDB commit errors. |

@@ -37,11 +37,11 @@ type benchmarkTypedEdit struct {
 	Delete bool   `json:"delete,omitempty"`
 }
 
-// BenchmarkM43TypedEditJournal is a benchmark-only lower-bound experiment. It
+// BenchmarkJournalTypedEdit is a benchmark-only lower-bound experiment. It
 // uses RepoDB's typed key/row encodings and publishes an in-memory read overlay
 // only after the framed record is flushed. It deliberately excludes SQL parsing
 // and is not a production persistence mode.
-func BenchmarkM43TypedEditJournal(b *testing.B) {
+func BenchmarkJournalTypedEdit(b *testing.B) {
 	schema := benchmarkPrimaryKeySchema()
 	crcTable := crc32.MakeTable(crc32.Castagnoli)
 	for _, batch := range []int{1, 10, 100} {
@@ -111,7 +111,7 @@ func BenchmarkM43TypedEditJournal(b *testing.B) {
 	}
 }
 
-func BenchmarkM43TypedEditCheckpoint(b *testing.B) {
+func BenchmarkJournalTypedEditCheckpoint(b *testing.B) {
 	ctx := context.Background()
 	schema := benchmarkPrimaryKeySchema()
 	for _, rows := range []int{1_000, 10_000, 50_000} {
