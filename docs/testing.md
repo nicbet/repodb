@@ -103,7 +103,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 
 - **`server`.** A MySQL-protocol round trip with the Go client: exec, query, parameters, `EXPLAIN` as a plan, `DESCRIBE`, and restart. Also commit-outcome errors carried over the wire and recovered with `RecoverCommit`. A write in a read-only transaction returns MySQL error 1792, and the connection keeps working.
 - **`cmd/repodb`.** `init`, then `commit`: journal rows are checkpointed and the journal is clean afterwards.
-- **`experiments/dbbench`.** The scorecard harness's bookkeeping: rejected-attempt counting, partial reports, percentiles, and tolerance of files removed by Git's auto-gc.
+- **`experiments/dbbench`.** The scorecard harness's bookkeeping: rejected-attempt counting, partial reports, percentiles, tolerance of files removed by Git's auto-gc, and fixture repositories that disable automatic Git housekeeping.
 
 ## Test infrastructure
 

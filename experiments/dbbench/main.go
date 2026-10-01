@@ -67,6 +67,7 @@ type report struct {
 	WorkingTree string        `json:"working_tree_status"`
 	Server      string        `json:"server_version,omitempty"`
 	Root        string        `json:"fixture_root"`
+	GitGC       string        `json:"git_gc,omitempty"`
 	Results     []measurement `json:"results"`
 	PeakRSS     *int64        `json:"process_peak_rss_bytes,omitempty"`
 	Failure     string        `json:"failure,omitempty"`
@@ -133,6 +134,7 @@ func main() {
 	if *mode == "external" {
 		err = runExternal(&r, *dsn)
 	} else {
+		r.GitGC = gitGCPolicy
 		err = run(&r)
 	}
 	if err != nil {
@@ -183,6 +185,34 @@ func git(dir string, args ...string) error {
 	b, err := c.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git %v: %w: %s", args, err, b)
+	}
+	return nil
+}
+
+// gitGCPolicy is recorded in reports. Git's automatic gc and maintenance
+// would otherwise start, detached, after fetches and pushes and overlap
+// whichever timed request runs next. Fixtures disable both and run gitGC
+// untimed between workload groups, so object-store state is the same from run
+// to run and mode to mode.
+const gitGCPolicy = "manual"
+
+// configureFixture disables Git's automatic housekeeping in a fixture
+// repository, bare or not.
+func configureFixture(path string) error {
+	for _, kv := range [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}, {"receive.autogc", "false"}} {
+		if err := git(path, "config", kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// gitGC runs git gc, untimed, in each repository.
+func gitGC(paths ...string) error {
+	for _, path := range paths {
+		if err := git(path, "gc", "--quiet"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -371,6 +401,9 @@ func runSize(r *report, rows int) error {
 	if err := git(root, "init", "--bare", "--quiet", remote); err != nil {
 		return err
 	}
+	if err := configureFixture(remote); err != nil {
+		return err
+	}
 	d := &database{path: filepath.Join(root, "local"), options: engine.Options{Persistence: engine.PersistenceMode(r.Config.Mode)}}
 	if err := newRepo(d.path, remote); err != nil {
 		return err
@@ -428,6 +461,9 @@ func runSize(r *report, rows int) error {
 	}
 	// Establish the same committed starting dataset before exercising ordinary saves.
 	if err := m("initial_publish_sync", 1, func(int, int) error { return d.sync() }); err != nil {
+		return err
+	}
+	if err := gitGC(d.path, remote); err != nil {
 		return err
 	}
 	s, err := d.e.NewSession()
@@ -521,8 +557,14 @@ func runSize(r *report, rows int) error {
 		return err
 	}
 	var failures []error
+	if err := gitGC(d.path, remote); err != nil {
+		return err
+	}
 	if err := concurrency(r, root, rows, d); err != nil {
 		failures = append(failures, err)
+	}
+	if err := gitGC(d.path, remote); err != nil {
+		return errors.Join(append(failures, err)...)
 	}
 	if err := wire(r, root, rows, d); err != nil {
 		return errors.Join(append(failures, err)...)
@@ -542,6 +584,9 @@ func runSize(r *report, rows int) error {
 	}); err != nil {
 		failures = append(failures, err)
 	}
+	if err := gitGC(d.path, remote); err != nil {
+		return errors.Join(append(failures, err)...)
+	}
 	if err := syncWorkloads(r, root, rows, d, remote); err != nil {
 		failures = append(failures, err)
 	}
@@ -553,6 +598,9 @@ func newRepo(path, remote string) error {
 		return err
 	}
 	if err := git(path, "init", "--quiet", "-b", "main"); err != nil {
+		return err
+	}
+	if err := configureFixture(path); err != nil {
 		return err
 	}
 	return git(path, "remote", "add", "origin", remote)
@@ -795,6 +843,9 @@ func syncPair(root, name, seed string, options engine.Options) (*database, *data
 	}
 	remote := filepath.Join(dir, "remote.git")
 	if err := git(dir, "init", "--bare", "--quiet", remote); err != nil {
+		return nil, nil, err
+	}
+	if err := configureFixture(remote); err != nil {
 		return nil, nil, err
 	}
 	if err := git(remote, "fetch", "--quiet", seed, repository.DataRef+":"+repository.DataRef); err != nil {

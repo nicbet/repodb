@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,5 +102,29 @@ func TestEntryBytesToleratesVanishedFile(t *testing.T) {
 	}
 	if n, err := directoryBytes(filepath.Join(dir, "missing-root")); err != nil || n != 0 {
 		t.Fatalf("directoryBytes(missing root) = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// Fixture repositories, bare or not, never start Git housekeeping on their own.
+func TestFixturesDisableAutomaticGitHousekeeping(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	if err := git(root, "init", "--bare", "--quiet", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureFixture(remote); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(root, "local")
+	if err := newRepo(local, remote); err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range []string{remote, local} {
+		for key, want := range map[string]string{"gc.auto": "0", "maintenance.auto": "false", "receive.autogc": "false"} {
+			out, err := exec.Command("git", "-C", repo, "config", "--get", key).Output()
+			if got := strings.TrimSpace(string(out)); err != nil || got != want {
+				t.Errorf("%s: %s = %q, %v; want %q", repo, key, got, err, want)
+			}
+		}
 	}
 }

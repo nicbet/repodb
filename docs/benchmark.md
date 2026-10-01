@@ -82,7 +82,7 @@ fixture sizes continue after failures; dependent work stops if setup fails.
 The table reports successful operations/sec, successful request p50/p95/p99/max,
 success/conflict/error counts, and fixture growth. JSON additionally retains raw
 successful and rejected request durations, process allocations, heap, configuration,
-revision, working-tree status, Go/Git/platform versions, and fixture path. Throughput
+revision, working-tree status, Go/Git/platform versions, Git housekeeping policy (`git_gc`), and fixture path. Throughput
 uses total workload wall time, including rejected attempts. Percentiles use
 nearest-rank individual successful requests, not averages from separate runs.
 
@@ -92,6 +92,19 @@ reports. Use identical hardware, filesystem, power state, and flags, and record 
 mount/durability settings and other system load alongside the JSON. No durability
 settings are relaxed by this harness. Filesystem caches are uncontrolled; fresh
 process reopen is not a cold-filesystem or power-loss test.
+
+**Git housekeeping.** Left to its defaults, Git starts `maintenance run --auto`
+(and `gc --auto`) detached after fetches and pushes, so a repack can overlap
+whichever timed request runs next. Every fixture repository therefore sets
+`gc.auto=0`, `maintenance.auto=false` and `receive.autogc=false`, and the harness
+runs `git gc --quiet` untimed in the local repository and its remote after the
+initial publication and before the concurrency, MySQL-interface and sharing
+groups. The report records this as `"git_gc": "manual"`. Housekeeping cost is not
+part of any measured workload.
+
+Native-git saves write and fsync Git objects on every commit. Occasional
+write stalls inside those Git processes, unrelated to housekeeping, can still
+appear in native-git p95/max (rdb-c85855).
 
 Allocation and heap figures are process-wide, including harness/client overhead.
 Peak RSS spans the whole run and excludes child processes. File growth sums logical
