@@ -7,3 +7,4 @@ dbbench.json
 .xpo/issues.snapshot.json
 .xpo/git.lock
 .xpo/worktrees/
+/.xpo/events.lock
