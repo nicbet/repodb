@@ -125,19 +125,19 @@ go install -tags gms_pure_go github.com/nicbet/repodb/cmd/repodb-server@latest
 
 ## Performance
 
-Measured 2026-09-28 at `c1aa399` on an Apple M1 Max: p50 at 50k rows, with RepoDB embedded and MySQL and Dolt over loopback TCP. See [latest results](docs/benchmarks/latest.md) for all sizes, concurrency, sync, and the environment.
+Measured 2026-10-02 at `87dd885` on an Apple M1 Max: p50 at 50k rows, with RepoDB embedded and MySQL and Dolt over loopback TCP. See [latest results](docs/benchmarks/latest.md) for all sizes, concurrency, sync, and the environment.
 
-Journal-mode point and range reads are sub-millisecond; single-row writes take ~5 ms (one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the journal appends one record regardless of batch size.
+Journal mode, the default, serves point and range reads in well under a millisecond; single-row writes take ~5 ms (one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the journal appends one record regardless of batch size.
 
 | Workload (50k rows) | MySQL 8.4 | Dolt 2.3 | RepoDB Journal |
 | ------------------- | --------: | -------: | -------------: |
-| Point read          |   0.30 ms |  0.41 ms |        0.11 ms |
-| Range (100 rows)    |   0.36 ms |  0.52 ms |        0.14 ms |
-| Full scan           |     26 ms |    39 ms |          33 ms |
-| Read tx (10 reads)  |    5.9 ms |   6.7 ms |        0.83 ms |
-| Update x1           |    1.5 ms |   1.9 ms |         5.0 ms |
-| Update x100         |     57 ms |    78 ms |         9.0 ms |
-| Insert              |   0.99 ms |   1.2 ms |         5.2 ms |
+| Point read          |   0.22 ms |  0.38 ms |        0.09 ms |
+| Range (100 rows)    |   0.38 ms |  0.49 ms |        0.13 ms |
+| Full scan           |     27 ms |    38 ms |          35 ms |
+| Read tx (10 reads)  |    6.2 ms |   7.0 ms |        0.60 ms |
+| Update x1           |    1.1 ms |   1.5 ms |         5.1 ms |
+| Update x100         |     44 ms |    73 ms |         7.3 ms |
+| Insert              |   0.71 ms |  0.92 ms |         5.0 ms |
 
 Full scans and joins still grow with table size, and a descending `ORDER BY … LIMIT` sorts the whole table until reverse index scans land. A write transaction is rejected rather than queued when another commits first, even if the two wrote different rows, so concurrent writers see conflicts that MySQL would not report. Journal-mode merge syncs take about 3 s at 50k rows. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
 
