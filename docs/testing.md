@@ -32,7 +32,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - edit locality: in a 10k-entry tree, an update writes at most one node per level, and an insert or delete a small constant;
   - seeking iterators at exact keys, between keys, past the end, and on empty trees, and reverse iterators matching forward iteration below every kind of bound;
   - the node encoding: round trips, rejection of every truncation, trailing bytes, foreign headers and codec versions, and appends to decoded entries never touching the node bytes;
-  - subtree counts matching the entries after `Build`, the sorted builder and `Apply`, and `Reachable` rejecting a wrong count.
+  - subtree counts matching the entries after `Build`, the sorted builder and `Apply`, and `Reachable` rejecting a wrong count;
+  - chunk sizes independent of the key format: sequential integer, string and random keys give similar average leaves, with few cut at the size cap.
 - **`common/git`.** Durability auditing: which Git commands flush objects and refs, under `fsync` and `batch` methods. Also that pushing the data ref skips the host repository's `pre-push` hook.
 - **`common/robustio`.** The retry loop: success after transient failures, stopping on permanent errors, and the timeout.
 

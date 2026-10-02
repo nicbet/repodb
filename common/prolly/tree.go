@@ -51,7 +51,10 @@ type Options struct {
 	BoundaryBits    uint8
 }
 
-var DefaultOptions = Options{MinChunkEntries: 32, MaxChunkEntries: 128, BoundaryBits: 6}
+// DefaultOptions give leaves of about 124 entries on average. A chunk rarely
+// reaches the 256-entry cap (about 4% of chunks), so nearly every boundary is
+// content-defined.
+var DefaultOptions = Options{MinChunkEntries: 64, MaxChunkEntries: 256, BoundaryBits: 6}
 
 type Tree struct {
 	store   storage.Store
@@ -738,16 +741,25 @@ func chunkLinks(links []link, options Options) [][]link {
 // and on the chunk's size. Hashing values or child hashes, or accumulating a
 // hash across items, would let one edit move every later boundary, and Apply
 // would then rewrite chunks until the boundaries happened to realign.
-func entryBoundaryHash(entry Entry) uint64 {
-	h := fnv.New64a()
-	h.Write(entry.Key)
-	return h.Sum64()
-}
+func entryBoundaryHash(entry Entry) uint64 { return keyBoundaryHash(entry.Key) }
 
-func linkBoundaryHash(item link) uint64 {
+func linkBoundaryHash(item link) uint64 { return keyBoundaryHash(item.MaxKey) }
+
+// keyBoundaryHash is FNV-64a of the key passed through the splitmix64
+// finalizer. shouldCut tests the low bits, and FNV-64a's low bits depend only
+// on the low bits of the key's last byte: sequential integer keys would cut
+// exactly every 2^BoundaryBits keys. The finalizer makes every output bit
+// depend on every input bit.
+func keyBoundaryHash(key []byte) uint64 {
 	h := fnv.New64a()
-	h.Write(item.MaxKey)
-	return h.Sum64()
+	h.Write(key)
+	x := h.Sum64()
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // shouldCut reports whether a chunk of size entries ends at an item whose

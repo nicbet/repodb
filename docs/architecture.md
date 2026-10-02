@@ -45,14 +45,14 @@ objects/sha256/ab/cdef…   # one blob per RepoDB object, named by its SHA-256
 ```
 
 `manifest.json` holds:
-- `format_version` (currently 5);
+- `format_version` (currently 6);
 - `default_database` (`repodb`);
 - `tables`, mapping each table name to its schema root, data root and one root per secondary index;
 - `objects`, the sorted, complete inventory of object hashes.
 
 **Identities.** RepoDB identifies objects by SHA-256 of their content. The Git blob ID is a separate identity, so a repository may use Git's SHA-1 or SHA-256 object format.
 
-**Commit parents.** A data commit's parent is the previous data head, and merges have two parents. SQL commits in native-git mode use the subject `RepoDB snapshot v5` (the storage format version); checkpoints use the given message.
+**Commit parents.** A data commit's parent is the previous data head, and merges have two parents. SQL commits in native-git mode use the subject `RepoDB snapshot v6` (the storage format version); checkpoints use the given message.
 
 **Opening a snapshot.** It must pass these checks before any use, or it fails with `repository.ErrCorrupt`:
 - the manifest decodes strictly and the format version matches;
@@ -76,7 +76,7 @@ Each table has three kinds of object:
 
 A Prolly tree is a B-tree-like structure whose node boundaries depend only on content:
 - Nodes are binary, stored as content-addressed objects (see [Node encoding](#node-encoding)).
-- Entries are split into chunks by a per-entry boundary hash: the FNV-64 hash of the entry's **key**. A chunk ends after an entry once it has at least 32 entries and that entry's hash has its low 6 bits zero, or at 128 entries.
+- Entries are split into chunks by a per-entry boundary hash of the entry's **key**: FNV-64a passed through the splitmix64 finalizer. A chunk ends after an entry once it has at least 64 entries and that entry's hash has its low 6 bits zero, or at 256 entries. Leaves average about 124 entries whatever the key format, and fewer than 5% end at the cap. (FNV-64a's raw low bits follow the low bits of the key's last byte, so without the finalizer sequential integer keys would cut at a fixed period.)
 - Interior levels chunk their child links the same way, hashing each link's maximum key.
 - The decision never looks at values, child hashes or earlier entries. So an update never moves a boundary, and an insert or delete moves at most the boundaries up to the next key-hash boundary.
 

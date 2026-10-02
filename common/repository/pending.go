@@ -2,6 +2,7 @@ package repository
 
 import (
 	"bytes"
+	"slices"
 	"sort"
 )
 
@@ -40,15 +41,25 @@ func (p PendingRows) With(edits []TypedRowEdit) PendingRows {
 	if len(edits) == 0 {
 		return p
 	}
-	run := make(pendingRun, len(edits))
-	copy(run, edits)
-	sort.SliceStable(run, func(i, j int) bool { return bytes.Compare(run[i].Key, run[j].Key) < 0 })
-	unique := run[:0]
-	for i, edit := range run {
-		if i+1 < len(run) && bytes.Equal(edit.Key, run[i+1].Key) {
-			continue
+	// Sort positions, not the 56-byte edits, and break ties on position: the
+	// same order as a stable sort, without its O(n log² n) rotations, which
+	// dominated a 50k-row bulk commit.
+	order := make([]int32, len(edits))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	slices.SortFunc(order, func(a, b int32) int {
+		if c := bytes.Compare(edits[a].Key, edits[b].Key); c != 0 {
+			return c
 		}
-		unique = append(unique, edit)
+		return int(a - b)
+	})
+	unique := make(pendingRun, 0, len(edits))
+	for i, pos := range order {
+		if i+1 < len(order) && bytes.Equal(edits[pos].Key, edits[order[i+1]].Key) {
+			continue // a later edit of the same key wins
+		}
+		unique = append(unique, edits[pos])
 	}
 	runs := make([]pendingRun, 0, len(p.runs)+1)
 	runs = append(runs, unique[:len(unique):len(unique)])
