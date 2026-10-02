@@ -71,6 +71,9 @@ type Iterator struct {
 	stack []iteratorFrame
 	leaf  nodeReader
 	done  bool
+	// prefetch batches each internal node's children into one store read;
+	// set for full-tree iteration, which visits them all.
+	prefetch bool
 }
 
 type iteratorFrame struct {
@@ -426,7 +429,7 @@ func (t *Tree) Root() storage.Hash { return t.root }
 
 // Iterator returns a lazy ordered iterator positioned before the first entry.
 func (t *Tree) Iterator(ctx context.Context) (*Iterator, error) {
-	it := &Iterator{ctx: ctx, store: t.store}
+	it := &Iterator{ctx: ctx, store: t.store, prefetch: true}
 	if err := it.descend(t.root); err != nil {
 		return nil, err
 	}
@@ -513,6 +516,9 @@ func (it *Iterator) descend(hash storage.Hash) error {
 		}
 		if len(n.Children) == 0 {
 			return fmt.Errorf("invalid internal Prolly node %s", hash)
+		}
+		if it.prefetch {
+			prefetchChildren(it.ctx, it.store, n, nil)
 		}
 		it.stack = append(it.stack, iteratorFrame{node: n, next: 1})
 		hash = n.Children[0].Hash
@@ -631,6 +637,7 @@ func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[
 		if len(n.Entries) != 0 || len(n.Children) == 0 {
 			return 0, fmt.Errorf("invalid internal Prolly node %s", hash)
 		}
+		prefetchChildren(ctx, store, n, seen)
 		for i, child := range n.Children {
 			if !child.Hash.Valid() || (i > 0 && bytes.Compare(n.Children[i-1].MaxKey, child.MaxKey) >= 0) {
 				return 0, fmt.Errorf("invalid child link in Prolly node %s", hash)
@@ -785,6 +792,21 @@ func writeNode(ctx context.Context, store storage.Store, n node) (storage.Hash, 
 		return "", err
 	}
 	return store.Put(ctx, data)
+}
+
+// prefetchChildren hints store to read n's children not yet in seen in one
+// batch.
+func prefetchChildren(ctx context.Context, store storage.Store, n node, seen map[storage.Hash]uint64) {
+	if _, ok := store.(storage.Prefetcher); !ok {
+		return
+	}
+	hashes := make([]storage.Hash, 0, len(n.Children))
+	for _, child := range n.Children {
+		if _, visited := seen[child.Hash]; !visited {
+			hashes = append(hashes, child.Hash)
+		}
+	}
+	storage.Prefetch(ctx, store, hashes)
 }
 
 func readNode(ctx context.Context, store storage.Store, hash storage.Hash) (node, error) {

@@ -620,7 +620,7 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 			snapshotEdits[name] = te.rows
 		}
 	}
-	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: objectSet, objectOIDs: base.objectOIDs, cache: cache, pendingEdits: snapshotEdits}, pending
+	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: objectSet, objectOIDs: base.objectOIDs, cache: cache, core: base.core, pendingEdits: snapshotEdits}, pending
 }
 
 // firstHeaderAfterAppend returns the journal's first frame header after an
@@ -890,7 +890,7 @@ func workingSnapshot(base *Snapshot, manifest Manifest, available map[storage.Ha
 			oids[hash] = oid
 		}
 	}
-	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: available, objectOIDs: oids, cache: cache}
+	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: available, objectOIDs: oids, cache: cache, core: base.core}
 }
 
 func (w *WorkingState) load(ctx context.Context) (workingView, error) {

@@ -7,8 +7,9 @@ import (
 	"github.com/nicbet/repodb/common/storage"
 )
 
-// snapshotCore is the immutable, validated content of one data commit. Every
-// Snapshot loaded from the commit references it, which keeps it alive.
+// snapshotCore is the checked inventory of one data commit and the cache of
+// its objects read so far. Every Snapshot of the commit references it, which
+// keeps it alive.
 type snapshotCore struct {
 	manifest   Manifest
 	objectSet  map[storage.Hash]struct{}
@@ -18,18 +19,18 @@ type snapshotCore struct {
 
 type snapshotMemoKey struct{ repository, commit string }
 
-// snapshotMemo maps validated commits to their cores through weak pointers. It
+// snapshotMemo maps loaded commits to their cores through weak pointers. It
 // never keeps a snapshot alive by itself: a commit is reused only while some
-// caller still holds a snapshot of it. A commit ID names immutable content and
-// its first load verified every object, so a hit skips the Git reads and
-// integrity checks.
+// caller still holds a snapshot of it. A commit ID names immutable content, so
+// a hit skips the manifest and tree checks and reuses every object already
+// read and checked.
 var snapshotMemo = struct {
 	sync.Mutex
 	entries map[snapshotMemoKey]weak.Pointer[snapshotCore]
 }{entries: make(map[snapshotMemoKey]weak.Pointer[snapshotCore])}
 
-// memoizedSnapshot returns a fresh Snapshot of commit if a validated core is
-// still alive.
+// memoizedSnapshot returns a fresh Snapshot of commit if its core is still
+// alive.
 func (r *Repository) memoizedSnapshot(commit string) *Snapshot {
 	key := snapshotMemoKey{r.Identity(), commit}
 	snapshotMemo.Lock()
@@ -45,7 +46,7 @@ func (r *Repository) memoizedSnapshot(commit string) *Snapshot {
 	return r.snapshotFromCore(commit, core)
 }
 
-// rememberSnapshot records a validated snapshot and sweeps entries whose cores
+// rememberSnapshot records a checked snapshot and sweeps entries whose cores
 // were collected.
 func (r *Repository) rememberSnapshot(snapshot *Snapshot) {
 	if snapshot.core == nil {

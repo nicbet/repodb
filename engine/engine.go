@@ -26,30 +26,38 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const snapshotValidationVersion = 4
+const snapshotValidationVersion = 5
 
-// validatedTables caches table validation by content: repository, base
-// commit, and the table's schema, data and index roots. Journal generations
-// keep their base commit and roots (pending edits are not validated), so a
-// new generation re-validates only the tables whose roots changed.
+// validatedTables caches table validation by content: repository and the
+// table's schema, data and index roots. The roots name the content, so a
+// table validated under one commit or journal generation stays valid under
+// any other with the same roots. Each entry records the table's reachable
+// objects with the Git object IDs they were read from, and a hit counts only
+// for a snapshot that provides those same objects (repository.Snapshot.
+// Provides): an object present only in a journal, or stored under another
+// Git object, never vouches for a snapshot that lacks it.
 var validatedTables = struct {
 	sync.Mutex
 	entries map[string]*list.Element
 	order   *list.List
+	objects int
 }{entries: make(map[string]*list.Element), order: list.New()}
 
-const maxValidatedTables = 1024
+// The cache is bounded by entries and by the objects they record; the newest
+// entry is always kept.
+const (
+	maxValidatedTables  = 1024
+	maxValidatedObjects = 1 << 20
+)
 
 type validationCacheEntry struct {
 	key     string
-	objects []storage.Hash
+	objects []repository.ObjectRef
 }
 
-// tableValidationKey keeps the base commit so objects present only in one
-// snapshot's store (for example a journal) never vouch for another commit.
 func tableValidationKey(snapshot *repository.Snapshot, table repository.Table) string {
 	var key strings.Builder
-	fmt.Fprintf(&key, "%s\x00%s\x00%d\x00%s\x00%s", snapshot.RepositoryIdentity(), snapshot.Commit, snapshotValidationVersion, table.SchemaRoot, table.DataRoot)
+	fmt.Fprintf(&key, "%s\x00%d\x00%s\x00%s", snapshot.RepositoryIdentity(), snapshotValidationVersion, table.SchemaRoot, table.DataRoot)
 	names := make([]string, 0, len(table.Indexes))
 	for name := range table.Indexes {
 		names = append(names, name)
@@ -61,28 +69,40 @@ func tableValidationKey(snapshot *repository.Snapshot, table repository.Table) s
 	return key.String()
 }
 
-func lookupValidatedTable(key string) ([]storage.Hash, bool) {
+// lookupValidatedTable returns the table's validated objects if snapshot
+// provides all of them.
+func lookupValidatedTable(snapshot *repository.Snapshot, key string) ([]repository.ObjectRef, bool) {
 	validatedTables.Lock()
-	defer validatedTables.Unlock()
 	element := validatedTables.entries[key]
 	if element == nil {
+		validatedTables.Unlock()
 		return nil, false
 	}
 	validatedTables.order.MoveToFront(element)
-	return element.Value.(validationCacheEntry).objects, true
+	objects := element.Value.(validationCacheEntry).objects
+	validatedTables.Unlock()
+	if !snapshot.Provides(objects) {
+		return nil, false
+	}
+	return objects, true
 }
 
-func rememberValidatedTable(key string, objects []storage.Hash) {
+// rememberValidatedTable records (or replaces) the objects a table was
+// validated with.
+func rememberValidatedTable(key string, objects []repository.ObjectRef) {
 	validatedTables.Lock()
 	defer validatedTables.Unlock()
 	if element := validatedTables.entries[key]; element != nil {
-		validatedTables.order.MoveToFront(element)
-		return
+		validatedTables.objects -= len(element.Value.(validationCacheEntry).objects)
+		validatedTables.order.Remove(element)
 	}
 	validatedTables.entries[key] = validatedTables.order.PushFront(validationCacheEntry{key: key, objects: objects})
-	if validatedTables.order.Len() > maxValidatedTables {
+	validatedTables.objects += len(objects)
+	for validatedTables.order.Len() > 1 && (validatedTables.order.Len() > maxValidatedTables || validatedTables.objects > maxValidatedObjects) {
 		oldest := validatedTables.order.Back()
-		delete(validatedTables.entries, oldest.Value.(validationCacheEntry).key)
+		entry := oldest.Value.(validationCacheEntry)
+		delete(validatedTables.entries, entry.key)
+		validatedTables.objects -= len(entry.objects)
 		validatedTables.order.Remove(oldest)
 	}
 }
@@ -188,21 +208,22 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 
 // ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
 // and primary-key encoding before integration publishes a fetched snapshot.
-// Tables already validated with the same roots and base commit are skipped.
+// A table already validated with the same roots is skipped when this snapshot
+// provides the same objects (see validatedTables).
 func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error {
 	if snapshot == nil {
 		return errors.New("snapshot is required")
 	}
 	for name, table := range snapshot.Manifest.Tables {
 		key := tableValidationKey(snapshot, table)
-		if _, ok := lookupValidatedTable(key); ok {
+		if _, ok := lookupValidatedTable(snapshot, key); ok {
 			continue
 		}
 		objects, err := validateTable(ctx, snapshot.Store(), name, table)
 		if err != nil {
 			return err
 		}
-		rememberValidatedTable(key, objects)
+		rememberValidatedTable(key, snapshot.ObjectRefs(objects))
 	}
 	return nil
 }
@@ -212,6 +233,11 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 func validateTable(ctx context.Context, store storage.Store, name string, table repository.Table) ([]storage.Hash, error) {
 	if !table.DataRoot.Valid() {
 		if table.SchemaRoot.Valid() {
+			// Snapshots read objects lazily, so read the schema here to
+			// check it even though no rows need it.
+			if _, err := loadTableMetadata(ctx, store, table); err != nil {
+				return nil, fmt.Errorf("validate SQL table %s schema: %w", name, err)
+			}
 			return []storage.Hash{table.SchemaRoot}, nil
 		}
 		return nil, nil
@@ -274,8 +300,15 @@ func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]stora
 	if !ok {
 		return nil, false
 	}
-	objects, ok := lookupValidatedTable(tableValidationKey(snapshot, manifestTable))
-	return append([]storage.Hash(nil), objects...), ok
+	refs, ok := lookupValidatedTable(snapshot, tableValidationKey(snapshot, manifestTable))
+	if !ok {
+		return nil, false
+	}
+	objects := make([]storage.Hash, len(refs))
+	for i, ref := range refs {
+		objects[i] = ref.Hash
+	}
+	return objects, true
 }
 
 func (e *Engine) Repository() *repository.Repository     { return e.repo }

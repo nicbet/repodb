@@ -54,8 +54,8 @@ func TestReaderMissingObjectKeepsReader(t *testing.T) {
 	root := newReaderTestRepository(t)
 	oids := writeBlobs(t, root, []byte("present"))
 	missing := strings.Repeat("0", len(oids[0]))
-	if _, err := (CLI{}).ReadObjects(ctx, root, []string{oids[0], missing}); !errors.Is(err, errObjectMissing) {
-		t.Fatalf("read with missing object: err = %v, want errObjectMissing", err)
+	if _, err := (CLI{}).ReadObjects(ctx, root, []string{oids[0], missing}); !errors.Is(err, ErrObjectMissing) {
+		t.Fatalf("read with missing object: err = %v, want ErrObjectMissing", err)
 	}
 	before := ProcessCount()
 	if _, err := (CLI{}).ReadObjects(ctx, root, oids); err != nil {
@@ -174,8 +174,8 @@ func TestReadTreeFileThroughReader(t *testing.T) {
 	if err != nil || string(data) != "manifest" {
 		t.Fatalf("ReadTreeFile = %q, %v", data, err)
 	}
-	if _, err := cli.ReadTreeFile(ctx, root, commit, "absent.json"); !errors.Is(err, errObjectMissing) {
-		t.Fatalf("ReadTreeFile(absent) err = %v, want errObjectMissing", err)
+	if _, err := cli.ReadTreeFile(ctx, root, commit, "absent.json"); !errors.Is(err, ErrObjectMissing) {
+		t.Fatalf("ReadTreeFile(absent) err = %v, want ErrObjectMissing", err)
 	}
 	if present, err := cli.HasCommit(ctx, root, commit); err != nil || !present {
 		t.Fatalf("HasCommit(commit) = %v, %v", present, err)

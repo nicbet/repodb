@@ -48,7 +48,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - two writer processes in linked worktrees give one success and one conflict;
   - a writer killed inside publication leaves the old snapshot intact and releases the lock;
   - linked worktrees share one repository identity.
-- **Formats and corruption.** Missing data gives `ErrNotInitialized`. A future format and the previous format are both refused. A manifest listing a missing object gives `ErrCorrupt`.
+- **Formats and corruption.** Missing data gives `ErrNotInitialized`. A future format and the previous format are both refused. A manifest listing a missing object gives `ErrCorrupt`. Opening reads no object; an object whose blob is missing or holds other bytes gives `ErrCorrupt` on first read, and a fetched snapshot that stores a validated table's object under another blob, or relies on a journal-only object, is validated again and rejected.
 - **SHA-256 Git repositories.** A round trip; the test is skipped if the installed Git lacks SHA-256 support.
 
 ### SQL engine (`engine`)

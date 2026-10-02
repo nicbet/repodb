@@ -347,7 +347,7 @@ func (CLI) ReadTreeFile(ctx context.Context, root, commit, path string) ([]byte,
 		return nil, fmt.Errorf("read %s from snapshot %s: %w", path, commit, err)
 	}
 	if results[0].Missing {
-		return nil, fmt.Errorf("read %s from snapshot %s: %w", path, commit, errObjectMissing)
+		return nil, fmt.Errorf("read %s from snapshot %s: %w", path, commit, ErrObjectMissing)
 	}
 	if results[0].Type != "blob" {
 		return nil, fmt.Errorf("read %s from snapshot %s: not a file (%s)", path, commit, results[0].Type)
@@ -409,7 +409,7 @@ func (CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (ma
 	objects := make(map[string][]byte, len(objectIDs))
 	for i, result := range results {
 		if result.Missing {
-			return nil, fmt.Errorf("batch read Git objects: %s: %w", objectIDs[i], errObjectMissing)
+			return nil, fmt.Errorf("batch read Git objects: %s: %w", objectIDs[i], ErrObjectMissing)
 		}
 		if result.Type != "blob" {
 			return nil, fmt.Errorf("batch read Git objects: %s is a %s, not a blob", objectIDs[i], result.Type)

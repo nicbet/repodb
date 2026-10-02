@@ -18,8 +18,8 @@ import (
 // callers that never call CloseReaders don't leave Git processes behind.
 var readerIdleTimeout = 5 * time.Second
 
-// errObjectMissing marks a request cat-file reported as missing.
-var errObjectMissing = errors.New("git object not found")
+// ErrObjectMissing marks a request cat-file reported as missing.
+var ErrObjectMissing = errors.New("git object not found")
 
 // objectReader keeps one `git cat-file --batch` process per worktree root, so
 // object reads cost no process start. Requests are serialized. Any I/O or

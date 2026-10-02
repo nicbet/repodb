@@ -41,3 +41,17 @@ type Store interface {
 	Get(context.Context, Hash) ([]byte, error)
 	Put(context.Context, []byte) (Hash, error)
 }
+
+// Prefetcher is implemented by stores whose reads are cheaper in batches.
+// Prefetch is a hint: it loads what it can so later Gets are served from
+// memory, and leaves any failure for Get to report.
+type Prefetcher interface {
+	Prefetch(context.Context, []Hash)
+}
+
+// Prefetch hints store to load hashes if it supports batched reads.
+func Prefetch(ctx context.Context, store Store, hashes []Hash) {
+	if p, ok := store.(Prefetcher); ok && len(hashes) != 0 {
+		p.Prefetch(ctx, hashes)
+	}
+}

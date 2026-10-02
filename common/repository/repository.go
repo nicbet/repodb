@@ -140,9 +140,11 @@ type Snapshot struct {
 	Manifest   Manifest
 	objectSet  map[storage.Hash]struct{}
 	objectOIDs map[storage.Hash]string
-	cache      *snapshotObjectCache
-	// core keeps a loaded commit's validated content alive for snapshotMemo;
-	// derived working snapshots leave it nil.
+	// cache holds the objects read so far, each checked against its name,
+	// plus journal-only objects. Snapshots of one commit share it.
+	cache *snapshotObjectCache
+	// core keeps a loaded commit's checked inventory alive for snapshotMemo.
+	// Working snapshots derived from it keep it too: they share its commit.
 	core *snapshotCore
 
 	pendingEdits map[string]PendingRows
@@ -263,6 +265,44 @@ func (r *Repository) Identity() string { return r.CommonDir + "\x00" + r.ObjectF
 
 // RepositoryIdentity identifies the repository that owns this snapshot.
 func (s *Snapshot) RepositoryIdentity() string { return s.repo.Identity() }
+
+// ObjectRef names an object together with the Git object ID a snapshot stores
+// it under; OID is empty for an object held only in memory (a journal-only
+// schema, for example).
+type ObjectRef struct {
+	Hash storage.Hash
+	OID  string
+}
+
+// ObjectRefs pairs each hash with its Git object ID in this snapshot.
+func (s *Snapshot) ObjectRefs(hashes []storage.Hash) []ObjectRef {
+	refs := make([]ObjectRef, len(hashes))
+	for i, hash := range hashes {
+		refs[i] = ObjectRef{Hash: hash, OID: s.objectOIDs[hash]}
+	}
+	return refs
+}
+
+// Provides reports whether this snapshot lists every object and serves the
+// same bytes for it: either already read and checked against its name, or
+// stored under the same Git object ID. Bytes checked through one snapshot
+// thereby vouch for another only when both name the same Git object.
+func (s *Snapshot) Provides(refs []ObjectRef) bool {
+	s.cache.mu.RLock()
+	defer s.cache.mu.RUnlock()
+	for _, ref := range refs {
+		if _, listed := s.objectSet[ref.Hash]; !listed {
+			return false
+		}
+		if _, cached := s.cache.data[ref.Hash]; cached {
+			continue
+		}
+		if ref.OID == "" || s.objectOIDs[ref.Hash] != ref.OID {
+			return false
+		}
+	}
+	return true
+}
 
 func (r *Repository) Current(ctx context.Context) (*Snapshot, error) {
 	commit, err := r.Head(ctx)
@@ -488,6 +528,23 @@ func (w *Writer) Get(ctx context.Context, hash storage.Hash) ([]byte, error) {
 	return w.base.Store().Get(ctx, hash)
 }
 
+// Prefetch hands the hashes this writer doesn't hold to its base snapshot's
+// batched read.
+func (w *Writer) Prefetch(ctx context.Context, hashes []storage.Hash) {
+	if w.base == nil {
+		return
+	}
+	missing := make([]storage.Hash, 0, len(hashes))
+	w.mu.RLock()
+	for _, hash := range hashes {
+		if _, ok := w.objects[hash]; !ok {
+			missing = append(missing, hash)
+		}
+	}
+	w.mu.RUnlock()
+	storage.Prefetch(ctx, w.base.Store(), missing)
+}
+
 // ImportObjects makes selected immutable objects from another validated
 // snapshot available to this writer. Objects already present in the local base
 // are retained by identity; only missing bytes are copied, and their existing
@@ -496,6 +553,7 @@ func (w *Writer) ImportObjects(ctx context.Context, source *Snapshot, hashes []s
 	if source == nil || source.repo != w.repo {
 		return errors.New("import snapshot belongs to a different repository")
 	}
+	storage.Prefetch(ctx, source.Store(), hashes)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.committed {
@@ -911,23 +969,61 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 	if len(expectedPaths) != 0 {
 		return nil, fmt.Errorf("%w: snapshot is missing %d listed tree entries", ErrCorrupt, len(expectedPaths))
 	}
-	oids := make([]string, 0, len(snapshot.objectOIDs))
-	for _, oid := range snapshot.objectOIDs {
-		oids = append(oids, oid)
-	}
-	objectData, err := r.git.ReadObjects(ctx, r.Root, oids)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
-	}
-	for hash := range objectSet {
-		data, ok := objectData[snapshot.objectOIDs[hash]]
-		if !ok || storage.Sum(data) != hash {
-			return nil, fmt.Errorf("%w: object %s failed integrity check", ErrCorrupt, hash)
-		}
-		snapshot.cache.data[hash] = data
-	}
+	// Object bytes are read and checked against their names on first use
+	// (readObjects), so opening a snapshot costs only its inventory.
 	r.rememberSnapshot(snapshot)
 	return r.snapshotFromCore(commit, snapshot.core), nil
+}
+
+// readObjects reads the listed objects that are not cached yet by Git object
+// ID, in one batch, and caches each one whose content hashes to its name. It
+// returns the first integrity failure; objects the snapshot doesn't list or
+// has no Git object for are left to Get.
+func (s *Snapshot) readObjects(ctx context.Context, hashes []storage.Hash) error {
+	want := make([]storage.Hash, 0, len(hashes))
+	oids := make([]string, 0, len(hashes))
+	s.cache.mu.RLock()
+	for _, hash := range hashes {
+		if _, cached := s.cache.data[hash]; cached {
+			continue
+		}
+		if _, listed := s.objectSet[hash]; !listed {
+			continue
+		}
+		if oid := s.objectOIDs[hash]; oid != "" {
+			want = append(want, hash)
+			oids = append(oids, oid)
+		}
+	}
+	s.cache.mu.RUnlock()
+	if len(want) == 0 {
+		return nil
+	}
+	objects, err := s.repo.git.ReadObjects(ctx, s.repo.Root, oids)
+	if err != nil {
+		if errors.Is(err, repodbgit.ErrObjectMissing) {
+			return fmt.Errorf("%w: snapshot %s: %v", ErrCorrupt, s.Commit, err)
+		}
+		return err
+	}
+	verified := make(map[storage.Hash][]byte, len(want))
+	var failed error
+	for i, hash := range want {
+		data := objects[oids[i]]
+		if storage.Sum(data) != hash {
+			if failed == nil {
+				failed = fmt.Errorf("%w: object %s failed integrity check", ErrCorrupt, hash)
+			}
+			continue
+		}
+		verified[hash] = data
+	}
+	s.cache.mu.Lock()
+	for hash, data := range verified {
+		s.cache.data[hash] = data
+	}
+	s.cache.mu.Unlock()
+	return failed
 }
 
 type snapshotStore struct{ snapshot *Snapshot }
@@ -939,23 +1035,30 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 	if _, ok := s.snapshot.objectSet[hash]; !ok {
 		return nil, storage.ErrNotFound
 	}
-	s.snapshot.cache.mu.RLock()
-	cached, ok := s.snapshot.cache.data[hash]
-	s.snapshot.cache.mu.RUnlock()
-	if ok {
-		return cached, nil
+	if data, ok := s.cached(hash); ok {
+		return data, nil
 	}
-	data, err := s.snapshot.repo.git.ReadTreeFile(ctx, s.snapshot.repo.Root, s.snapshot.Commit, objectPath(hash))
-	if err != nil {
+	if s.snapshot.objectOIDs[hash] == "" {
+		return nil, fmt.Errorf("%w: object %s has no Git object in snapshot %s", ErrCorrupt, hash, s.snapshot.Commit)
+	}
+	if err := s.snapshot.readObjects(ctx, []storage.Hash{hash}); err != nil {
 		return nil, err
 	}
-	if storage.Sum(data) != hash {
-		return nil, fmt.Errorf("object %s failed integrity check", hash)
-	}
-	s.snapshot.cache.mu.Lock()
-	s.snapshot.cache.data[hash] = data
-	s.snapshot.cache.mu.Unlock()
+	data, _ := s.cached(hash)
 	return data, nil
+}
+
+func (s *snapshotStore) cached(hash storage.Hash) ([]byte, bool) {
+	s.snapshot.cache.mu.RLock()
+	defer s.snapshot.cache.mu.RUnlock()
+	data, ok := s.snapshot.cache.data[hash]
+	return data, ok
+}
+
+// Prefetch reads the uncached objects among hashes in one Git batch. Failures
+// are left for Get to report.
+func (s *snapshotStore) Prefetch(ctx context.Context, hashes []storage.Hash) {
+	_ = s.snapshot.readObjects(ctx, hashes)
 }
 
 func (*snapshotStore) Put(context.Context, []byte) (storage.Hash, error) {
