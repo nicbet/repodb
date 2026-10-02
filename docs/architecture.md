@@ -176,9 +176,12 @@ The journal is an append-only file of framed records:
 "RDBJ" | payload length (u32 BE) | CRC-32C (u32 BE) | JSON payload
 ```
 
-**Commit.** Under `working.lock`, a committing transaction checks that its base (the journal generation and the committed data head) is still current, or fails with `ErrConflict`. It then appends a `typed-prepare` record and a `commit` record, and flushes the journal at the engine's durability level (see [Durability and recovery](#durability-and-recovery)) before returning success. The prepare record carries the transaction's typed edits:
+**Commit.** Under `working.lock`, a committing transaction checks that its base is still valid (see [Write conflicts](#write-conflicts)), or fails with `ErrConflict`. It then appends a `typed-prepare` record and a `commit` record, and flushes the journal at the engine's durability level (see [Durability and recovery](#durability-and-recovery)) before returning success. The prepare record carries the transaction's typed edits:
 - per table, a new schema object or a drop;
-- the rows this transaction changed, as encoded key and value, or delete. Replay merges records key by key, so a record never repeats earlier transactions' edits.
+- the rows this transaction changed, as encoded key and value, or delete. Replay merges records key by key, so a record never repeats earlier transactions' edits;
+- per table, the keys this transaction added to `UNIQUE` indexes (`claims`), for conflict detection only.
+
+The edits are applied on top of the current state, which may already include transactions committed after this one's snapshot.
 
 Each transaction gets the next generation number and a transaction ID of the form `<generation>-<random>`. Git is not touched.
 
@@ -205,9 +208,21 @@ If the process dies after publishing but before the record, the next open sees t
 
 **Growth.** The journal holds only the work since the last checkpoint, plus the anchor, so its size doesn't grow with the repository's age. Retention policies, archiving and a manual `repodb compact` are tracked in rdb-515fae.
 
+### Write conflicts
+
+Journal commits use first-committer-wins snapshot isolation. A transaction whose snapshot is older than the journal's current generation still commits if its writes are disjoint from those of every transaction committed since. Otherwise it fails with `ErrConflict`, naming the table and the kind of overlap. The check runs under `working.lock`:
+1. If the data head has moved since the snapshot (a checkpoint), the transaction conflicts.
+2. **Rows.** The pending edits record, for each row key, the generation that last wrote it. Writing a key that was written after the snapshot is a conflict. A primary-key change writes both the old and the new key.
+3. **Unique indexes.** A transaction's `claims` are recorded with their generation. Claiming a key that was claimed after the snapshot, even for a different row, is a conflict. A unique index key that contains a NULL also contains the primary key, so it never collides.
+4. **Schema.** A table created, altered or dropped after the snapshot conflicts with any write to it. A transaction that creates, alters or drops a table conflicts if anything wrote to that table after its snapshot.
+
+The table and claim generations live in memory, in a write log kept with the replayed view. Replay rebuilds it, so commits by other processes are checked too. It covers the transactions since the last checkpoint or whole-manifest commit; a snapshot older than that always conflicts. Reads are not tracked, so write skew is possible ([sql.md](sql.md#transactions)).
+
+The engine caches each generation's derived secondary-index entries. A rebased transaction's index entries were computed on its snapshot, but because its rows are disjoint from everything committed since, its own entries are still correct on top of the current generation. They are added to that generation's cache, if it is cached, instead of being derived again.
+
 ### Concurrency limits
 
-Commits are optimistic and repository-wide: any commit since a transaction's snapshot rejects that transaction, whichever rows it touched. Within one repository, commits are serialized by `working.lock` (journal) or by `working.lock` and `publish.lock` (native-git), and each journal commit does its own flush. Together these bound concurrent write throughput. Per-key conflict detection, group commit and automatic retry are tracked in rdb-df092b.
+Commits are optimistic. In journal mode a transaction conflicts only with overlapping writes ([Write conflicts](#write-conflicts)). In native-git mode it conflicts with any commit since its snapshot, whichever rows that commit touched. Within one repository, commits are serialized by `working.lock` (journal) or by `working.lock` and `publish.lock` (native-git), and each journal commit does its own flush. Together these bound concurrent write throughput. Group commit and automatic retry are tracked in rdb-df092b.
 
 ## Sync and merge
 
@@ -268,7 +283,7 @@ A `committed` or `unknown` outcome carries the candidate commit ID. `Repository.
 | no `refs/repodb/data` | `repository.ErrNotInitialized` |
 | another format version | unsupported-format error |
 | missing, extra or altered snapshot content | `repository.ErrCorrupt` |
-| stale transaction base | `repository.ErrConflict` (nothing written) |
+| transaction conflicting with one committed since its snapshot | `repository.ErrConflict` (nothing written) |
 | damaged journal history | `repository.ErrWorkingCorrupt` |
 | data head moved under a dirty journal | `repository.ErrWorkingBaseChanged` |
 

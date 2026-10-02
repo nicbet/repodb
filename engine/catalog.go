@@ -256,6 +256,29 @@ func (o *indexOverlay) sorted() []prolly.Edit {
 	}
 }
 
+// uniqueClaims returns the keys this transaction added to unique indexes, so
+// that the journal rejects a concurrent transaction that gave another row the
+// same value. A key with a NULL contains the primary key and never collides.
+func (s *tableState) uniqueClaims() []repository.IndexClaim {
+	var claims []repository.IndexClaim
+	for _, idx := range s.indexes {
+		overlay := s.idxEdits[idx.Name]
+		if !idx.Unique || overlay == nil {
+			continue
+		}
+		last := make(map[string]bool, len(overlay.local))
+		for _, edit := range overlay.local {
+			last[string(edit.Key)] = !edit.Delete
+		}
+		for key, put := range last {
+			if put {
+				claims = append(claims, repository.IndexClaim{Index: idx.Name, Key: []byte(key)})
+			}
+		}
+	}
+	return claims
+}
+
 // indexViews returns each index's edits as one set, for the cache.
 func indexViews(overlays map[string]*indexOverlay) map[string]repository.PendingRows {
 	views := make(map[string]repository.PendingRows, len(overlays))
@@ -268,6 +291,11 @@ func indexViews(overlays map[string]*indexOverlay) map[string]repository.Pending
 // storeIndexEdits caches a committed journal transaction's index edits for the
 // generation it produced. They stay valid because a journal commit keeps the
 // base Git commit, and with it the persisted data and index trees.
+//
+// A rebased commit (one that landed on later generations than its base) has
+// index edits that miss the commits in between. Its own edits are still right
+// on top of them, because it wrote no row they wrote: they are added to the
+// cache of the generation it landed on, if that is cached.
 func (d *database) storeIndexEdits(tx *transaction, next *repository.Snapshot) {
 	base := tx.writer.BaseSnapshot()
 	d.mu.Lock()
@@ -276,14 +304,28 @@ func (d *database) storeIndexEdits(tx *transaction, next *repository.Snapshot) {
 		d.indexEdits = nil
 		return
 	}
+	rebased := next.Generation() != base.Generation()+1
 	var carried map[string]map[string]repository.PendingRows
-	if d.indexEditsCommit == base.Commit && d.indexEditsGen == base.Generation() {
+	if d.indexEditsCommit == base.Commit && d.indexEditsGen == next.Generation()-1 {
 		carried = d.indexEdits
+	}
+	if rebased && carried == nil {
+		return
 	}
 	cache := make(map[string]map[string]repository.PendingRows, len(tx.tables))
 	for name, state := range tx.tables {
 		switch {
 		case tx.dropped[name] || state.schemaDirty:
+		case rebased:
+			// Views this transaction derived for a table it only read
+			// are of its base generation: only carried views are current.
+			if !state.dirty {
+				if carried[name] != nil {
+					cache[name] = carried[name]
+				}
+			} else if views := rebaseIndexViews(carried[name], state.idxEdits); views != nil {
+				cache[name] = views
+			}
 		case state.idxEdits != nil:
 			cache[name] = indexViews(state.idxEdits)
 		case !state.dirty && carried[name] != nil:
@@ -293,6 +335,23 @@ func (d *database) storeIndexEdits(tx *transaction, next *repository.Snapshot) {
 	d.indexEdits = cache
 	d.indexEditsCommit = next.Commit
 	d.indexEditsGen = next.Generation()
+}
+
+// rebaseIndexViews returns current's index edits with a rebased
+// transaction's own edits added, or nil if either lacks an index.
+func rebaseIndexViews(current map[string]repository.PendingRows, overlays map[string]*indexOverlay) map[string]repository.PendingRows {
+	if current == nil || overlays == nil || len(current) != len(overlays) {
+		return nil
+	}
+	views := make(map[string]repository.PendingRows, len(overlays))
+	for name, overlay := range overlays {
+		view, ok := current[name]
+		if !ok {
+			return nil
+		}
+		views[name] = view.With(overlay.local)
+	}
+	return views
 }
 
 // rememberIndexEdits caches index edits that a clean transaction derived, so
@@ -422,6 +481,7 @@ func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
 			}
 			te.Edits = append(te.Edits, re)
 		}
+		te.Claims = state.uniqueClaims()
 		edits = append(edits, te)
 	}
 	for name := range tx.dropped {
@@ -2302,6 +2362,10 @@ func (s *tableState) ensureIndexEdits(ctx context.Context) error {
 // the pending row overlay: the base row's entry is removed and the overlay
 // row's entry added. Without them, rows from earlier journal transactions are
 // invisible to index lookups and unique checks.
+//
+// Each index's removals come before its additions: a unique value can move
+// from one row to another, and its new row's entry must win whatever the rows'
+// key order (rdb-9afb3c).
 func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk, built map[string][]prolly.Edit) error {
 	var base *prolly.Tree
 	if s.manifest.DataRoot.Valid() {
@@ -2323,6 +2387,7 @@ func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk,
 		return err
 	}
 	sort.Slice(overlay, func(i, j int) bool { return overlay[i].key < overlay[j].key })
+	added := make(map[string][]prolly.Edit, len(indexes))
 	for _, item := range overlay {
 		edit := item.edit
 		pk := []byte(item.key)
@@ -2359,9 +2424,12 @@ func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk,
 				built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: oldKey, Delete: true})
 			}
 			if newKey != nil {
-				built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: newKey, Value: pk})
+				added[idx.Name] = append(added[idx.Name], prolly.Edit{Key: newKey, Value: pk})
 			}
 		}
+	}
+	for name, edits := range added {
+		built[name] = append(built[name], edits...)
 	}
 	return nil
 }

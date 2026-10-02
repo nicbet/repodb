@@ -403,3 +403,18 @@ func TestJournalIndexOverlayLayers(t *testing.T) {
 		t.Fatalf("n = 'p' after reopen: %s", got)
 	}
 }
+
+// A unique value that moves to another row after a checkpoint belongs to its
+// new row when an engine derives index edits from the journal, whatever the
+// rows' key order (rdb-9afb3c).
+func TestJournalDerivedUniqueIndexFollowsMovedValue(t *testing.T) {
+	root, eng := openCheckpointedIndexedTable(t)
+	defer eng.Close()
+	execAll(t, eng, "DELETE FROM t WHERE id = 2", "UPDATE t SET u = 20 WHERE id = 1")
+	fresh := openJournal(t, root)
+	defer fresh.Close()
+	if got := queryIDs(t, fresh, "SELECT id FROM t WHERE u = 20"); got != "[[1]]" {
+		t.Fatalf("u=20 = %s, want [[1]]", got)
+	}
+	expectDuplicate(t, fresh, "INSERT INTO t VALUES (3, 20, 'c')")
+}

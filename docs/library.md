@@ -129,7 +129,7 @@ if err := tx.Commit(ctx); errors.Is(err, repository.ErrConflict) {
 
 **Snapshot isolation.** A transaction reads the snapshot taken at its first table access, plus its own writes.
 
-**Conflicts are repository-wide.** `Commit` returns `repository.ErrConflict` if any other transaction committed after that snapshot, even one that wrote different rows. RepoDB never re-runs your statements, so retry in application code (rdb-df092b tracks narrower conflicts and automatic retry).
+**Conflicts.** `Commit` returns `repository.ErrConflict` if the transaction conflicts with one committed after its snapshot. In journal mode, that means it wrote a row or a `UNIQUE` index value that the other transaction also wrote, or one of them changed the schema of a table the other wrote, or a checkpoint came in between. Transactions that wrote different rows both commit. In native-git mode, any commit after the snapshot conflicts. Reads are not checked, so two transactions can each read a condition and write different rows (write skew); see [sql.md](sql.md#transactions). RepoDB never re-runs your statements, so retry in application code (rdb-df092b tracks automatic retry).
 
 A failed statement undoes only its own changes and leaves the transaction open. DDL commits implicitly, as in MySQL.
 

@@ -132,7 +132,7 @@ func TestJournalRejectsStaleWriterAndIgnoresIncompleteTail(t *testing.T) {
 	if err := ta.Exec(ctx, "INSERT INTO issues VALUES (1, 'winner')"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tb.Exec(ctx, "INSERT INTO issues VALUES (2, 'stale')"); err != nil {
+	if err := tb.Exec(ctx, "INSERT INTO issues VALUES (1, 'stale')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := ta.Commit(ctx); err != nil {
@@ -303,7 +303,7 @@ func TestSeparateJournalEnginesObserveProgressAndRejectStaleWriter(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := stale.Exec(ctx, "INSERT INTO shared_rows VALUES (2, 'stale')"); err != nil {
+	if err := stale.Exec(ctx, "INSERT INTO shared_rows VALUES (1, 'stale')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := sa.Exec(ctx, "INSERT INTO shared_rows VALUES (1, 'winner')"); err != nil {
@@ -681,7 +681,7 @@ func TestRejectedCommitStartsFreshTransaction(t *testing.T) {
 			if err := s1.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
 				t.Fatal(err)
 			}
-			for _, statement := range []string{"START TRANSACTION", "INSERT INTO t VALUES (2)"} {
+			for _, statement := range []string{"START TRANSACTION", "INSERT INTO t VALUES (1)"} {
 				if err := s2.Exec(ctx, statement); err != nil {
 					t.Fatal(err)
 				}

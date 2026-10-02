@@ -38,6 +38,12 @@ func (p PendingRows) Len() int {
 // for equal keys; among edits, the last one for a key wins. p is unchanged.
 // With takes ownership of the edits' key and value bytes.
 func (p PendingRows) With(edits []TypedRowEdit) PendingRows {
+	return p.with(edits, 0)
+}
+
+// with is With, recording generation as the journal generation that wrote
+// each of the edits.
+func (p PendingRows) with(edits []TypedRowEdit, generation uint64) PendingRows {
 	if len(edits) == 0 {
 		return p
 	}
@@ -59,7 +65,9 @@ func (p PendingRows) With(edits []TypedRowEdit) PendingRows {
 		if i+1 < len(order) && bytes.Equal(edits[pos].Key, edits[order[i+1]].Key) {
 			continue // a later edit of the same key wins
 		}
-		unique = append(unique, edits[pos])
+		edit := edits[pos]
+		edit.generation = generation
+		unique = append(unique, edit)
 	}
 	runs := make([]pendingRun, 0, len(p.runs)+1)
 	runs = append(runs, unique[:len(unique):len(unique)])

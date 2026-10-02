@@ -147,12 +147,24 @@ type TypedTableEdit struct {
 	Schema []byte         `json:"schema,omitempty"`
 	Drop   bool           `json:"drop,omitempty"`
 	Edits  []TypedRowEdit `json:"edits,omitempty"`
+	// Claims are the unique-index keys the transaction added. A concurrent
+	// transaction that claimed the same key conflicts, even on another row.
+	Claims []IndexClaim `json:"claims,omitempty"`
 }
 
 type TypedRowEdit struct {
 	Key    []byte `json:"key"`
 	Value  []byte `json:"value,omitempty"`
 	Delete bool   `json:"delete,omitempty"`
+	// generation is the journal generation that wrote the edit, set for
+	// pending journal edits (see writeLog). It is not journaled.
+	generation uint64
+}
+
+// IndexClaim is a key added to a unique secondary index.
+type IndexClaim struct {
+	Index string `json:"index"`
+	Key   []byte `json:"key"`
 }
 
 type workingView struct {
@@ -161,6 +173,9 @@ type workingView struct {
 	dirty        bool
 	baseCommit   string
 	pendingEdits map[string]*pendingTableEdits
+	// writes records which generations wrote what since the base commit, for
+	// conflict detection. Nil until the first typed commit on this base.
+	writes *writeLog
 }
 
 type pendingTableEdits struct {
@@ -481,6 +496,10 @@ func (w *WorkingState) Commit(ctx context.Context, writer *Writer, manifest Mani
 // CommitTypedEdits durably appends typed row/schema edits to the journal. A
 // save records only encoded keys and values (about 200 bytes per row), not
 // Prolly chunks; trees are built at checkpoint.
+//
+// edits are the transaction's own writes. If other transactions committed
+// since base, they are applied on top of those when the writes are disjoint
+// (see writeConflict); otherwise CommitTypedEdits returns ErrConflict.
 func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edits []TypedTableEdit) (*Snapshot, string, error) {
 	if base == nil {
 		return nil, "", errors.New("typed-edit base snapshot is required")
@@ -494,8 +513,11 @@ func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edi
 	if err != nil {
 		return nil, "", err
 	}
-	if base.Generation() != view.generation || base.Commit != view.snapshot.Commit {
+	if base.Commit != view.snapshot.Commit {
 		return nil, "", ErrConflict
+	}
+	if err := view.writeConflict(base.Generation(), edits); err != nil {
+		return nil, "", err
 	}
 	generation := view.generation + 1
 	txid, err := newTransactionID(generation)
@@ -528,8 +550,9 @@ func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edi
 		return nil, txid, &WorkingCommitError{Outcome: OutcomeUnknown, TransactionID: txid, Err: err}
 	}
 	snapshot, newPending := applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, edits, generation)
+	writes := view.writes.recorded(edits, generation)
 	if info, statErr := os.Stat(w.JournalPath()); statErr == nil {
-		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit, pendingEdits: newPending}, info: info, offset: info.Size(), first: w.firstHeaderAfterAppend()}
+		w.cache = &workingCache{view: workingView{snapshot: snapshot, generation: generation, dirty: true, baseCommit: view.baseCommit, pendingEdits: newPending, writes: writes}, info: info, offset: info.Size(), first: w.firstHeaderAfterAppend()}
 	}
 	if w.fault != nil {
 		if err := w.fault(AfterJournalFlush); err != nil {
@@ -575,7 +598,7 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 			existing.SchemaRoot = schemaHash
 			manifest.Tables[te.Table] = existing
 		}
-		entry.rows = entry.rows.With(te.Edits)
+		entry.rows = entry.rows.with(te.Edits, generation)
 	}
 	objectSet := make(map[storage.Hash]struct{})
 	for hash := range base.objectSet {
@@ -981,6 +1004,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 		for _, prepare := range deferred {
 			if prepare.Kind == "typed-prepare" {
 				view.snapshot, view.pendingEdits = applyTypedEditsToSnapshot(view.snapshot, view.pendingEdits, prepare.TypedEdits, prepare.Generation)
+				view.writes = view.writes.recorded(prepare.TypedEdits, prepare.Generation)
 				continue
 			}
 			available := make(map[storage.Hash]struct{}, len(prepare.Manifest.Objects))
@@ -988,7 +1012,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				available[hash] = struct{}{}
 			}
 			view.snapshot = workingSnapshot(view.snapshot, *prepare.Manifest, available, prepare.Objects, prepare.Generation)
-			view.pendingEdits = nil
+			view.pendingEdits, view.writes = nil, nil
 		}
 		deferred = nil
 		return nil
@@ -1031,7 +1055,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 					return workingView{}, fmt.Errorf("%w: transaction base changed while dirty", ErrWorkingCorrupt)
 				}
 				view.baseCommit, baseLoaded = prepare.BaseCommit, false
-				view.pendingEdits = nil
+				view.pendingEdits, view.writes = nil, nil
 				deferred = nil
 			}
 			if prepare.Kind == "prepare" {
@@ -1055,7 +1079,7 @@ func (w *WorkingState) load(ctx context.Context) (workingView, error) {
 				return workingView{}, fmt.Errorf("%w: checkpoint generation differs", ErrWorkingCorrupt)
 			}
 			view.baseCommit, view.dirty, baseLoaded = record.GitCommit, false, false
-			view.pendingEdits = nil
+			view.pendingEdits, view.writes = nil, nil
 			deferred = nil
 			safeOffset = frame.end
 		default:
@@ -1107,6 +1131,7 @@ func (w *WorkingState) reconcileHead(ctx context.Context, view workingView, head
 	}
 	current.generation = view.generation
 	view.snapshot, view.baseCommit, view.dirty = current, head, false
+	view.writes = nil
 	return view, nil
 }
 

@@ -1228,7 +1228,7 @@ func TestStaleEmbeddedTransactionIsRejected(t *testing.T) {
 	if err := ta.Exec(ctx, "INSERT INTO issues VALUES (1, 'winner')"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tb.Exec(ctx, "INSERT INTO issues VALUES (2, 'stale')"); err != nil {
+	if err := tb.Exec(ctx, "INSERT INTO issues VALUES (1, 'stale')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := ta.Commit(ctx); err != nil {
