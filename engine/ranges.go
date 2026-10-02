@@ -268,6 +268,40 @@ func (c *keyCursor) advance() error {
 	return nil
 }
 
+// pendingCursor walks a PendingRows interval. After advance, edit holds the
+// edit for the key just passed.
+type pendingCursor struct {
+	it   *repository.PendingIter
+	next repository.TypedRowEdit
+	key  string
+	ok   bool
+	edit repository.TypedRowEdit
+}
+
+func newPendingCursor(edits repository.PendingRows, iv keyInterval) *pendingCursor {
+	c := &pendingCursor{}
+	if !edits.Empty() {
+		c.it = edits.Iter(iv.start, iv.end)
+		c.load()
+	}
+	return c
+}
+
+func (c *pendingCursor) load() {
+	c.next, c.ok = c.it.Next()
+	if c.ok {
+		c.key = string(c.next.Key)
+	}
+}
+
+func (c *pendingCursor) peek() (string, bool) { return c.key, c.ok }
+
+func (c *pendingCursor) advance() error {
+	c.edit = c.next
+	c.load()
+	return nil
+}
+
 // rowOverlayCursor merges a transaction's own row edits with the journal's
 // pending edits in key order; the transaction's edit wins for equal keys.
 // After advance, edit holds the edit for the key just passed.
@@ -506,16 +540,17 @@ type indexRowIter struct {
 	intervals  []keyInterval
 	next       int
 	cur        *mergedEntries
-	overlay    map[string]prolly.Edit
+	overlay    repository.PendingRows
+	cursor     *pendingCursor
 }
 
 func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, intervals []keyInterval, projection *rowProjection) (*indexRowIter, error) {
 	if err := state.ensureIndexEdits(ctx); err != nil {
 		return nil, err
 	}
-	overlay := make(map[string]prolly.Edit)
-	for _, edit := range state.idxEdits[def.Name] {
-		overlay[string(edit.Key)] = edit // last edit per key wins
+	var overlay repository.PendingRows
+	if edits := state.idxEdits[def.Name]; edits != nil {
+		overlay = edits.view()
 	}
 	return &indexRowIter{state: state, projection: projection, def: def, intervals: intervals, overlay: overlay}, nil
 }
@@ -528,13 +563,14 @@ func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 			iv := it.intervals[it.next]
 			it.next++
-			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.Indexes[it.def.Name], iv, &keyCursor{keys: sortedOverlayKeys(it.overlay, iv)})
+			it.cursor = newPendingCursor(it.overlay, iv)
+			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.Indexes[it.def.Name], iv, it.cursor)
 			if err != nil {
 				return nil, err
 			}
 			it.cur = cur
 		}
-		key, pk, fromOverlay, ok, err := it.cur.next()
+		_, pk, fromOverlay, ok, err := it.cur.next()
 		if err != nil {
 			return nil, err
 		}
@@ -546,11 +582,10 @@ func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			continue
 		}
 		if fromOverlay {
-			edit := it.overlay[key]
-			if edit.Delete {
+			if it.cursor.edit.Delete {
 				continue
 			}
-			pk = edit.Value
+			pk = it.cursor.edit.Value
 		}
 		performanceCounters.pointKeysVisited.Add(1)
 		row, exists, err := it.state.lookupRow(ctx, string(pk))

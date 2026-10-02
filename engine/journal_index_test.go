@@ -330,3 +330,76 @@ func runIndexModel(t *testing.T, engineCount int) {
 		}
 	}
 }
+
+// Index edits are layered: the journal's pending edits (shared) under the
+// transaction's own. Unique checks, scans and statement rollback must see
+// through both layers.
+func TestJournalIndexOverlayLayers(t *testing.T) {
+	ctx := context.Background()
+	_, eng := openCheckpointedIndexedTable(t)
+	// Pending, uncheckpointed rows: their index entries live only in the
+	// shared journal overlay.
+	execAll(t, eng,
+		"INSERT INTO t VALUES (3, 30, 'p'), (4, 40, 'p')",
+		"UPDATE t SET n = 'q' WHERE id = 1",
+	)
+	expectDuplicate(t, eng, "INSERT INTO t VALUES (5, 30, 'x')")
+
+	session, _ := eng.NewSession()
+	defer session.Close()
+	tx, err := session.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	ids := func(query string) string {
+		t.Helper()
+		result, err := tx.Query(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprint(result.Rows)
+	}
+	// A failing multi-row statement adds index entries for its first row, then
+	// hits a pending key; rollback of the statement must drop them.
+	if err := tx.Exec(ctx, "INSERT INTO t VALUES (6, 60, 'p'), (7, 40, 'z')"); err == nil {
+		t.Fatal("duplicate of a pending unique key was accepted")
+	}
+	if got := ids("SELECT id FROM t WHERE u = 60"); got != "[]" {
+		t.Fatalf("rolled-back statement left an index entry: %s", got)
+	}
+	if err := tx.Exec(ctx, "INSERT INTO t VALUES (6, 60, 'p')"); err != nil {
+		t.Fatalf("re-insert after statement rollback: %v", err)
+	}
+	// A local delete hides a key that exists only in the pending overlay, and
+	// a local update moves another row into the scanned range.
+	if err := tx.Exec(ctx, "DELETE FROM t WHERE id = 3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Exec(ctx, "UPDATE t SET n = 'p' WHERE id = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ids("SELECT id FROM t WHERE n = 'p' ORDER BY id"); got != "[[2] [4] [6]]" {
+		t.Fatalf("n = 'p' in transaction: %s", got)
+	}
+	if got := ids("SELECT id FROM t WHERE n = 'q'"); got != "[[1]]" {
+		t.Fatalf("n = 'q' in transaction: %s", got)
+	}
+	// The deleted row's unique key is free again inside the transaction.
+	if err := tx.Exec(ctx, "INSERT INTO t VALUES (8, 30, 'r')"); err != nil {
+		t.Fatalf("reuse of a locally deleted unique key: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := queryIDs(t, eng, "SELECT id FROM t WHERE n = 'p' ORDER BY id"); got != "[[2] [4] [6]]" {
+		t.Fatalf("n = 'p' after commit: %s", got)
+	}
+	if got := queryIDs(t, eng, "SELECT id FROM t WHERE u = 30"); got != "[[8]]" {
+		t.Fatalf("u = 30 after commit: %s", got)
+	}
+	// A fresh engine rebuilds the overlay from the journal.
+	if got := queryIDs(t, openJournal(t, eng.Repository().Root), "SELECT id FROM t WHERE n = 'p' ORDER BY id"); got != "[[2] [4] [6]]" {
+		t.Fatalf("n = 'p' after reopen: %s", got)
+	}
+}
