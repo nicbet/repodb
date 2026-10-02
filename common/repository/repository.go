@@ -142,17 +142,18 @@ type Snapshot struct {
 	objectOIDs map[storage.Hash]string
 	cache      *snapshotObjectCache
 
-	pendingEdits map[string]map[string]TypedRowEdit
+	pendingEdits map[string]PendingRows
 }
 
 // Generation identifies the durable working-state version layered over Commit.
 // Native-Git snapshots use generation zero.
 func (s *Snapshot) Generation() uint64 { return s.generation }
 
-// PendingEdits returns accumulated typed row edits since the last checkpoint.
-// The map is keyed by table name; each inner map is keyed by encoded primary
-// key. Returns nil when no typed edits are pending.
-func (s *Snapshot) PendingEdits() map[string]map[string]TypedRowEdit {
+// PendingEdits returns accumulated typed row edits since the last checkpoint,
+// keyed by table name. A table whose schema changed has an entry even without
+// row edits. Returns nil when no typed edits are pending. The returned sets are
+// shared and immutable.
+func (s *Snapshot) PendingEdits() map[string]PendingRows {
 	return s.pendingEdits
 }
 

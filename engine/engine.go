@@ -3,13 +3,11 @@
 package engine
 
 import (
-	"bytes"
 	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -240,7 +238,7 @@ func (e *Engine) Checkpoint(ctx context.Context, message string) (repository.Com
 	return result, err
 }
 
-func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snapshot *repository.Snapshot, pending map[string]map[string]repository.TypedRowEdit) (repository.CommitResult, error) {
+func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snapshot *repository.Snapshot, pending map[string]repository.PendingRows) (repository.CommitResult, error) {
 	base, err := e.repo.SnapshotCommit(ctx, snapshot.Commit)
 	if err != nil {
 		return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
@@ -321,15 +319,19 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 			}
 			reachable[table.SchemaRoot] = struct{}{}
 		}
-		edits := make([]prolly.Edit, 0, len(rowEdits))
-		for _, re := range rowEdits {
+		// PendingRows iterates in key order, as Apply requires.
+		edits := make([]prolly.Edit, 0, rowEdits.Len())
+		for it := rowEdits.Iter(nil, nil); ; {
+			re, ok := it.Next()
+			if !ok {
+				break
+			}
 			item := prolly.Edit{Key: append([]byte(nil), re.Key...), Delete: re.Delete}
 			if !re.Delete {
 				item.Value = append([]byte(nil), re.Value...)
 			}
 			edits = append(edits, item)
 		}
-		sort.Slice(edits, func(i, j int) bool { return bytes.Compare(edits[i].Key, edits[j].Key) < 0 })
 		if table.DataRoot.Valid() {
 			baseTree, err := prolly.Open(base.Store(), table.DataRoot)
 			if err != nil {

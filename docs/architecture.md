@@ -162,7 +162,7 @@ The journal is an append-only file of framed records:
 
 **Commit.** Under `working.lock`, a committing transaction checks that its base (the journal generation and the committed data head) is still current, or fails with `ErrConflict`. It then appends a `typed-prepare` record and a `commit` record, and flushes the journal at the engine's durability level (see [Durability and recovery](#durability-and-recovery)) before returning success. The prepare record carries the transaction's typed edits:
 - per table, a new schema object or a drop;
-- the changed rows as encoded key and value, or delete.
+- the rows this transaction changed, as encoded key and value, or delete. Replay merges records key by key, so a record never repeats earlier transactions' edits.
 
 Each transaction gets the next generation number and a transaction ID of the form `<generation>-<random>`. Git is not touched.
 
@@ -171,7 +171,7 @@ Each transaction gets the next generation number and a transaction ID of the for
 - A bad checksum or out-of-order history in complete frames is corruption (`ErrWorkingCorrupt`).
 - A long-lived engine remembers the verified offset and the file's identity: its inode and its first frame header. It reads only new frames, and falls back to a full replay if the file was replaced or shortened. The header check catches a replacement that reuses the old inode number.
 
-**Pending edits.** Pending row edits are kept as an overlay on the checkpointed trees, and reads merge them in. They become Prolly trees only at checkpoint.
+**Pending edits.** Pending row edits are kept as an overlay on the checkpointed trees, and reads merge them in. They become Prolly trees only at checkpoint. Each table's overlay is a list of immutable sorted runs, newest first: a commit adds its edits as a new run and merges runs of similar size, so snapshots and transactions share the overlay without copying it. Rows in the overlay stay encoded and are decoded when read. A transaction's own edits are layered on top. The cost of a commit or a read therefore doesn't grow with the number of edits since the last checkpoint.
 
 **Checkpoint** (`repodb commit`, `Engine.Checkpoint`), under `working.lock`:
 1. applies the pending edits to the trees;

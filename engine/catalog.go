@@ -46,12 +46,6 @@ type database struct {
 	metadataCacheCommit string
 	metadataCacheGen    uint64
 
-	// decodedEdits caches the decoded pending edits for the current snapshot
-	// so StartTransaction doesn't re-decode them on every autocommit query.
-	decodedEditsGen    uint64
-	decodedEditsCommit string
-	decodedEdits       map[string]map[string]rowEdit
-
 	// indexEdits caches each table's secondary-index edits for the current
 	// snapshot, keyed by table then index. A committing journal transaction
 	// stores its own edits here, so the next transaction need not re-derive
@@ -200,49 +194,12 @@ func (s *session) StartTransaction(ctx *sql.Context, characteristic sql.Transact
 		s.db.metadataCacheGen = snapshot.Generation()
 		s.db.mu.Unlock()
 	}
-	s.db.mu.RLock()
-	editsHit := s.db.decodedEdits != nil && s.db.decodedEditsCommit == snapshot.Commit && s.db.decodedEditsGen == snapshot.Generation()
-	cachedEdits := s.db.decodedEdits
-	s.db.mu.RUnlock()
-	if editsHit {
-		for name, edits := range cachedEdits {
-			if state := tx.tables[name]; state != nil {
-				state.edits = make(map[string]rowEdit, len(edits))
-				for k, v := range edits {
-					state.edits[k] = v
-				}
-			}
+	// Pending journal edits are shared, not copied: a transaction's own edits
+	// go to state.edits, layered over state.pending.
+	for name, rows := range snapshot.PendingEdits() {
+		if state := tx.tables[name]; state != nil {
+			state.pending = rows
 		}
-	} else if pending := snapshot.PendingEdits(); pending != nil {
-		decoded := make(map[string]map[string]rowEdit, len(pending))
-		for name, rowEdits := range pending {
-			state := tx.tables[name]
-			if state == nil {
-				continue
-			}
-			tableEdits := make(map[string]rowEdit, len(rowEdits))
-			for key, re := range rowEdits {
-				if re.Delete {
-					tableEdits[key] = rowEdit{delete: true}
-				} else {
-					row, decErr := decodeRow(state.schema.Schema, re.Value)
-					if decErr != nil {
-						return nil, fmt.Errorf("decode pending edit for table %s: %w", name, decErr)
-					}
-					tableEdits[key] = rowEdit{row: row}
-				}
-			}
-			state.edits = make(map[string]rowEdit, len(tableEdits))
-			for k, v := range tableEdits {
-				state.edits[k] = v
-			}
-			decoded[name] = tableEdits
-		}
-		s.db.mu.Lock()
-		s.db.decodedEdits = decoded
-		s.db.decodedEditsCommit = snapshot.Commit
-		s.db.decodedEditsGen = snapshot.Generation()
-		s.db.mu.Unlock()
 	}
 	s.db.mu.RLock()
 	if s.db.indexEdits != nil && s.db.indexEditsCommit == snapshot.Commit && s.db.indexEditsGen == snapshot.Generation() {
@@ -430,6 +387,8 @@ func (s *session) commitTypedEdits(ctx *sql.Context, tx *transaction) error {
 			}
 			te.Schema = schemaData
 		}
+		// Only this transaction's own edits: replay merges records key by key,
+		// so the pending edits it read are already in the journal.
 		for key, edit := range state.edits {
 			re := repository.TypedRowEdit{Key: []byte(key), Delete: edit.delete}
 			if !edit.delete {
@@ -490,7 +449,7 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 		performanceCounters.tablesRebuilt.Add(1)
 		if state.manifest.DataRoot.Valid() {
 			edits := make([]prolly.Edit, 0, len(state.edits))
-			for key, edit := range state.edits {
+			if err := state.forEachEdit(func(key string, edit rowEdit) error {
 				item := prolly.Edit{Key: []byte(key), Delete: edit.delete}
 				if !edit.delete {
 					value, err := encodeRow(state.schema.Schema, edit.row)
@@ -500,6 +459,9 @@ func (s *session) commitNativeGit(ctx *sql.Context, tx *transaction) error {
 					item.Value = value
 				}
 				edits = append(edits, item)
+				return nil
+			}); err != nil {
+				return err
 			}
 			sort.Slice(edits, func(i, j int) bool { return bytes.Compare(edits[i].Key, edits[j].Key) < 0 })
 			baseTree, err := prolly.Open(tx.writer.BaseSnapshot().Store(), state.manifest.DataRoot)
@@ -719,13 +681,17 @@ func transactionFrom(ctx *sql.Context) (*transaction, error) {
 }
 
 type tableState struct {
-	schema      sql.PrimaryKeySchema
-	checks      []sql.CheckDefinition
-	indexes     []indexDisk
-	idxEdits    map[string][]prolly.Edit
-	rows        map[string]sql.Row
-	manifest    repository.Table
-	store       storage.Store
+	schema   sql.PrimaryKeySchema
+	checks   []sql.CheckDefinition
+	indexes  []indexDisk
+	idxEdits map[string][]prolly.Edit
+	rows     map[string]sql.Row
+	manifest repository.Table
+	store    storage.Store
+	// pending holds the journal's row edits since the last checkpoint. It is
+	// shared between transactions and never modified; values are encoded rows.
+	pending repository.PendingRows
+	// edits holds this transaction's own row edits, which win over pending.
 	edits       map[string]rowEdit
 	dirty       bool
 	schemaDirty bool
@@ -742,13 +708,12 @@ func (s *tableState) ensureRows(ctx context.Context) error {
 	}
 	if !s.manifest.DataRoot.Valid() {
 		s.rows = make(map[string]sql.Row, len(s.edits))
-		for key, edit := range s.edits {
-			if edit.delete {
-				continue
+		return s.forEachEdit(func(key string, edit rowEdit) error {
+			if !edit.delete {
+				s.rows[key] = cloneRow(edit.row)
 			}
-			s.rows[key] = cloneRow(edit.row)
-		}
-		return nil
+			return nil
+		})
 	}
 	tree, err := prolly.Open(s.store, s.manifest.DataRoot)
 	if err != nil {
@@ -771,14 +736,101 @@ func (s *tableState) ensureRows(ctx context.Context) error {
 		}
 		s.rows[string(entry.Key)] = row
 	}
-	for key, edit := range s.edits {
+	return s.forEachEdit(func(key string, edit rowEdit) error {
 		if edit.delete {
 			delete(s.rows, key)
 		} else {
 			s.rows[key] = cloneRow(edit.row)
 		}
+		return nil
+	})
+}
+
+// edit returns the overlay edit for key: the transaction's own, else the
+// pending journal edit.
+func (s *tableState) edit(key string) (rowEdit, bool, error) {
+	if edit, ok := s.edits[key]; ok {
+		return edit, true, nil
+	}
+	if s.pending.Empty() {
+		return rowEdit{}, false, nil
+	}
+	pending, ok := s.pending.Get([]byte(key))
+	if !ok {
+		return rowEdit{}, false, nil
+	}
+	edit, err := s.decodePending(pending)
+	return edit, true, err
+}
+
+func (s *tableState) decodePending(pending repository.TypedRowEdit) (rowEdit, error) {
+	if pending.Delete {
+		return rowEdit{delete: true}, nil
+	}
+	row, err := decodeRow(s.schema.Schema, pending.Value)
+	if err != nil {
+		return rowEdit{}, fmt.Errorf("decode pending edit: %w", err)
+	}
+	return rowEdit{row: row}, nil
+}
+
+// hasEdits reports whether the overlay holds any edit.
+func (s *tableState) hasEdits() bool { return len(s.edits) != 0 || !s.pending.Empty() }
+
+// forEachEdit calls fn once per overlay key with the winning edit, in no
+// particular order.
+func (s *tableState) forEachEdit(fn func(key string, edit rowEdit) error) error {
+	if !s.pending.Empty() {
+		it := s.pending.Iter(nil, nil)
+		for {
+			pending, ok := it.Next()
+			if !ok {
+				break
+			}
+			key := string(pending.Key)
+			if _, local := s.edits[key]; local {
+				continue
+			}
+			edit, err := s.decodePending(pending)
+			if err != nil {
+				return err
+			}
+			if err := fn(key, edit); err != nil {
+				return err
+			}
+		}
+	}
+	for key, edit := range s.edits {
+		if err := fn(key, edit); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// overlayDeletes returns the overlay's deletes, for DDL that re-keys a table.
+// Rows are not decoded, so it is safe while the schema is being changed.
+func (s *tableState) overlayDeletes() map[string]rowEdit {
+	deletes := make(map[string]rowEdit)
+	if !s.pending.Empty() {
+		for it := s.pending.Iter(nil, nil); ; {
+			pending, ok := it.Next()
+			if !ok {
+				break
+			}
+			if pending.Delete {
+				deletes[string(pending.Key)] = rowEdit{delete: true}
+			}
+		}
+	}
+	for key, edit := range s.edits {
+		if edit.delete {
+			deletes[key] = edit
+		} else {
+			delete(deletes, key)
+		}
+	}
+	return deletes
 }
 
 func (s *tableState) lookupRow(ctx context.Context, key string) (sql.Row, bool, error) {
@@ -786,8 +838,8 @@ func (s *tableState) lookupRow(ctx context.Context, key string) (sql.Row, bool, 
 		row, ok := s.rows[key]
 		return cloneRow(row), ok, nil
 	}
-	if edit, ok := s.edits[key]; ok {
-		return cloneRow(edit.row), !edit.delete, nil
+	if edit, ok, err := s.edit(key); err != nil || ok {
+		return cloneRow(edit.row), ok && !edit.delete, err
 	}
 	if !s.manifest.DataRoot.Valid() {
 		return nil, false, nil
@@ -1128,6 +1180,7 @@ func (t *table) AddColumn(ctx *sql.Context, column *sql.Column, order *sql.Colum
 	}
 	t.state.idxEdits = nil
 	t.state.rows = newRows
+	t.state.pending = repository.PendingRows{}
 	t.state.edits = make(map[string]rowEdit)
 	for key, row := range newRows {
 		t.state.edits[key] = rowEdit{row: cloneRow(row)}
@@ -1138,6 +1191,8 @@ func (t *table) AddColumn(ctx *sql.Context, column *sql.Column, order *sql.Colum
 	return nil
 }
 
+// rekeyRows re-keys rows under schema. Only the delete edits of oldEdits are
+// used: they are carried over.
 func rekeyRows(schema sql.PrimaryKeySchema, oldRows map[string]sql.Row, oldEdits map[string]rowEdit) (map[string]sql.Row, map[string]rowEdit, error) {
 	newRows := make(map[string]sql.Row, len(oldRows))
 	for _, row := range oldRows {
@@ -1238,7 +1293,8 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 	}
 	candidateSchema := sql.PrimaryKeySchema{Schema: newSchema, PkOrdinals: newPK}
 	if isPKColumn {
-		reKeyedRows, reKeyedEdits, err := rekeyRows(candidateSchema, candidateRows, t.state.edits)
+		overlay := t.state.overlayDeletes()
+		reKeyedRows, reKeyedEdits, err := rekeyRows(candidateSchema, candidateRows, overlay)
 		if err != nil {
 			return err
 		}
@@ -1251,6 +1307,7 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 			}
 		}
 		t.state.rows = reKeyedRows
+		t.state.pending = repository.PendingRows{}
 		t.state.edits = reKeyedEdits
 		t.state.idxEdits = nil
 		t.state.manifest.Indexes = nil
@@ -1265,6 +1322,7 @@ func (t *table) DropColumn(ctx *sql.Context, columnName string) error {
 		}
 		t.state.idxEdits = nil
 		t.state.rows = candidateRows
+		t.state.pending = repository.PendingRows{}
 		t.state.edits = make(map[string]rowEdit)
 		for key, row := range candidateRows {
 			t.state.edits[key] = rowEdit{row: cloneRow(row)}
@@ -1380,7 +1438,8 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 				}
 				candidateRows[key] = r
 			}
-			if _, _, err := rekeyRows(candidateSchema, candidateRows, t.state.edits); err != nil {
+			overlay := t.state.overlayDeletes()
+			if _, _, err := rekeyRows(candidateSchema, candidateRows, overlay); err != nil {
 				return err
 			}
 		}
@@ -1466,15 +1525,18 @@ func (t *table) ModifyColumn(ctx *sql.Context, columnName string, column *sql.Co
 		}
 	}
 	if isPKColumn && typeChanged {
-		reKeyedRows, reKeyedEdits, err := rekeyRows(t.state.schema, t.state.rows, t.state.edits)
+		overlay := t.state.overlayDeletes()
+		reKeyedRows, reKeyedEdits, err := rekeyRows(t.state.schema, t.state.rows, overlay)
 		if err != nil {
 			return err
 		}
 		t.state.rows = reKeyedRows
+		t.state.pending = repository.PendingRows{}
 		t.state.edits = reKeyedEdits
 		t.state.idxEdits = nil
 		t.state.manifest.Indexes = nil
 	} else {
+		t.state.pending = repository.PendingRows{}
 		t.state.edits = make(map[string]rowEdit)
 		for key, row := range t.state.rows {
 			t.state.edits[key] = rowEdit{row: cloneRow(row)}
@@ -2125,7 +2187,7 @@ func (s *tableState) ensureIndexEdits(ctx context.Context) error {
 		}
 	}
 	built := make(map[string][]prolly.Edit)
-	if len(persisted) > 0 && len(s.edits) > 0 {
+	if len(persisted) > 0 && s.hasEdits() {
 		if err := s.overlayIndexEdits(ctx, persisted, built); err != nil {
 			return err
 		}
@@ -2162,14 +2224,21 @@ func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk,
 		}
 		base = tree
 	}
-	keys := make([]string, 0, len(s.edits))
-	for key := range s.edits {
-		keys = append(keys, key)
+	type keyedEdit struct {
+		key  string
+		edit rowEdit
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		edit := s.edits[key]
-		pk := []byte(key)
+	var overlay []keyedEdit
+	if err := s.forEachEdit(func(key string, edit rowEdit) error {
+		overlay = append(overlay, keyedEdit{key, edit})
+		return nil
+	}); err != nil {
+		return err
+	}
+	sort.Slice(overlay, func(i, j int) bool { return overlay[i].key < overlay[j].key })
+	for _, item := range overlay {
+		edit := item.edit
+		pk := []byte(item.key)
 		var baseRow sql.Row
 		if base != nil {
 			value, err := base.Get(ctx, pk)

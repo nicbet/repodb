@@ -165,8 +165,7 @@ type workingView struct {
 
 type pendingTableEdits struct {
 	schemaData []byte
-	dropped    bool
-	rows       map[string]TypedRowEdit
+	rows       PendingRows
 }
 
 type journalFrame struct {
@@ -541,13 +540,11 @@ func (w *WorkingState) CommitTypedEdits(ctx context.Context, base *Snapshot, edi
 }
 
 func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTableEdits, edits []TypedTableEdit, generation uint64) (*Snapshot, map[string]*pendingTableEdits) {
+	// Table entries are copied, not mutated: earlier views and snapshots share
+	// them. PendingRows.With leaves the existing rows untouched.
 	pending := make(map[string]*pendingTableEdits, len(existing)+len(edits))
 	for name, te := range existing {
-		rows := make(map[string]TypedRowEdit, len(te.rows))
-		for k, v := range te.rows {
-			rows[k] = v
-		}
-		pending[name] = &pendingTableEdits{schemaData: te.schemaData, dropped: te.dropped, rows: rows}
+		pending[name] = te
 	}
 	manifest := Manifest{FormatVersion: base.Manifest.FormatVersion, DefaultDatabase: base.Manifest.DefaultDatabase, Tables: make(map[string]Table, len(base.Manifest.Tables))}
 	for name, table := range base.Manifest.Tables {
@@ -563,11 +560,11 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 			delete(pending, te.Table)
 			continue
 		}
-		entry := pending[te.Table]
-		if entry == nil {
-			entry = &pendingTableEdits{rows: make(map[string]TypedRowEdit)}
-			pending[te.Table] = entry
+		entry := &pendingTableEdits{}
+		if previous := pending[te.Table]; previous != nil {
+			*entry = *previous
 		}
+		pending[te.Table] = entry
 		if len(te.Schema) > 0 {
 			entry.schemaData = te.Schema
 			schemaHash := storage.Sum(te.Schema)
@@ -578,9 +575,7 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 			existing.SchemaRoot = schemaHash
 			manifest.Tables[te.Table] = existing
 		}
-		for _, re := range te.Edits {
-			entry.rows[string(re.Key)] = re
-		}
+		entry.rows = entry.rows.With(te.Edits)
 	}
 	objectSet := make(map[storage.Hash]struct{})
 	for hash := range base.objectSet {
@@ -596,14 +591,10 @@ func applyTypedEditsToSnapshot(base *Snapshot, existing map[string]*pendingTable
 		objects = append(objects, hash)
 	}
 	manifest.Objects = objects
-	snapshotEdits := make(map[string]map[string]TypedRowEdit, len(pending))
+	snapshotEdits := make(map[string]PendingRows, len(pending))
 	for name, te := range pending {
-		if len(te.rows) > 0 || te.schemaData != nil {
-			rows := make(map[string]TypedRowEdit, len(te.rows))
-			for k, v := range te.rows {
-				rows[k] = v
-			}
-			snapshotEdits[name] = rows
+		if !te.rows.Empty() || te.schemaData != nil {
+			snapshotEdits[name] = te.rows
 		}
 	}
 	return &Snapshot{repo: base.repo, Commit: base.Commit, generation: generation, Manifest: manifest, objectSet: objectSet, objectOIDs: base.objectOIDs, cache: cache, pendingEdits: snapshotEdits}, pending
@@ -692,7 +683,7 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 	// trees from them. Publishing the snapshot objects alone and marking the
 	// journal clean would discard those rows.
 	for _, rows := range view.snapshot.PendingEdits() {
-		if len(rows) > 0 {
+		if !rows.Empty() {
 			return CommitResult{Outcome: OutcomeRejected}, ErrPendingRowEdits
 		}
 	}
@@ -803,22 +794,7 @@ func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, w
 }
 
 func hasPendingRows(edits *pendingTableEdits) bool {
-	return edits != nil && len(edits.rows) > 0
-}
-
-// PendingEdits returns the accumulated typed edits from the current working
-// state, if any. Must be called under the working state's process lock.
-func (w *WorkingState) PendingTableEdits(ctx context.Context) (map[string]*pendingTableEdits, error) {
-	release, err := w.lock(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	view, err := w.load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return view.pendingEdits, nil
+	return edits != nil && !edits.rows.Empty()
 }
 
 func takeWorkingWriter(w *Writer, manifest Manifest) (Manifest, map[storage.Hash]struct{}, map[storage.Hash][]byte, error) {

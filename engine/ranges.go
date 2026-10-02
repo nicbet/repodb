@@ -11,6 +11,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/nicbet/repodb/common/prolly"
+	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
 )
 
@@ -242,6 +243,90 @@ func sortedOverlayKeys[V any](overlay map[string]V, iv keyInterval) []string {
 	return keys
 }
 
+// overlayCursor yields the keys of an overlay of pending changes in ascending
+// order.
+type overlayCursor interface {
+	peek() (key string, ok bool)
+	advance() error
+}
+
+// keyCursor walks a sorted key slice.
+type keyCursor struct {
+	keys []string
+	pos  int
+}
+
+func (c *keyCursor) peek() (string, bool) {
+	if c.pos >= len(c.keys) {
+		return "", false
+	}
+	return c.keys[c.pos], true
+}
+
+func (c *keyCursor) advance() error {
+	c.pos++
+	return nil
+}
+
+// rowOverlayCursor merges a transaction's own row edits with the journal's
+// pending edits in key order; the transaction's edit wins for equal keys.
+// After advance, edit holds the edit for the key just passed.
+type rowOverlayCursor struct {
+	state      *tableState
+	local      keyCursor
+	pending    *repository.PendingIter
+	pendingKey string
+	pendingRow repository.TypedRowEdit
+	pendingOK  bool
+	edit       rowEdit
+}
+
+func newRowOverlayCursor(state *tableState, iv keyInterval) *rowOverlayCursor {
+	c := &rowOverlayCursor{state: state, local: keyCursor{keys: sortedOverlayKeys(state.edits, iv)}}
+	if !state.pending.Empty() {
+		c.pending = state.pending.Iter(iv.start, iv.end)
+		c.nextPending()
+	}
+	return c
+}
+
+func (c *rowOverlayCursor) nextPending() {
+	c.pendingRow, c.pendingOK = c.pending.Next()
+	if c.pendingOK {
+		c.pendingKey = string(c.pendingRow.Key)
+	}
+}
+
+func (c *rowOverlayCursor) peek() (string, bool) {
+	local, localOK := c.local.peek()
+	switch {
+	case !c.pendingOK:
+		return local, localOK
+	case !localOK || c.pendingKey < local:
+		return c.pendingKey, true
+	default:
+		return local, true
+	}
+}
+
+func (c *rowOverlayCursor) advance() error {
+	local, localOK := c.local.peek()
+	if localOK && (!c.pendingOK || local <= c.pendingKey) {
+		if c.pendingOK && local == c.pendingKey {
+			c.nextPending()
+		}
+		c.edit = c.state.edits[local]
+		return c.local.advance()
+	}
+	edit, err := c.state.decodePending(c.pendingRow)
+	if err != nil {
+		return err
+	}
+	c.edit = edit
+	c.nextPending()
+	return nil
+}
+
 // mergedEntries walks one interval of a Prolly tree merged with an overlay of
 // pending changes. Overlay entries win over tree entries with the same key.
 type mergedEntries struct {
@@ -249,12 +334,11 @@ type mergedEntries struct {
 	tree     *prolly.Iterator
 	treeNext prolly.Entry
 	treeOK   bool
-	overlay  []string
-	pos      int
+	overlay  overlayCursor
 	end      []byte
 }
 
-func newMergedEntries(ctx context.Context, store storage.Store, root storage.Hash, iv keyInterval, overlay []string) (*mergedEntries, error) {
+func newMergedEntries(ctx context.Context, store storage.Store, root storage.Hash, iv keyInterval, overlay overlayCursor) (*mergedEntries, error) {
 	m := &mergedEntries{ctx: ctx, overlay: overlay, end: iv.end}
 	if root.Valid() {
 		tree, err := prolly.Open(store, root)
@@ -286,13 +370,15 @@ func (m *mergedEntries) advanceTree() error {
 // next returns the next key; fromOverlay reports whether the caller must
 // consult the overlay for it, otherwise value is the tree entry's value.
 func (m *mergedEntries) next() (key string, value []byte, fromOverlay, ok bool, err error) {
-	hasOverlay := m.pos < len(m.overlay)
+	overlayKey, hasOverlay := m.overlay.peek()
 	switch {
 	case !hasOverlay && !m.treeOK:
 		return "", nil, false, false, nil
-	case hasOverlay && (!m.treeOK || m.overlay[m.pos] <= string(m.treeNext.Key)):
-		key = m.overlay[m.pos]
-		m.pos++
+	case hasOverlay && (!m.treeOK || overlayKey <= string(m.treeNext.Key)):
+		key = overlayKey
+		if err := m.overlay.advance(); err != nil {
+			return "", nil, false, false, err
+		}
 		if m.treeOK && key == string(m.treeNext.Key) {
 			if err := m.advanceTree(); err != nil {
 				return "", nil, false, false, err
@@ -321,6 +407,7 @@ type primaryRowIter struct {
 	intervals []keyInterval
 	next      int
 	cur       *mergedEntries
+	overlay   *rowOverlayCursor
 	// When the transaction has materialized every row (state.rows), rows are
 	// served from it; keys holds the matching keys in order.
 	keys []string
@@ -353,7 +440,8 @@ func (it *primaryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 			iv := it.intervals[it.next]
 			it.next++
-			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.DataRoot, iv, sortedOverlayKeys(it.state.edits, iv))
+			it.overlay = newRowOverlayCursor(it.state, iv)
+			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.DataRoot, iv, it.overlay)
 			if err != nil {
 				return nil, err
 			}
@@ -371,7 +459,7 @@ func (it *primaryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			continue
 		}
 		if fromOverlay {
-			edit := it.state.edits[key]
+			edit := it.overlay.edit
 			if edit.delete {
 				continue
 			}
@@ -428,7 +516,7 @@ func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 			iv := it.intervals[it.next]
 			it.next++
-			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.Indexes[it.def.Name], iv, sortedOverlayKeys(it.overlay, iv))
+			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.Indexes[it.def.Name], iv, &keyCursor{keys: sortedOverlayKeys(it.overlay, iv)})
 			if err != nil {
 				return nil, err
 			}
