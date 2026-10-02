@@ -14,7 +14,7 @@ The Makefile sets `GOFLAGS=-tags=gms_pure_go`. When calling `go` directly, pass 
 | `go test -tags gms_pure_go -cover ./...` | statement coverage per package. Add `-coverpkg=./...` to credit code exercised from other packages: `common/repository` and `common/git` are mostly driven by the `engine` and `integration` tests. |
 | `go test -tags gms_pure_go ./engine -run '^$' -fuzz '^FuzzDecodeRow$' -fuzztime 60s` | one fuzz target in fuzzing mode (see [Fuzz targets](#fuzz-targets)) |
 | `go test -tags gms_pure_go ./engine -run '^$' -bench <name> -benchmem` | Go benchmarks (see [Benchmarks](#benchmarks)) |
-| `make bench`, `make bench-external` | the database scorecard ([benchmark.md](benchmark.md)) |
+| `make bench-docker` | the database scorecard, every system in Docker ([benchmark.md](benchmark.md)); `make bench` and `make bench-external` run it on the host for diagnostics |
 
 **Requirements.** Tests need `git` on `PATH`: most packages create real repositories, bare remotes, clones and linked worktrees. The tests use `git init -b`, so Git 2.28 or newer is needed. A few tests install `/bin/sh` hook scripts. No test needs MySQL, Dolt or Docker. The server tests listen on a random loopback port.
 
@@ -108,7 +108,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 
 - **`server`.** A MySQL-protocol round trip with the Go client: exec, query, parameters, `EXPLAIN` as a plan, `DESCRIBE`, and restart. Also commit-outcome errors carried over the wire and recovered with `RecoverCommit`. A write in a read-only transaction returns MySQL error 1792, and the connection keeps working.
 - **`cmd/repodb`.** `init`, then `commit`: journal rows are checkpointed and the journal is clean afterwards. `start` defaults to journal persistence. `sync --commit -m` checkpoints and pushes from a dirty journal; without it, a dirty journal fails with a message naming `--commit -m`. `cmd/repodb-server` checks its persistence default.
-- **`experiments/dbbench`.** The scorecard harness's bookkeeping: rejected-attempt counting, partial reports, percentiles, tolerance of files removed by Git's auto-gc, and fixture repositories that disable automatic Git housekeeping.
+- **`experiments/dbbench`.** The scorecard harness's bookkeeping: rejected-attempt counting, partial reports, percentiles, tolerance of files removed by Git's auto-gc, fixture repositories that disable automatic Git housekeeping, and report metadata passed in from outside a container (revision, working-tree status, runtime).
 
 ## Test infrastructure
 

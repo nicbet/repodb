@@ -156,9 +156,10 @@ git diff --check
 Run the [database scorecard](docs/benchmark.md) ([how results are published](docs/benchmark.md#publishing-results)):
 
 ```sh
-make bench                         # Native Git persistence (default)
-make bench BENCH_MODE=journal      # Journal persistence
-make bench-external                # MySQL 8 or Dolt baseline
+make bench-docker BENCH_MODE=journal     # RepoDB in Docker, like the baselines
+make bench-docker BENCH_MODE=native-git
+make bench-docker BENCH_MODE=external BENCH_SUFFIX=-mysql \
+  BENCH_DSN='root@tcp(repodb-bench-mysql:3306)/'   # MySQL or Dolt baseline
 ```
 
 ## Architecture

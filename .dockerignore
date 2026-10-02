@@ -1,0 +1,5 @@
+.git
+.xpo
+bin
+*.test
+bench-out

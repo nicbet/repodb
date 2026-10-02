@@ -128,3 +128,25 @@ func TestFixturesDisableAutomaticGitHousekeeping(t *testing.T) {
 		}
 	}
 }
+
+// Inside a container there is no checkout: the report records the revision,
+// status and runtime the caller passes, including an explicitly clean status.
+func TestReportRecordsSourceOverrides(t *testing.T) {
+	r := newReport(config{Mode: "journal"}, "/fixtures/x", source{
+		revision: "abc123", revisionSet: true,
+		workingTree: "", workingTreeSet: true,
+		runtime: "docker",
+	})
+	if r.Revision != "abc123" || r.WorkingTree != "" || r.Runtime != "docker" {
+		t.Fatalf("report = revision %q, status %q, runtime %q", r.Revision, r.WorkingTree, r.Runtime)
+	}
+	data, err := json.Marshal(r)
+	if err != nil || !strings.Contains(string(data), `"runtime":"docker"`) || !strings.Contains(string(data), `"working_tree_status":""`) {
+		t.Fatalf("report JSON = %s, %v", data, err)
+	}
+
+	detected := newReport(config{}, "", source{runtime: "host"})
+	if detected.Revision == "" || detected.Runtime != "host" {
+		t.Fatalf("detected report = revision %q, runtime %q", detected.Revision, detected.Runtime)
+	}
+}

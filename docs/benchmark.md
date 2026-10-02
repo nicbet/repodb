@@ -5,34 +5,78 @@ This document describes how RepoDB is benchmarked. It contains no results:
 RepoDB performs today. Earlier results are in that file's Git history
 (`git log -p docs/benchmarks/latest.md`).
 
-`make bench` is the whole-database benchmark entry point. It executes one
-versioned workload suite against the current checkout and prints a consolidated
-table at the end, with raw observations and metadata in `dbbench.json`. It
-defaults to native-Git persistence (`BENCH_MODE=native-git`). Go benchmarks
-(`go test -bench`, listed in [testing.md](testing.md#benchmarks)) are diagnostic
-tools, not the scorecard.
+`dbbench` (`experiments/dbbench`) is the whole-database benchmark. It executes one
+versioned workload suite and prints a consolidated table at the end, with raw
+observations and metadata in a JSON report. Go benchmarks (`go test -bench`,
+listed in [testing.md](testing.md#benchmarks)) are diagnostic tools, not the
+scorecard.
+
+## Setup
+
+Published results compare like with like: **every system runs in a Linux
+container on the same Docker VM.**
+
+- **Where things run.** RepoDB (journal and native Git) runs embedded in the
+  `dbbench` harness, inside a container built from `experiments/dbbench/Dockerfile`
+  (Go toolchain image to build, `debian:trixie-slim` with Debian's `git` to run).
+  MySQL and Dolt run in their own containers. For the external baselines, the
+  harness runs in the same image and reaches them by container name over a
+  user-defined Docker network (`repodb-bench`), so no request crosses the host's
+  port forwarding.
+- **Storage.** RepoDB's fixtures live on a Docker named volume
+  (`repodb-bench-fixtures`); MySQL's and Dolt's data directories are named volumes
+  too. All of them are ext4 inside the VM's disk image.
+- **What a flush means there.** A synchronous write inside Docker Desktop's VM
+  costs about 0.16 ms on the reference Mac. Guest flushes (`fdatasync`, InnoDB's
+  log flush) don't become full flushes of the host SSD's cache, for any of the
+  systems. Results therefore show what each system does on that VM, not how it
+  would behave against power loss on bare hardware.
+- **Durability settings.** Each system runs at its defaults: MySQL with
+  `innodb_flush_log_at_trx_commit=1` and `sync_binlog=1`, Dolt as shipped, and
+  RepoDB's journal at `normal` durability, which on Linux is an `fdatasync` per
+  commit (see [architecture.md](architecture.md#durability-and-recovery)). Git's
+  durability settings are never relaxed.
+- **Resources.** No CPU or memory limits are set on any container. Containers run
+  one at a time: the baselines are stopped while RepoDB runs, and only the
+  baseline under test runs otherwise. Unrelated containers are stopped.
+- **Recorded metadata.** Every report records `runtime` (`docker`), `platform`,
+  Go and Git versions, `revision`, `working_tree_status`, `durability`, `git_gc`,
+  and, for baselines, `server_version`.
+
+`make bench-docker` builds the image, prepares the network and volume, and runs
+one mode. It measures committed code only: with uncommitted changes it stops,
+unless `BENCH_ALLOW_DIRTY=1` is set for a diagnostic run, whose report then
+records the dirty status. Reports are written to `BENCH_OUT` (default
+`./bench-out`).
 
 ```sh
-make bench
-make bench BENCH_MODE=journal
+# RepoDB, both modes
+make bench-docker BENCH_MODE=native-git
+make bench-docker BENCH_MODE=journal
 
-# Quick harness verification; these samples are not performance reference results.
-make bench BENCH_MODE=journal \
-  BENCH_ARGS='-rows 100 -clients 1,4 -requests 2 -output /tmp/journal-smoke.json'
+# Baselines: attach their containers to the network once, then run each alone
+docker network connect repodb-bench repodb-bench-mysql
+docker network connect repodb-bench repodb-bench-dolt
+make bench-docker BENCH_MODE=external BENCH_SUFFIX=-mysql \
+  BENCH_DSN='root@tcp(repodb-bench-mysql:3306)/'
+make bench-docker BENCH_MODE=external BENCH_SUFFIX=-dolt \
+  BENCH_DSN='root@tcp(repodb-bench-dolt:3306)/'
 
-# Choose the filesystem and preserve results from separate, sequential runs.
-make bench BENCH_MODE=native-git \
-  BENCH_ARGS='-temp-dir /Volumes/Work/Projects/repodb -output /tmp/git-scorecard.json'
-make bench BENCH_MODE=journal \
-  BENCH_ARGS='-temp-dir /Volumes/Work/Projects/repodb -output /tmp/journal-scorecard.json'
+# Quick harness check; these samples are not reference results
+make bench-docker BENCH_ALLOW_DIRTY=1 BENCH_MODE=journal \
+  BENCH_ARGS='-rows 100 -clients 1,4 -requests 2'
 ```
+
+`make bench` and `make bench-external` run the same harness directly on the host.
+They are for local profiling and diagnostics only and are never published: on
+macOS, host runs use APFS and different flush primitives, so they don't compare
+with the containerized baselines.
 
 The defaults are 1k/10k/50k rows, 1/4/16 clients, and 30 requests per client for
 each repeated workload. Git publication and sync make a complete run substantially
-longer than a smoke test. The harness creates unique directories, never resets
-an existing repository, and retains fixtures for inspection. Remove the printed
-fixture directory when finished. The MySQL tests require permission to bind a
-loopback TCP port.
+longer than a smoke test. The harness creates unique directories and retains
+fixtures for inspection; `make bench-docker` empties the fixture volume before each
+run. The MySQL-protocol workloads require permission to bind a loopback TCP port.
 
 ## Workload contract (version 1)
 
@@ -116,29 +160,16 @@ is outside repeated SQL request timing. There is no artificial warmup.
 
 ## External baselines
 
-`make bench-external` runs the portable SQL workloads against an external
+`-mode external` runs the portable SQL workloads against an external
 MySQL-compatible server. Git-specific operations (sync, merge, conflict,
 reopen) are skipped; everything else — reads, writes, concurrency, correctness
 checks — uses the same workload code and reporting format.
 
-```sh
-# MySQL (default DSN)
-make bench-external
-
-# Dolt (default sql-server port)
-make bench-external BENCH_DSN='root:@tcp(127.0.0.1:3336)/'
-
-# Quick smoke
-make bench-external BENCH_DSN='root@tcp(127.0.0.1:3306)/' \
-  BENCH_ARGS='-rows 100 -clients 1,4 -requests 2 -output /tmp/mysql-smoke.json'
-```
-
 A fresh database is created per fixture size and dropped on success. The DSN
 follows `go-sql-driver/mysql` format (`user:pass@tcp(host:port)/`). Results are
-directly comparable to the native-git and journal runs on the same machine:
-identical SQL, identical correctness checks, identical reporting. Compare all
-four columns (native-git, journal, MySQL, Dolt) from sequential runs on the
-same hardware, filesystem, and power state.
+directly comparable to the native-git and journal runs in the setup above:
+identical SQL, identical correctness checks, identical reporting. Commands are
+under [Setup](#setup).
 
 ## Explicit coverage limits
 
@@ -159,8 +190,9 @@ numbers. The README performance table quotes it, and nothing else does.
 To publish a new scorecard:
 
 1. **Measure at one clean commit.** Run every mode (native-git, journal, and the
-   MySQL and Dolt baselines) sequentially on the same machine, filesystem, and power
-   state, from the same commit with no local changes. Each JSON report records
+   MySQL and Dolt baselines) with `make bench-docker`, sequentially on the same
+   machine and power state, from the same commit with no local changes (see
+   [Setup](#setup)). Each JSON report records
    `revision` and `working_tree_status`: all revisions must match, and the status must
    be empty.
 2. **Replace latest.md and `docs/benchmarks/latest/*.json` in place.** The previous

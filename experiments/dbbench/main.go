@@ -67,6 +67,7 @@ type report struct {
 	WorkingTree string        `json:"working_tree_status"`
 	Server      string        `json:"server_version,omitempty"`
 	Root        string        `json:"fixture_root"`
+	Runtime     string        `json:"runtime,omitempty"`
 	GitGC       string        `json:"git_gc,omitempty"`
 	Durability  string        `json:"durability,omitempty"`
 	Results     []measurement `json:"results"`
@@ -89,6 +90,9 @@ func main() {
 	requests := flag.Int("requests", 30, "requests per client per repeated workload")
 	output := flag.String("output", "dbbench.json", "complete JSON report")
 	parent := flag.String("temp-dir", "", "parent directory for fresh fixtures (choose benchmark filesystem)")
+	revision := flag.String("revision", "", "source revision to record instead of `git rev-parse HEAD` (bench-docker passes the host's)")
+	workingTree := flag.String("working-tree-status", "", "source `git status --porcelain` to record instead of detecting it (bench-docker passes the host's)")
+	runtimeName := flag.String("runtime", "host", "where the harness runs, recorded in the report: host or docker")
 	verify := flag.String("verify-repo", "", "internal: fresh-process reopen check")
 	verifyRows := flag.Int("verify-rows", 0, "internal: expected recovered row count")
 	verifyValue := flag.String("verify-value", "", "internal: expected recovered last write")
@@ -142,7 +146,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	r := report{Version: 1, Started: time.Now().UTC(), Config: c, Go: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH, Git: commandOutput("git", "--version"), Revision: commandOutput("git", "rev-parse", "HEAD"), WorkingTree: commandOutput("git", "status", "--porcelain"), Root: root}
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	r := newReport(c, root, source{
+		revision:       *revision,
+		revisionSet:    set["revision"],
+		workingTree:    *workingTree,
+		workingTreeSet: set["working-tree-status"],
+		runtime:        *runtimeName,
+	})
 	if *mode == "external" {
 		err = runExternal(&r, *dsn)
 	} else {
@@ -168,6 +180,30 @@ func main() {
 	if err != nil || jsonErr != nil {
 		os.Exit(1)
 	}
+}
+
+// source describes where the measured code came from. Inside a container
+// there is no checkout to ask, so bench-docker passes the host's revision and
+// status.
+type source struct {
+	revision, workingTree       string
+	revisionSet, workingTreeSet bool
+	runtime                     string
+}
+
+func newReport(c config, root string, src source) report {
+	r := report{Version: 1, Started: time.Now().UTC(), Config: c, Go: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH, Git: commandOutput("git", "--version"), Root: root, Runtime: src.runtime}
+	if src.revisionSet {
+		r.Revision = src.revision
+	} else {
+		r.Revision = commandOutput("git", "rev-parse", "HEAD")
+	}
+	if src.workingTreeSet {
+		r.WorkingTree = src.workingTree
+	} else {
+		r.WorkingTree = commandOutput("git", "status", "--porcelain")
+	}
+	return r
 }
 
 func integers(s string) []int {

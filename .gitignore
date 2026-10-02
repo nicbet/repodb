@@ -8,3 +8,5 @@ dbbench.json
 .xpo/git.lock
 .xpo/worktrees/
 /.xpo/events.lock
+/bench-out/
+/dbbench
