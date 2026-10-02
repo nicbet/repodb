@@ -2414,17 +2414,6 @@ func loadTableMetadata(ctx context.Context, store storage.Store, manifest reposi
 	return &tableState{schema: schema, checks: checks, indexes: indexes, manifest: manifest, store: store}, nil
 }
 
-func loadTable(ctx context.Context, store storage.Store, manifest repository.Table) (*tableState, error) {
-	state, err := loadTableMetadata(ctx, store, manifest)
-	if err != nil {
-		return nil, err
-	}
-	if err := state.ensureRows(ctx); err != nil {
-		return nil, err
-	}
-	return state, nil
-}
-
 func contains(values []int, value int) bool {
 	for _, v := range values {
 		if v == value {

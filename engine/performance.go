@@ -16,6 +16,9 @@ type PerformanceCounters struct {
 	SnapshotBuildNanos  uint64
 	MetadataCacheHits   uint64
 	MetadataCacheMisses uint64
+	// TablesValidated counts tables fully validated (rows decoded and trees
+	// walked) by ValidateSnapshot; cache hits do not count.
+	TablesValidated uint64
 }
 
 var performanceCounters struct {
@@ -30,6 +33,7 @@ var performanceCounters struct {
 	snapshotBuildNanos  atomic.Uint64
 	metadataCacheHits   atomic.Uint64
 	metadataCacheMisses atomic.Uint64
+	tablesValidated     atomic.Uint64
 }
 
 func ResetPerformanceCounters() {
@@ -44,6 +48,7 @@ func ResetPerformanceCounters() {
 	performanceCounters.snapshotBuildNanos.Store(0)
 	performanceCounters.metadataCacheHits.Store(0)
 	performanceCounters.metadataCacheMisses.Store(0)
+	performanceCounters.tablesValidated.Store(0)
 }
 
 func ReadPerformanceCounters() PerformanceCounters {
@@ -59,5 +64,6 @@ func ReadPerformanceCounters() PerformanceCounters {
 		SnapshotBuildNanos:  performanceCounters.snapshotBuildNanos.Load(),
 		MetadataCacheHits:   performanceCounters.metadataCacheHits.Load(),
 		MetadataCacheMisses: performanceCounters.metadataCacheMisses.Load(),
+		TablesValidated:     performanceCounters.tablesValidated.Load(),
 	}
 }

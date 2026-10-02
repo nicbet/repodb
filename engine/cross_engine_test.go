@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"testing"
 
@@ -116,5 +117,59 @@ func TestHeadObservesExternalRefUpdate(t *testing.T) {
 	}
 	if got, err := repo.Head(ctx); err != nil || got != second {
 		t.Fatalf("head after packed update-ref = %q, want %q (%v)", got, second, err)
+	}
+}
+
+// A journal commit by another engine keeps the base commit and tree roots, so
+// the reader must not re-validate (decode and walk) unchanged tables; a DDL
+// re-validates only the table it changed.
+func TestOtherEngineCommitSkipsValidationOfUnchangedTables(t *testing.T) {
+	ctx := context.Background()
+	root := gitRepository(t)
+	if _, err := repository.Init(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	open := func() *engine.Engine {
+		eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return eng
+	}
+	writer := open()
+	defer writer.Close()
+	execAll(t, writer,
+		"CREATE TABLE a (id BIGINT PRIMARY KEY, v VARCHAR(20))",
+		"CREATE TABLE b (id BIGINT PRIMARY KEY, v VARCHAR(20))",
+		"INSERT INTO a VALUES (1, 'a'), (2, 'b')",
+		"INSERT INTO b VALUES (1, 'x'), (2, 'y')",
+	)
+	if _, err := writer.Checkpoint(ctx, "persisted trees"); err != nil {
+		t.Fatal(err)
+	}
+	reader := open()
+	defer reader.Close()
+	if got := queryIDs(t, reader, "SELECT id FROM b ORDER BY id"); got != "[[1] [2]]" {
+		t.Fatalf("initial read = %s", got)
+	}
+
+	engine.ResetPerformanceCounters()
+	for i := 3; i < 8; i++ {
+		execAll(t, writer, fmt.Sprintf("INSERT INTO a VALUES (%d, 'w')", i))
+		if got := queryIDs(t, reader, "SELECT COUNT(*) FROM a"); got != fmt.Sprintf("[[%d]]", i) {
+			t.Fatalf("read after write %d = %s", i, got)
+		}
+	}
+	if got := engine.ReadPerformanceCounters().TablesValidated; got != 0 {
+		t.Fatalf("tables validated after other engine's journal commits = %d, want 0", got)
+	}
+
+	execAll(t, writer, "CREATE INDEX a_v ON a (v)")
+	engine.ResetPerformanceCounters()
+	if got := queryIDs(t, reader, "SELECT id FROM b ORDER BY id"); got != "[[1] [2]]" {
+		t.Fatalf("read after DDL = %s", got)
+	}
+	if got := engine.ReadPerformanceCounters().TablesValidated; got != 1 {
+		t.Fatalf("tables validated after DDL on one table = %d, want 1", got)
 	}
 }

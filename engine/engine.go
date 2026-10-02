@@ -3,11 +3,13 @@
 package engine
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,19 +25,65 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const snapshotValidationVersion = 3
+const snapshotValidationVersion = 4
 
-var validatedSnapshots = struct {
+// validatedTables caches table validation by content: repository, base
+// commit, and the table's schema, data and index roots. Journal generations
+// keep their base commit and roots (pending edits are not validated), so a
+// new generation re-validates only the tables whose roots changed.
+var validatedTables = struct {
 	sync.Mutex
 	entries map[string]*list.Element
 	order   *list.List
 }{entries: make(map[string]*list.Element), order: list.New()}
 
-const maxValidatedSnapshots = 128
+const maxValidatedTables = 1024
 
 type validationCacheEntry struct {
-	key          string
-	tableObjects map[string][]storage.Hash
+	key     string
+	objects []storage.Hash
+}
+
+// tableValidationKey keeps the base commit so objects present only in one
+// snapshot's store (for example a journal) never vouch for another commit.
+func tableValidationKey(snapshot *repository.Snapshot, table repository.Table) string {
+	var key strings.Builder
+	fmt.Fprintf(&key, "%s\x00%s\x00%d\x00%s\x00%s", snapshot.RepositoryIdentity(), snapshot.Commit, snapshotValidationVersion, table.SchemaRoot, table.DataRoot)
+	names := make([]string, 0, len(table.Indexes))
+	for name := range table.Indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(&key, "\x00%s=%s", name, table.Indexes[name])
+	}
+	return key.String()
+}
+
+func lookupValidatedTable(key string) ([]storage.Hash, bool) {
+	validatedTables.Lock()
+	defer validatedTables.Unlock()
+	element := validatedTables.entries[key]
+	if element == nil {
+		return nil, false
+	}
+	validatedTables.order.MoveToFront(element)
+	return element.Value.(validationCacheEntry).objects, true
+}
+
+func rememberValidatedTable(key string, objects []storage.Hash) {
+	validatedTables.Lock()
+	defer validatedTables.Unlock()
+	if element := validatedTables.entries[key]; element != nil {
+		validatedTables.order.MoveToFront(element)
+		return
+	}
+	validatedTables.entries[key] = validatedTables.order.PushFront(validationCacheEntry{key: key, objects: objects})
+	if validatedTables.order.Len() > maxValidatedTables {
+		oldest := validatedTables.order.Back()
+		delete(validatedTables.entries, oldest.Value.(validationCacheEntry).key)
+		validatedTables.order.Remove(oldest)
+	}
 }
 
 type Engine struct {
@@ -139,70 +187,94 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 
 // ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
 // and primary-key encoding before integration publishes a fetched snapshot.
+// Tables already validated with the same roots and base commit are skipped.
 func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error {
 	if snapshot == nil {
 		return errors.New("snapshot is required")
 	}
-	key := fmt.Sprintf("%s\x00%s\x00%d\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshot.Generation(), snapshotValidationVersion)
-	validatedSnapshots.Lock()
-	if element := validatedSnapshots.entries[key]; element != nil {
-		validatedSnapshots.order.MoveToFront(element)
-		validatedSnapshots.Unlock()
-		return nil
-	}
-	validatedSnapshots.Unlock()
-	tableObjects := make(map[string][]storage.Hash, len(snapshot.Manifest.Tables))
 	for name, table := range snapshot.Manifest.Tables {
-		if !table.DataRoot.Valid() {
-			if table.SchemaRoot.Valid() {
-				tableObjects[name] = []storage.Hash{table.SchemaRoot}
-			}
+		key := tableValidationKey(snapshot, table)
+		if _, ok := lookupValidatedTable(key); ok {
 			continue
 		}
-		if _, err := loadTable(ctx, snapshot.Store(), table); err != nil {
-			return fmt.Errorf("validate SQL table %s: %w", name, err)
-		}
-		hashes, err := prolly.Reachable(ctx, snapshot.Store(), table.DataRoot)
+		objects, err := validateTable(ctx, snapshot.Store(), name, table)
 		if err != nil {
-			return fmt.Errorf("validate SQL table %s reachability: %w", name, err)
+			return err
 		}
-		objects := append([]storage.Hash{table.SchemaRoot}, hashes...)
-		for _, idxRoot := range table.Indexes {
-			idxHashes, err := prolly.Reachable(ctx, snapshot.Store(), idxRoot)
-			if err != nil {
-				return fmt.Errorf("validate SQL table %s index reachability: %w", name, err)
-			}
-			objects = append(objects, idxHashes...)
-		}
-		tableObjects[name] = objects
+		rememberValidatedTable(key, objects)
 	}
-	validatedSnapshots.Lock()
-	if element := validatedSnapshots.entries[key]; element != nil {
-		validatedSnapshots.order.MoveToFront(element)
-	} else {
-		entry := validationCacheEntry{key: key, tableObjects: tableObjects}
-		validatedSnapshots.entries[key] = validatedSnapshots.order.PushFront(entry)
-		if validatedSnapshots.order.Len() > maxValidatedSnapshots {
-			oldest := validatedSnapshots.order.Back()
-			delete(validatedSnapshots.entries, oldest.Value.(validationCacheEntry).key)
-			validatedSnapshots.order.Remove(oldest)
-		}
-	}
-	validatedSnapshots.Unlock()
 	return nil
 }
 
+// validateTable decodes and key-checks every row, streaming the data tree,
+// and returns the table's reachable objects.
+func validateTable(ctx context.Context, store storage.Store, name string, table repository.Table) ([]storage.Hash, error) {
+	if !table.DataRoot.Valid() {
+		if table.SchemaRoot.Valid() {
+			return []storage.Hash{table.SchemaRoot}, nil
+		}
+		return nil, nil
+	}
+	performanceCounters.tablesValidated.Add(1)
+	if err := validateTableRows(ctx, store, table); err != nil {
+		return nil, fmt.Errorf("validate SQL table %s: %w", name, err)
+	}
+	hashes, err := prolly.Reachable(ctx, store, table.DataRoot)
+	if err != nil {
+		return nil, fmt.Errorf("validate SQL table %s reachability: %w", name, err)
+	}
+	objects := append([]storage.Hash{table.SchemaRoot}, hashes...)
+	for _, idxRoot := range table.Indexes {
+		idxHashes, err := prolly.Reachable(ctx, store, idxRoot)
+		if err != nil {
+			return nil, fmt.Errorf("validate SQL table %s index reachability: %w", name, err)
+		}
+		objects = append(objects, idxHashes...)
+	}
+	return objects, nil
+}
+
+func validateTableRows(ctx context.Context, store storage.Store, table repository.Table) error {
+	state, err := loadTableMetadata(ctx, store, table)
+	if err != nil {
+		return err
+	}
+	tree, err := prolly.Open(store, table.DataRoot)
+	if err != nil {
+		return err
+	}
+	it, err := tree.Iterator(ctx)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for {
+		entry, ok, err := it.Next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		performanceCounters.rowsDecoded.Add(1)
+		row, err := decodeRow(state.schema.Schema, entry.Value)
+		if err != nil {
+			return err
+		}
+		key, err := encodeKey(state.schema, row)
+		if err != nil || !bytes.Equal(key, entry.Key) {
+			return errors.New("stored row key does not match row primary key")
+		}
+	}
+}
+
 func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]storage.Hash, bool) {
-	key := fmt.Sprintf("%s\x00%s\x00%d\x00%d", snapshot.RepositoryIdentity(), snapshot.Commit, snapshot.Generation(), snapshotValidationVersion)
-	validatedSnapshots.Lock()
-	defer validatedSnapshots.Unlock()
-	element := validatedSnapshots.entries[key]
-	if element == nil {
+	manifestTable, ok := snapshot.Manifest.Tables[table]
+	if !ok {
 		return nil, false
 	}
-	validatedSnapshots.order.MoveToFront(element)
-	hashes, ok := element.Value.(validationCacheEntry).tableObjects[table]
-	return append([]storage.Hash(nil), hashes...), ok
+	objects, ok := lookupValidatedTable(tableValidationKey(snapshot, manifestTable))
+	return append([]storage.Hash(nil), objects...), ok
 }
 
 func (e *Engine) Repository() *repository.Repository     { return e.repo }

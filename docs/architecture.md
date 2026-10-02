@@ -62,7 +62,7 @@ objects/sha256/ab/cdef…   # one blob per RepoDB object, named by its SHA-256
 
 The verified objects stay in memory for the snapshot's lifetime, so memory use grows with the size of the database. Snapshots from another format version are refused with an "unsupported RepoDB format" error. There is no migration between formats (rdb-92cd4a).
 
-**SQL validation.** Before sync publishes a fetched snapshot, `engine.ValidateSnapshot` decodes every schema and walks every Prolly tree. Its results are cached per repository, commit and journal generation.
+**SQL validation.** Before sync publishes a fetched snapshot, `engine.ValidateSnapshot` decodes every schema and walks every Prolly tree. It also checks every row's encoding and primary key, streaming each data tree without keeping rows in memory. Results are cached per table, keyed by repository, base commit and the table's schema, data and index roots. A journal commit keeps its base commit and roots, so a session that starts after another session's commit re-validates only tables changed by DDL. Pending journal edits are not part of this validation.
 
 ## Tables
 
