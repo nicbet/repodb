@@ -11,7 +11,7 @@ This page describes how the pieces work today. Usage is in [cli.md](cli.md) and 
 | `engine` | The SQL catalog on go-mysql-server: tables, indexes, transactions and sessions. Also the key and row codecs, range scans, snapshot validation, three-way merge, and the `repodb_recover_commit` function. |
 | `common/repository` | Repositories and snapshots: manifests, object inventories, publication to Git with commit outcomes and recovery, locking, and the journal (`WorkingState`). |
 | `common/prolly` | Immutable, content-addressed Prolly trees: build, sorted streaming build, incremental `Apply`, seekable iterators, reachability. |
-| `common/git` | Runs the `git` executable: object and tree writes with explicit fsync settings, `cat-file --batch` reads, ref updates, fetch and push. |
+| `common/git` | Runs the `git` executable: object and tree writes with explicit fsync settings, object reads through a long-lived `cat-file --batch` process, ref updates, fetch and push. |
 | `common/storage` | The content-addressed `Store` interface and SHA-256 hashes (`storage.Sum`), plus an in-memory store. `Get` returns the stored bytes themselves, shared with other readers, so callers never modify them. |
 | `common/robustio` | Rename and remove with retries for Windows sharing violations. |
 | `integration` | `Enable`, `Sync`, `Conflicts`, `Resolve`: remote configuration, transport, merge and conflict records. |
@@ -25,7 +25,7 @@ All paths are under the repository's common Git directory (`git rev-parse --git-
 | Location | Contents | Authority |
 | --- | --- | --- |
 | `refs/repodb/data` | the local data head: the latest published data commit | authoritative |
-| `refs/repodb/remotes/<remote>/data` | the last fetched data head of a remote | fetched copy, never written locally |
+| `refs/repodb/remotes/<remote>/data` | the remote's data head as last seen by a fetch or by RepoDB's own push | copy of the remote; Git's fetch and push update it, RepoDB never writes it directly |
 | `repodb/working/v1/journal` | the journal: an anchor for the last checkpoint, then the transactions since | authoritative in journal mode |
 | `repodb/locks/publish.lock` | serializes updates of `refs/repodb/data` | coordination |
 | `repodb/locks/working.lock` | serializes journal appends and checkpoints; every update of `refs/repodb/data` takes it before `publish.lock` | coordination |
@@ -58,9 +58,13 @@ objects/sha256/ab/cdef…   # one blob per RepoDB object, named by its SHA-256
 - the manifest decodes strictly and the format version matches;
 - the inventory is sorted and unique, and every table root is in it;
 - the tree has exactly the listed entries;
-- every object, read in one `git cat-file --batch` pass, hashes to its name.
+- every object hashes to its name.
 
-The verified objects stay in memory for the snapshot's lifetime, so memory use grows with the size of the database. Snapshots from another format version are refused with an "unsupported RepoDB format" error. There is no migration between formats (rdb-92cd4a).
+The verified objects stay in memory for the snapshot's lifetime, so memory use grows with the size of the database, and opening a snapshot reads and hashes every object (rdb-93103f). Snapshots from another format version are refused with an "unsupported RepoDB format" error. There is no migration between formats (rdb-92cd4a).
+
+**Reading objects.** Each worktree has one long-lived `git cat-file --batch` process. It serves the manifest, object reads while opening a snapshot, and object reads that miss a snapshot's cache, so a read starts no process. Requests are serialized. An I/O or protocol error, or a cancelled context, ends the process; the next read starts a new one, and a read that finds an idle process dead retries once. The process exits after 5 seconds without requests, and `engine.Close` stops it at once (`git.CloseReaders`), because on Windows it keeps pack files open. It sees objects written after it started: Git finds new loose objects and re-scans packs when an object is missing.
+
+**Reusing validated snapshots.** A process-wide memo maps each repository and commit to the validated content of its snapshot. It holds weak references, so it never keeps a snapshot alive itself. While any caller still holds a snapshot of a commit (an engine, the journal's replayed view, sync), opening that commit again returns a new `Snapshot` sharing the validated content, without Git reads or hashing. Every caller gets its own `Snapshot`, because callers set its working generation. The memo trusts content validated earlier in the process: a commit ID names immutable content, and corruption that appears on disk after validation is not detected until the snapshot is collected and read again. A published commit's snapshot is memoized too, so loading the commit just checkpointed costs nothing while its result is held.
 
 **SQL validation.** Before sync publishes a fetched snapshot, `engine.ValidateSnapshot` decodes every schema and walks every Prolly tree. It also checks every row's encoding and primary key, streaming each data tree without keeping rows in memory. Results are cached per table, keyed by repository, base commit and the table's schema, data and index roots. A journal commit keeps its base commit and roots, so a session that starts after another session's commit re-validates only tables changed by DDL. Pending journal edits are not part of this validation.
 
@@ -228,14 +232,16 @@ Commits are optimistic. In journal mode a transaction conflicts only with overla
 
 `integration.Sync`:
 1. refuses a dirty journal (with `SyncOptions.Checkpoint`, it checkpoints it instead);
-2. fetches the remote's `refs/repodb/data` into the tracking ref;
+2. fetches the remote's `refs/repodb/data` into the tracking ref. It first reads the remote head with `ls-remote`, and skips the fetch, with its transfer and Git auto-maintenance, when the tracking ref already names that commit and the commit is present locally;
 3. validates the fetched snapshot and its SQL data;
-4. compares ancestry with the local head.
+4. compares ancestry with the local head through one `git merge-base --all`: the remote is behind when its head is the only merge base, the local side when its head is.
+
+Snapshots of commits already loaded in the process are reused rather than read again (see [Snapshots](#snapshots)).
 
 It then does one of the following:
 
 - **Fast-forward local.** Under `working.lock` and `publish.lock`, the local ref moves to the fetched commit, unless a journal transaction committed since step 1 (`ErrWorkingDirty`; with `SyncOptions.Checkpoint`, sync checkpoints and retries).
-- **Push.** The local commit is pushed to the remote's `refs/repodb/data` as an ordinary fast-forward push, without force. The push does not hold `publish.lock`, so local SQL commits continue during a slow push.
+- **Push.** The local commit is pushed to the remote's `refs/repodb/data` as an ordinary fast-forward push, without force. The push does not hold `publish.lock`, so local SQL commits continue during a slow push. A successful push also moves the tracking ref to the pushed commit (Git updates remote-tracking refs that match the fetch refspec), so sync does not fetch afterwards.
 - **Merge.** A three-way merge between the local head, the fetched head and their Git merge base.
 
 **How merge compares.** Merge works table by table and key by key:

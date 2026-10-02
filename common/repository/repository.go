@@ -141,6 +141,9 @@ type Snapshot struct {
 	objectSet  map[storage.Hash]struct{}
 	objectOIDs map[storage.Hash]string
 	cache      *snapshotObjectCache
+	// core keeps a loaded commit's validated content alive for snapshotMemo;
+	// derived working snapshots leave it nil.
+	core *snapshotCore
 
 	pendingEdits map[string]PendingRows
 }
@@ -217,12 +220,13 @@ func OpenWithSnapshot(ctx context.Context, start string) (*Repository, *Snapshot
 	if err != nil {
 		return nil, nil, err
 	}
-	commit, err := repo.git.ResolveRef(ctx, repo.Root, DataRef)
+	// Head also primes the head cache for the caller's next Head.
+	commit, err := repo.Head(ctx)
 	if err != nil {
-		if errors.Is(err, repodbgit.ErrRefNotFound) {
-			return nil, nil, ErrNotInitialized
-		}
 		return nil, nil, err
+	}
+	if commit == "" {
+		return nil, nil, ErrNotInitialized
 	}
 	snapshot, err := repo.loadSnapshot(ctx, commit)
 	if err != nil {
@@ -777,6 +781,8 @@ func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest
 	if err != nil {
 		return result, &CommitError{Outcome: OutcomeCommitted, Commit: commit, Err: fmt.Errorf("published %s but verification failed: %w", commit, err)}
 	}
+	w.repo.rememberSnapshot(snapshot)
+	result.Snapshot = w.repo.snapshotFromCore(commit, snapshot.core)
 	return result, nil
 }
 
@@ -848,6 +854,9 @@ func (r *Repository) RecoverCommit(ctx context.Context, candidate string) (Commi
 }
 
 func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot, error) {
+	if snapshot := r.memoizedSnapshot(commit); snapshot != nil {
+		return snapshot, nil
+	}
 	data, err := r.git.ReadTreeFile(ctx, r.Root, commit, "manifest.json")
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
@@ -917,7 +926,8 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 		}
 		snapshot.cache.data[hash] = data
 	}
-	return snapshot, nil
+	r.rememberSnapshot(snapshot)
+	return r.snapshotFromCore(commit, snapshot.core), nil
 }
 
 type snapshotStore struct{ snapshot *Snapshot }

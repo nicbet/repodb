@@ -181,7 +181,7 @@ func SyncWithOptions(ctx context.Context, start, remote string, options SyncOpti
 			if localHead == remoteHead {
 				localSnapshot := openedSnapshot
 				if localSnapshot == nil || localSnapshot.Commit != localHead {
-					localSnapshot, err = repo.SnapshotAt(ctx, localHead)
+					localSnapshot, err = repo.SnapshotCommit(ctx, localHead)
 					if err != nil {
 						return last, fmt.Errorf("validate local RepoDB snapshot: %w", err)
 					}
@@ -198,12 +198,7 @@ func SyncWithOptions(ctx context.Context, start, remote string, options SyncOpti
 			}
 			err = pushExpected(ctx, repo, cli, info.TopLevel, remote, localHead)
 			if err == nil {
-				last.RemoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
-				if err != nil {
-					last.Action = "pushed-local-fetch-failed"
-					return last, err
-				}
-				last.Action = "pushed"
+				last.RemoteHead, last.Action = localHead, "pushed"
 				if err := clearConflictSet(repo, remote); err != nil {
 					last.Action = "conflict-cleanup-failed"
 					return last, err
@@ -214,33 +209,26 @@ func SyncWithOptions(ctx context.Context, start, remote string, options SyncOpti
 			continue
 		}
 
-		remoteBehind, err := cli.IsAncestor(ctx, info.TopLevel, remoteHead, localHead)
+		// One side is behind exactly when it is the only merge base.
+		bases, err := cli.MergeBases(ctx, info.TopLevel, localHead, remoteHead)
 		if err != nil {
 			return last, err
 		}
-		if remoteBehind {
+		baseHead := bases[0]
+		if len(bases) == 1 && baseHead == remoteHead {
 			if err := pushExpected(ctx, repo, cli, info.TopLevel, remote, localHead); err != nil {
 				lastErr, last.Action = err, "push-retry"
 				continue
 			}
-			last.RemoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
-			if err != nil {
-				last.Action = "pushed-local-fetch-failed"
-				return last, err
-			}
-			last.Action = "pushed"
+			last.RemoteHead, last.Action = localHead, "pushed"
 			if err := clearConflictSet(repo, remote); err != nil {
 				last.Action = "conflict-cleanup-failed"
 				return last, err
 			}
 			return last, nil
 		}
-		localBehind, err := cli.IsAncestor(ctx, info.TopLevel, localHead, remoteHead)
-		if err != nil {
-			return last, err
-		}
-		if localBehind {
-			remoteSnapshot, err := repo.SnapshotAt(ctx, remoteHead)
+		if len(bases) == 1 && baseHead == localHead {
+			remoteSnapshot, err := repo.SnapshotCommit(ctx, remoteHead)
 			if err != nil {
 				return last, fmt.Errorf("validate fetched RepoDB snapshot: %w", err)
 			}
@@ -276,22 +264,18 @@ func SyncWithOptions(ctx context.Context, start, remote string, options SyncOpti
 			return last, nil
 		}
 
-		baseHead, err := repo.MergeBase(ctx, localHead, remoteHead)
-		if err != nil {
-			return last, err
-		}
-		baseSnapshot, err := repo.SnapshotAt(ctx, baseHead)
+		baseSnapshot, err := repo.SnapshotCommit(ctx, baseHead)
 		if err != nil {
 			return last, err
 		}
 		localSnapshot := openedSnapshot
 		if localSnapshot == nil || localSnapshot.Commit != localHead {
-			localSnapshot, err = repo.SnapshotAt(ctx, localHead)
+			localSnapshot, err = repo.SnapshotCommit(ctx, localHead)
 			if err != nil {
 				return last, err
 			}
 		}
-		remoteSnapshot, err := repo.SnapshotAt(ctx, remoteHead)
+		remoteSnapshot, err := repo.SnapshotCommit(ctx, remoteHead)
 		if err != nil {
 			return last, err
 		}
@@ -351,12 +335,7 @@ func SyncWithOptions(ctx context.Context, start, remote string, options SyncOpti
 			lastErr, last.Action = err, "push-retry"
 			continue
 		}
-		last.RemoteHead, _, err = fetch(ctx, cli, info.TopLevel, remote, tracking)
-		if err != nil {
-			last.Action = "merged-local-fetch-failed"
-			return last, err
-		}
-		last.Action = "merged"
+		last.RemoteHead, last.Action = localHead, "merged"
 		if err := clearConflictSet(repo, remote); err != nil {
 			last.Action = "conflict-cleanup-failed"
 			return last, err
@@ -459,13 +438,21 @@ func resolveRemote(ctx context.Context, start, explicit string) (repodbgit.CLI, 
 	return cli, info, remote, tracking, nil
 }
 
+// fetch updates the tracking ref from remote. It skips `git fetch` when the
+// tracking ref already names the remote head and that commit is present, so an
+// unchanged remote costs no transfer or auto-maintenance.
 func fetch(ctx context.Context, cli repodbgit.CLI, root, remote, tracking string) (string, bool, error) {
-	_, err := cli.RemoteRef(ctx, root, remote, repository.DataRef)
+	remoteHead, err := cli.RemoteRef(ctx, root, remote, repository.DataRef)
 	if errors.Is(err, repodbgit.ErrRemoteRefNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, err
+	}
+	if current, err := cli.ResolveRef(ctx, root, tracking); err == nil && current == remoteHead {
+		if present, err := cli.HasCommit(ctx, root, remoteHead); err == nil && present {
+			return remoteHead, true, nil
+		}
 	}
 	if err := cli.FetchRef(ctx, root, remote, repository.DataRef, tracking); err != nil {
 		return "", false, err

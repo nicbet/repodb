@@ -3,7 +3,6 @@
 package git
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -50,23 +48,18 @@ type TreeEntry struct {
 }
 
 func (CLI) Discover(ctx context.Context, start string) (RepositoryInfo, error) {
-	top, err := run(ctx, start, nil, nil, "rev-parse", "--show-toplevel")
+	out, err := run(ctx, start, nil, nil, "rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir", "--show-object-format")
 	if err != nil {
 		return RepositoryInfo{}, fmt.Errorf("find Git worktree: %w", err)
 	}
-	top = filepath.Clean(strings.TrimSpace(top))
-	common, err := run(ctx, top, nil, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if err != nil {
-		return RepositoryInfo{}, fmt.Errorf("find common Git directory: %w", err)
-	}
-	format, err := run(ctx, top, nil, nil, "rev-parse", "--show-object-format")
-	if err != nil {
-		return RepositoryInfo{}, fmt.Errorf("find Git object format: %w", err)
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 3 {
+		return RepositoryInfo{}, fmt.Errorf("find Git worktree: unexpected rev-parse output %q", out)
 	}
 	return RepositoryInfo{
-		TopLevel:     top,
-		CommonDir:    filepath.Clean(strings.TrimSpace(common)),
-		ObjectFormat: strings.TrimSpace(format),
+		TopLevel:     filepath.Clean(strings.TrimSpace(lines[0])),
+		CommonDir:    filepath.Clean(strings.TrimSpace(lines[1])),
+		ObjectFormat: strings.TrimSpace(lines[2]),
 	}, nil
 }
 
@@ -95,16 +88,30 @@ func (CLI) IsAncestor(ctx context.Context, root, ancestor, descendant string) (b
 }
 
 func (CLI) MergeBase(ctx context.Context, root, left, right string) (string, error) {
+	bases, err := CLI{}.MergeBases(ctx, root, left, right)
+	if err != nil {
+		return "", err
+	}
+	return bases[0], nil
+}
+
+// MergeBases returns every best common ancestor of left and right, sorted.
+// One side is an ancestor of the other exactly when it is the only base.
+func (CLI) MergeBases(ctx context.Context, root, left, right string) ([]string, error) {
 	out, err := run(ctx, root, nil, nil, "merge-base", "--all", left, right)
 	if err != nil {
-		return "", fmt.Errorf("find Git merge base: %w", err)
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return nil, errors.New("RepoDB data histories have no common ancestor")
+		}
+		return nil, fmt.Errorf("find Git merge base: %w", err)
 	}
 	bases := strings.Fields(out)
 	if len(bases) == 0 {
-		return "", errors.New("RepoDB data histories have no common ancestor")
+		return nil, errors.New("RepoDB data histories have no common ancestor")
 	}
 	sort.Strings(bases)
-	return bases[0], nil
+	return bases, nil
 }
 
 func (CLI) RemoteURL(ctx context.Context, root, remote string) (string, error) {
@@ -332,12 +339,30 @@ func (CLI) UpdateRef(ctx context.Context, root, ref, newValue, oldValue string) 
 	return nil
 }
 
+// ReadTreeFile reads one file of a commit's tree through the long-lived
+// object reader.
 func (CLI) ReadTreeFile(ctx context.Context, root, commit, path string) ([]byte, error) {
-	out, err := run(ctx, root, nil, nil, "show", commit+":"+path)
+	results, err := readerFor(root).read(ctx, []string{commit + ":" + path})
 	if err != nil {
 		return nil, fmt.Errorf("read %s from snapshot %s: %w", path, commit, err)
 	}
-	return []byte(out), nil
+	if results[0].Missing {
+		return nil, fmt.Errorf("read %s from snapshot %s: %w", path, commit, errObjectMissing)
+	}
+	if results[0].Type != "blob" {
+		return nil, fmt.Errorf("read %s from snapshot %s: not a file (%s)", path, commit, results[0].Type)
+	}
+	return results[0].Data, nil
+}
+
+// HasCommit reports whether commit is present in the local object database,
+// without starting a process.
+func (CLI) HasCommit(ctx context.Context, root, commit string) (bool, error) {
+	results, err := readerFor(root).read(ctx, []string{commit})
+	if err != nil {
+		return false, err
+	}
+	return !results[0].Missing && results[0].Type == "commit", nil
 }
 
 func (CLI) ListTree(ctx context.Context, root, commit string) ([]string, error) {
@@ -375,39 +400,21 @@ func (CLI) ListTreeObjects(ctx context.Context, root, commit string) (map[string
 	return objects, nil
 }
 
-// ReadObjects reads a set of blobs through one cat-file batch process.
+// ReadObjects reads a set of blobs through the long-lived object reader.
 func (CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (map[string][]byte, error) {
-	if len(objectIDs) == 0 {
-		return map[string][]byte{}, nil
-	}
-	input := strings.Join(objectIDs, "\n") + "\n"
-	out, err := run(ctx, root, []byte(input), nil, "cat-file", "--batch")
+	results, err := readerFor(root).read(ctx, objectIDs)
 	if err != nil {
 		return nil, fmt.Errorf("batch read Git objects: %w", err)
 	}
-	reader := bufio.NewReader(strings.NewReader(out))
 	objects := make(map[string][]byte, len(objectIDs))
-	for range objectIDs {
-		header, err := reader.ReadString('\n')
-		if err != nil {
-			return nil, fmt.Errorf("read cat-file header: %w", err)
+	for i, result := range results {
+		if result.Missing {
+			return nil, fmt.Errorf("batch read Git objects: %s: %w", objectIDs[i], errObjectMissing)
 		}
-		fields := strings.Fields(header)
-		if len(fields) != 3 || fields[1] != "blob" {
-			return nil, fmt.Errorf("invalid cat-file header %q", strings.TrimSpace(header))
+		if result.Type != "blob" {
+			return nil, fmt.Errorf("batch read Git objects: %s is a %s, not a blob", objectIDs[i], result.Type)
 		}
-		size, err := strconv.Atoi(fields[2])
-		if err != nil {
-			return nil, err
-		}
-		data := make([]byte, size)
-		if _, err := io.ReadFull(reader, data); err != nil {
-			return nil, err
-		}
-		if delimiter, err := reader.ReadByte(); err != nil || delimiter != '\n' {
-			return nil, errors.New("invalid cat-file object delimiter")
-		}
-		objects[fields[0]] = data
+		objects[result.OID] = result.Data
 	}
 	return objects, nil
 }

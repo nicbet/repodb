@@ -155,7 +155,7 @@ Then:
 
 Exchanges committed data history with the remote:
 
-1. Fetches the remote data ref into the tracking ref, and validates the fetched snapshot and its SQL data.
+1. Fetches the remote data ref into the tracking ref, and validates the fetched snapshot and its SQL data. If the tracking ref already names the remote's head, nothing is fetched.
 2. If the local side is behind, fast-forwards the local data ref.
 3. If the remote is behind, pushes with an ordinary fast-forward push, never a force push.
 4. If both sides changed, performs a three-way merge and publishes a merge commit with both heads as parents, then pushes it. If the local ref or the remote moved during the merge, it starts again, up to three attempts.

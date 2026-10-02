@@ -19,6 +19,7 @@ import (
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/vitess/go/mysql"
+	repodbgit "github.com/nicbet/repodb/common/git"
 	"github.com/nicbet/repodb/common/prolly"
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/common/storage"
@@ -506,6 +507,9 @@ func (e *Engine) Close() error {
 	if e.closed.Swap(true) {
 		return nil
 	}
+	// Release the repository's long-lived object reader: on Windows it keeps
+	// pack files open. Another user of the repository restarts it on demand.
+	defer repodbgit.CloseReaders(e.repo.Root)
 	return e.sql.Close()
 }
 

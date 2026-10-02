@@ -29,7 +29,8 @@ func TestParseWorkloads(t *testing.T) {
 }
 
 func TestFixturesAreDeterministic(t *testing.T) {
-	if !reflect.DeepEqual(makeEvent(42), makeEvent(42)) || !reflect.DeepEqual(makeIssue(42), makeIssue(42)) || commentBody(7) != commentBody(7) {
+	firstBody, secondBody := commentBody(7), commentBody(7)
+	if !reflect.DeepEqual(makeEvent(42), makeEvent(42)) || !reflect.DeepEqual(makeIssue(42), makeIssue(42)) || firstBody != secondBody {
 		t.Fatal("same id produced different rows")
 	}
 	if makeEvent(1).payload == makeEvent(2).payload || makeIssue(1).body == makeIssue(2).body {
