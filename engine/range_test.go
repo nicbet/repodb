@@ -43,6 +43,9 @@ func TestRangeAndOrderPlansUseIndexes(t *testing.T) {
 		{"SELECT id FROM t WHERE id >= 2 ORDER BY id LIMIT 5", "[t.id]", true, nil},
 		{"SELECT id FROM t WHERE u > 5 ORDER BY u LIMIT 1", "[t.u]", true, nil},
 		{"SELECT id FROM t WHERE n BETWEEN 'a' AND 'c'", "[t.n]", false, nil},
+		{"SELECT id FROM t ORDER BY id DESC LIMIT 1", "[t.id]", true, []string{"reverse: true"}},
+		{"SELECT id FROM t WHERE id < 2 ORDER BY id DESC", "[t.id]", true, []string{"reverse: true"}},
+		{"SELECT id FROM t WHERE u > 5 ORDER BY u DESC LIMIT 1", "[t.u]", true, []string{"reverse: true"}},
 	} {
 		plan := explainPlan(t, eng, tc.query)
 		if !strings.Contains(plan, "IndexedTableAccess") || !strings.Contains(plan, "index: "+tc.index) {
@@ -50,6 +53,11 @@ func TestRangeAndOrderPlansUseIndexes(t *testing.T) {
 		}
 		if tc.noSort && (strings.Contains(plan, "Sort") || strings.Contains(plan, "TopN")) {
 			t.Errorf("%s: plan still sorts:\n%s", tc.query, plan)
+		}
+		for _, want := range tc.wantAny {
+			if !strings.Contains(plan, want) {
+				t.Errorf("%s: plan lacks %q:\n%s", tc.query, want, plan)
+			}
 		}
 	}
 }
@@ -236,11 +244,15 @@ func runRangeModel(t *testing.T, mode string, tbl rangeModelTable) {
 	var checks []check
 	// Both sides order by the primary key; the reference orders by the wrapped
 	// column so that it is a plain table scan plus sort, with no index code.
+	// Each predicate is checked in both directions: DESC on a primary-key
+	// predicate is answered by a reverse index scan.
 	add := func(where string) {
-		checks = append(checks, check{
-			indexed: fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s", tbl.name, fmt.Sprintf(where, pk, idx), pk),
-			scan:    fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s", tbl.name, fmt.Sprintf(where, scanExpr(pk), scanExpr(idx)), scanExpr(pk)),
-		})
+		for _, dir := range []string{"", " DESC"} {
+			checks = append(checks, check{
+				indexed: fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s%s", tbl.name, fmt.Sprintf(where, pk, idx), pk, dir),
+				scan:    fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s%s", tbl.name, fmt.Sprintf(where, scanExpr(pk), scanExpr(idx)), scanExpr(pk), dir),
+			})
+		}
 	}
 	for i := 0; i < 25; i++ {
 		a, b := tbl.pkLits(r), tbl.pkLits(r)
@@ -284,6 +296,18 @@ func runRangeModel(t *testing.T, mode string, tbl rangeModelTable) {
 			}
 		}(),
 		{fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s, %s LIMIT 9", pk, tbl.name, idx, idx, pk), fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s, %s LIMIT 9", pk, tbl.name, scanExpr(idx), scanExpr(idx), scanExpr(pk))},
+		// Descending forms, served by reverse scans.
+		{fmt.Sprintf("SELECT * FROM %s ORDER BY %s DESC LIMIT 7", tbl.name, pk), fmt.Sprintf("SELECT * FROM %s ORDER BY %s DESC LIMIT 7", tbl.name, scanExpr(pk))},
+		func() struct{ indexed, scan string } {
+			lit := tbl.pkLits(r)
+			return struct{ indexed, scan string }{
+				fmt.Sprintf("SELECT * FROM %s WHERE %s < %s ORDER BY %s DESC LIMIT 4", tbl.name, pk, lit, pk),
+				fmt.Sprintf("SELECT * FROM %s WHERE %s < %s ORDER BY %s DESC LIMIT 4", tbl.name, scanExpr(pk), lit, scanExpr(pk)),
+			}
+		}(),
+		{fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s DESC, %s DESC LIMIT 9", pk, tbl.name, idx, idx, pk), fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s DESC, %s DESC LIMIT 9", pk, tbl.name, scanExpr(idx), scanExpr(idx), scanExpr(pk))},
+		// NULL index values sort lowest, so they come last.
+		{fmt.Sprintf("SELECT %s FROM %s ORDER BY %s DESC, %s DESC", pk, tbl.name, idx, pk), fmt.Sprintf("SELECT %s FROM %s ORDER BY %s DESC, %s DESC", pk, tbl.name, scanExpr(idx), scanExpr(pk))},
 	} {
 		if got, want := query(q.indexed), query(q.scan); got != want {
 			t.Fatalf("%s\n  index: %s\n  scan:  %s", q.indexed, got, want)

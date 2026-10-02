@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"slices"
 	"sort"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -30,10 +31,30 @@ func (iv keyInterval) contains(key []byte) bool {
 }
 
 // rangePartition scans intervals of the primary key (index == nil) or of a
-// secondary index, in ascending key order.
+// secondary index, in ascending key order, or descending when reverse.
 type rangePartition struct {
 	intervals []keyInterval
 	index     *indexDisk
+	reverse   bool
+}
+
+// scanOrder returns intervals in the order a scan visits them: as given
+// (ascending, non-overlapping) or last to first.
+func scanOrder(intervals []keyInterval, reverse bool) []keyInterval {
+	if !reverse {
+		return intervals
+	}
+	out := slices.Clone(intervals)
+	slices.Reverse(out)
+	return out
+}
+
+// before reports whether key a comes before key b in a scan's direction.
+func before(a, b string, reverse bool) bool {
+	if reverse {
+		return a > b
+	}
+	return a < b
 }
 
 func (rangePartition) Key() []byte { return []byte("range") }
@@ -231,8 +252,9 @@ func mergeIntervals(in []keyInterval) []keyInterval {
 	return out
 }
 
-// sortedOverlayKeys returns the keys of an overlay map inside iv, sorted.
-func sortedOverlayKeys[V any](overlay map[string]V, iv keyInterval) []string {
+// sortedOverlayKeys returns the keys of an overlay map inside iv, sorted in
+// ascending order, or descending when reverse.
+func sortedOverlayKeys[V any](overlay map[string]V, iv keyInterval, reverse bool) []string {
 	keys := make([]string, 0)
 	for key := range overlay {
 		if iv.contains([]byte(key)) {
@@ -240,10 +262,13 @@ func sortedOverlayKeys[V any](overlay map[string]V, iv keyInterval) []string {
 		}
 	}
 	sort.Strings(keys)
+	if reverse {
+		slices.Reverse(keys)
+	}
 	return keys
 }
 
-// overlayCursor yields the keys of an overlay of pending changes in ascending
+// overlayCursor yields the keys of an overlay of pending changes in scan
 // order.
 type overlayCursor interface {
 	peek() (key string, ok bool)
@@ -278,13 +303,20 @@ type pendingCursor struct {
 	edit repository.TypedRowEdit
 }
 
-func newPendingCursor(edits repository.PendingRows, iv keyInterval) *pendingCursor {
+func newPendingCursor(edits repository.PendingRows, iv keyInterval, reverse bool) *pendingCursor {
 	c := &pendingCursor{}
 	if !edits.Empty() {
-		c.it = edits.Iter(iv.start, iv.end)
+		c.it = pendingIter(edits, iv, reverse)
 		c.load()
 	}
 	return c
+}
+
+func pendingIter(edits repository.PendingRows, iv keyInterval, reverse bool) *repository.PendingIter {
+	if reverse {
+		return edits.IterReverse(iv.start, iv.end)
+	}
+	return edits.Iter(iv.start, iv.end)
 }
 
 func (c *pendingCursor) load() {
@@ -303,10 +335,11 @@ func (c *pendingCursor) advance() error {
 }
 
 // rowOverlayCursor merges a transaction's own row edits with the journal's
-// pending edits in key order; the transaction's edit wins for equal keys.
+// pending edits in scan order; the transaction's edit wins for equal keys.
 // After advance, edit holds the edit for the key just passed.
 type rowOverlayCursor struct {
 	state      *tableState
+	reverse    bool
 	local      keyCursor
 	pending    *repository.PendingIter
 	pendingKey string
@@ -315,10 +348,10 @@ type rowOverlayCursor struct {
 	edit       rowEdit
 }
 
-func newRowOverlayCursor(state *tableState, iv keyInterval) *rowOverlayCursor {
-	c := &rowOverlayCursor{state: state, local: keyCursor{keys: sortedOverlayKeys(state.edits, iv)}}
+func newRowOverlayCursor(state *tableState, iv keyInterval, reverse bool) *rowOverlayCursor {
+	c := &rowOverlayCursor{state: state, reverse: reverse, local: keyCursor{keys: sortedOverlayKeys(state.edits, iv, reverse)}}
 	if !state.pending.Empty() {
-		c.pending = state.pending.Iter(iv.start, iv.end)
+		c.pending = pendingIter(state.pending, iv, reverse)
 		c.nextPending()
 	}
 	return c
@@ -336,7 +369,7 @@ func (c *rowOverlayCursor) peek() (string, bool) {
 	switch {
 	case !c.pendingOK:
 		return local, localOK
-	case !localOK || c.pendingKey < local:
+	case !localOK || before(c.pendingKey, local, c.reverse):
 		return c.pendingKey, true
 	default:
 		return local, true
@@ -345,7 +378,7 @@ func (c *rowOverlayCursor) peek() (string, bool) {
 
 func (c *rowOverlayCursor) advance() error {
 	local, localOK := c.local.peek()
-	if localOK && (!c.pendingOK || local <= c.pendingKey) {
+	if localOK && (!c.pendingOK || !before(c.pendingKey, local, c.reverse)) {
 		if c.pendingOK && local == c.pendingKey {
 			c.nextPending()
 		}
@@ -362,24 +395,32 @@ func (c *rowOverlayCursor) advance() error {
 }
 
 // mergedEntries walks one interval of a Prolly tree merged with an overlay of
-// pending changes. Overlay entries win over tree entries with the same key.
+// pending changes, ascending or, when reverse, descending. Overlay entries win
+// over tree entries with the same key; the overlay must yield keys in the same
+// direction.
 type mergedEntries struct {
 	ctx      context.Context
-	tree     *prolly.Iterator
+	tree     prolly.EntryIterator
 	treeNext prolly.Entry
 	treeOK   bool
 	overlay  overlayCursor
-	end      []byte
+	iv       keyInterval
+	reverse  bool
 }
 
-func newMergedEntries(ctx context.Context, store storage.Store, root storage.Hash, iv keyInterval, overlay overlayCursor) (*mergedEntries, error) {
-	m := &mergedEntries{ctx: ctx, overlay: overlay, end: iv.end}
+func newMergedEntries(ctx context.Context, store storage.Store, root storage.Hash, iv keyInterval, overlay overlayCursor, reverse bool) (*mergedEntries, error) {
+	m := &mergedEntries{ctx: ctx, overlay: overlay, iv: iv, reverse: reverse}
 	if root.Valid() {
 		tree, err := prolly.Open(store, root)
 		if err != nil {
 			return nil, err
 		}
-		if m.tree, err = tree.IteratorFrom(ctx, iv.start); err != nil {
+		if reverse {
+			m.tree, err = tree.ReverseIterator(ctx, iv.end)
+		} else {
+			m.tree, err = tree.IteratorFrom(ctx, iv.start)
+		}
+		if err != nil {
 			return nil, err
 		}
 		if err := m.advanceTree(); err != nil {
@@ -394,7 +435,9 @@ func (m *mergedEntries) advanceTree() error {
 	if err != nil {
 		return err
 	}
-	if ok && m.end != nil && bytes.Compare(entry.Key, m.end) >= 0 {
+	if ok && m.reverse && bytes.Compare(entry.Key, m.iv.start) < 0 {
+		ok = false
+	} else if ok && !m.reverse && m.iv.end != nil && bytes.Compare(entry.Key, m.iv.end) >= 0 {
 		ok = false
 	}
 	m.treeNext, m.treeOK = entry, ok
@@ -409,7 +452,7 @@ func (m *mergedEntries) next() (key string, value []byte, fromOverlay, ok bool, 
 	switch {
 	case !hasOverlay && !m.treeOK:
 		return "", nil, false, false, nil
-	case hasOverlay && (!m.treeOK || overlayKey <= string(m.treeNext.Key)):
+	case hasOverlay && (!m.treeOK || !before(string(m.treeNext.Key), overlayKey, m.reverse)):
 		key = overlayKey
 		if err := m.overlay.advance(); err != nil {
 			return "", nil, false, false, err
@@ -441,6 +484,7 @@ func (m *mergedEntries) close() error {
 // primaryRowIter streams table rows in primary-key order over intervals.
 type primaryRowIter struct {
 	state      *tableState
+	reverse    bool
 	projection *rowProjection
 	intervals  []keyInterval
 	next       int
@@ -451,11 +495,12 @@ type primaryRowIter struct {
 	keys []string
 }
 
-func newPrimaryRowIter(state *tableState, intervals []keyInterval, projection *rowProjection) *primaryRowIter {
-	it := &primaryRowIter{state: state, intervals: intervals, projection: projection}
+func newPrimaryRowIter(state *tableState, intervals []keyInterval, projection *rowProjection, reverse bool) *primaryRowIter {
+	intervals = scanOrder(intervals, reverse)
+	it := &primaryRowIter{state: state, intervals: intervals, projection: projection, reverse: reverse}
 	if state.rows != nil {
 		for _, iv := range intervals {
-			it.keys = append(it.keys, sortedOverlayKeys(state.rows, iv)...)
+			it.keys = append(it.keys, sortedOverlayKeys(state.rows, iv, reverse)...)
 		}
 	}
 	return it
@@ -478,8 +523,8 @@ func (it *primaryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 			iv := it.intervals[it.next]
 			it.next++
-			it.overlay = newRowOverlayCursor(it.state, iv)
-			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.DataRoot, iv, it.overlay)
+			it.overlay = newRowOverlayCursor(it.state, iv, it.reverse)
+			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.DataRoot, iv, it.overlay, it.reverse)
 			if err != nil {
 				return nil, err
 			}
@@ -535,6 +580,7 @@ func (it *primaryRowIter) Close(*sql.Context) error {
 // index's key space, merging the index tree with its pending edits.
 type indexRowIter struct {
 	state      *tableState
+	reverse    bool
 	projection *rowProjection
 	def        *indexDisk
 	intervals  []keyInterval
@@ -544,7 +590,7 @@ type indexRowIter struct {
 	cursor     *pendingCursor
 }
 
-func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, intervals []keyInterval, projection *rowProjection) (*indexRowIter, error) {
+func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, intervals []keyInterval, projection *rowProjection, reverse bool) (*indexRowIter, error) {
 	if err := state.ensureIndexEdits(ctx); err != nil {
 		return nil, err
 	}
@@ -552,7 +598,7 @@ func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, int
 	if edits := state.idxEdits[def.Name]; edits != nil {
 		overlay = edits.view()
 	}
-	return &indexRowIter{state: state, projection: projection, def: def, intervals: intervals, overlay: overlay}, nil
+	return &indexRowIter{state: state, reverse: reverse, projection: projection, def: def, intervals: scanOrder(intervals, reverse), overlay: overlay}, nil
 }
 
 func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
@@ -563,8 +609,8 @@ func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 			iv := it.intervals[it.next]
 			it.next++
-			it.cursor = newPendingCursor(it.overlay, iv)
-			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.Indexes[it.def.Name], iv, it.cursor)
+			it.cursor = newPendingCursor(it.overlay, iv, it.reverse)
+			cur, err := newMergedEntries(ctx, it.state.store, it.state.manifest.Indexes[it.def.Name], iv, it.cursor, it.reverse)
 			if err != nil {
 				return nil, err
 			}

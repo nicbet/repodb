@@ -1,6 +1,7 @@
 package prolly_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -583,4 +584,53 @@ func TestCountMatchesEntries(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestReverseIteratorMatchesForward(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	for _, count := range []int{0, 1, 127, 128, 129, 5000} {
+		entries := make([]prolly.Entry, count)
+		for i := range entries {
+			entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%05d", i*2)), Value: []byte(fmt.Sprintf("v%d", i))}
+		}
+		tree, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Bounds: none, before every key, between keys, on a key, past the end.
+		for _, end := range [][]byte{nil, []byte("a"), []byte("key-00001"), []byte("key-00100"), []byte(fmt.Sprintf("key-%05d", count)), []byte("z")} {
+			var want []string
+			for i := len(entries) - 1; i >= 0; i-- {
+				if end == nil || bytes.Compare(entries[i].Key, end) < 0 {
+					want = append(want, string(entries[i].Key))
+				}
+			}
+			it, err := tree.ReverseIterator(ctx, end)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for {
+				entry, ok, err := it.Next()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !ok {
+					break
+				}
+				got = append(got, string(entry.Key))
+			}
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("%d entries, end %q: got %d keys, want %d (first %v vs %v)", count, end, len(got), len(want), head(got), head(want))
+			}
+		}
+	}
+}
+
+func head(keys []string) []string {
+	if len(keys) > 3 {
+		return keys[:3]
+	}
+	return keys
 }

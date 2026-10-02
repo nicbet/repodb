@@ -7,9 +7,10 @@ import (
 	"github.com/nicbet/repodb/engine"
 )
 
-// BenchmarkSQLAutocommitScans measures range, ordered-limit, full-scan, join
-// and count queries in their own implicit transactions over a checkpointed
-// 50k-row journal table. The join is the scorecard's join_aggregate.
+// BenchmarkSQLAutocommitScans measures range, ordered-limit (both directions),
+// full-scan, join and count queries in their own implicit transactions over a
+// checkpointed 50k-row journal table. The join is the scorecard's
+// join_aggregate.
 func BenchmarkSQLAutocommitScans(b *testing.B) {
 	eng, repo := sqlBenchmarkEngineWithRepository(b, 50_000, 32, 1)
 	if err := eng.Close(); err != nil {
@@ -33,6 +34,7 @@ func BenchmarkSQLAutocommitScans(b *testing.B) {
 	for _, q := range []struct{ name, sql string }{
 		{"range100", "SELECT id, value FROM bench WHERE id BETWEEN 25000 AND 25099"},
 		{"limit20", "SELECT id, value FROM bench ORDER BY id LIMIT 20"},
+		{"desc-limit20", "SELECT id, value FROM bench ORDER BY id DESC LIMIT 20"},
 		{"after-limit20", "SELECT id, value FROM bench WHERE id > 49000 ORDER BY id LIMIT 20"},
 		{"range10k", "SELECT id, value FROM bench WHERE id BETWEEN 20000 AND 29999"},
 		{"fullscan", "SELECT id, value FROM bench"},

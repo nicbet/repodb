@@ -104,15 +104,33 @@ func (p PendingRows) Iter(start, end []byte) *PendingIter {
 	return it
 }
 
-// PendingIter walks a PendingRows in key order.
+// IterReverse returns an iterator over the newest edit for each key in
+// [start, end), in descending key order. A nil end is unbounded.
+func (p PendingRows) IterReverse(start, end []byte) *PendingIter {
+	it := &PendingIter{runs: p.runs, pos: make([]int, len(p.runs)), start: start, reverse: true}
+	for r, run := range p.runs {
+		it.pos[r] = len(run) - 1
+		if end != nil {
+			it.pos[r] = sort.Search(len(run), func(i int) bool { return bytes.Compare(run[i].Key, end) >= 0 }) - 1
+		}
+	}
+	return it
+}
+
+// PendingIter walks a PendingRows in key order, ascending or descending.
 type PendingIter struct {
-	runs []pendingRun
-	pos  []int
-	end  []byte
+	runs    []pendingRun
+	pos     []int // per run: the next index, counting up, or down when reverse
+	end     []byte
+	start   []byte
+	reverse bool
 }
 
 // Next returns the next edit, or ok=false at the end.
 func (it *PendingIter) Next() (edit TypedRowEdit, ok bool) {
+	if it.reverse {
+		return it.prev()
+	}
 	best := -1
 	for r, run := range it.runs {
 		if it.pos[r] >= len(run) {
@@ -136,6 +154,35 @@ func (it *PendingIter) Next() (edit TypedRowEdit, ok bool) {
 	for r, run := range it.runs {
 		if it.pos[r] < len(run) && bytes.Equal(run[it.pos[r]].Key, edit.Key) {
 			it.pos[r]++
+		}
+	}
+	return edit, true
+}
+
+func (it *PendingIter) prev() (edit TypedRowEdit, ok bool) {
+	best := -1
+	for r, run := range it.runs {
+		if it.pos[r] < 0 {
+			continue
+		}
+		// Runs are newest first, so on equal keys the earlier run wins.
+		if best < 0 || bytes.Compare(run[it.pos[r]].Key, it.runs[best][it.pos[best]].Key) > 0 {
+			best = r
+		}
+	}
+	if best < 0 {
+		return TypedRowEdit{}, false
+	}
+	edit = it.runs[best][it.pos[best]]
+	if it.start != nil && bytes.Compare(edit.Key, it.start) < 0 {
+		for r := range it.pos {
+			it.pos[r] = -1
+		}
+		return TypedRowEdit{}, false
+	}
+	for r, run := range it.runs {
+		if it.pos[r] >= 0 && bytes.Equal(run[it.pos[r]].Key, edit.Key) {
+			it.pos[r]--
 		}
 	}
 	return edit, true

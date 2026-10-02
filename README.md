@@ -211,7 +211,8 @@ Done
 - [x] Indexed range and ordered-scan queries, compact binary row storage
 
 Now: finish the performance envelope
-- [ ] Reverse index scans for `ORDER BY … DESC LIMIT`; fewer Git subprocesses per sync; append-heavy workload profiling
+- [x] Reverse index scans for `ORDER BY … DESC LIMIT`
+- [ ] Fewer Git subprocesses per sync; append-heavy workload profiling
 - [ ] Concurrent writers: per-key conflict detection, group commit, safe automatic retry, MySQL-compatible conflict errors
 
 Next: a standalone Git-native relational database

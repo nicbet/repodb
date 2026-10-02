@@ -150,7 +150,7 @@ So engines in other processes, and the server, observe each other's commits.
 - Every access path decodes only the columns the query uses: go-mysql-server pushes the needed columns down (`sql.ProjectedTable`), and the row decoder skips the other cells. A scan that needs no column, such as the counted side of a join, decodes no rows.
 - Stored keys are not re-derived from rows during reads: snapshot validation checks every stored row's key once per snapshot.
 - `SELECT COUNT(*) FROM t` reads the row count from the data tree's root when the transaction sees no pending edits (`sql.StatisticsTable`); otherwise it counts while scanning.
-- Iteration is forward-only, so `ORDER BY … DESC` sorts (rdb-acd36d).
+- Scans run in either direction. For `ORDER BY <index columns> DESC`, go-mysql-server asks for a reverse lookup, and RepoDB walks the tree, the pending journal edits and the transaction's own edits from the end of each key interval, visiting intervals last to first. A reverse scan decodes each leaf whole, because entries are length-prefixed only forward.
 
 ## Writes and persistence modes
 

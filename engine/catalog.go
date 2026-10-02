@@ -1081,20 +1081,20 @@ func (t *table) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.
 	}
 	if _, isPrimary := lookup.Index.(*primaryIndex); isPrimary {
 		if allFullPointRanges(ranges, len(t.state.schema.PkOrdinals)) {
-			return t.lookupPrimaryPartitions(ctx, ranges)
+			return t.lookupPrimaryPartitions(ctx, ranges, lookup.IsReverse)
 		}
 		intervals, err := rangeIntervals(ctx, t.columnTypes(t.state.schema.PkOrdinals), false, ranges)
 		if err != nil {
 			return nil, err
 		}
-		return sql.PartitionsToPartitionIter(rangePartition{intervals: intervals}), nil
+		return sql.PartitionsToPartitionIter(rangePartition{intervals: intervals, reverse: lookup.IsReverse}), nil
 	}
 	if si, isSecondary := lookup.Index.(*secondaryIndex); isSecondary {
 		intervals, err := rangeIntervals(ctx, t.columnTypes(si.def.Columns), true, ranges)
 		if err != nil {
 			return nil, err
 		}
-		return sql.PartitionsToPartitionIter(rangePartition{intervals: intervals, index: si.def}), nil
+		return sql.PartitionsToPartitionIter(rangePartition{intervals: intervals, index: si.def, reverse: lookup.IsReverse}), nil
 	}
 	return nil, fmt.Errorf("unsupported index type %T", lookup.Index)
 }
@@ -1123,7 +1123,7 @@ func allFullPointRanges(ranges sql.MySQLRangeCollection, n int) bool {
 	return true
 }
 
-func (t *table) lookupPrimaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection) (sql.PartitionIter, error) {
+func (t *table) lookupPrimaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeCollection, reverse bool) (sql.PartitionIter, error) {
 	keys := make([]string, 0, len(ranges))
 	for _, indexRange := range ranges {
 		row := make(sql.Row, len(t.state.schema.Schema))
@@ -1151,6 +1151,9 @@ func (t *table) lookupPrimaryPartitions(ctx *sql.Context, ranges sql.MySQLRangeC
 	// Keys are order-preserving: sorted keys return rows in index order.
 	sort.Strings(keys)
 	keys = slices.Compact(keys)
+	if reverse {
+		slices.Reverse(keys)
+	}
 	return sql.PartitionsToPartitionIter(pointPartition{keys: keys}), nil
 }
 
@@ -1175,12 +1178,12 @@ func (t *table) partitionRows(ctx context.Context, partition sql.Partition) (sql
 	}
 	if rp, ok := partition.(rangePartition); ok {
 		if rp.index != nil {
-			return newIndexRowIter(ctx, t.state, rp.index, rp.intervals, t.projection)
+			return newIndexRowIter(ctx, t.state, rp.index, rp.intervals, t.projection, rp.reverse)
 		}
-		return newPrimaryRowIter(t.state, rp.intervals, t.projection), nil
+		return newPrimaryRowIter(t.state, rp.intervals, t.projection, rp.reverse), nil
 	}
 	// A full scan streams every row in primary-key order.
-	return newPrimaryRowIter(t.state, []keyInterval{{}}, t.projection), nil
+	return newPrimaryRowIter(t.state, []keyInterval{{}}, t.projection, false), nil
 }
 func (t *table) Inserter(*sql.Context) sql.RowInserter { return &editor{table: t} }
 func (t *table) Updater(*sql.Context) sql.RowUpdater   { return &editor{table: t} }
@@ -1733,10 +1736,10 @@ func (*primaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
 }
 
 // Order and Reversible make the primary index an sql.OrderedIndex: keys are
-// order-preserving, so scans return rows in ascending primary-key order and
-// the planner can drop matching sorts. Reverse scans are not implemented.
+// order-preserving, so scans return rows in ascending primary-key order, or
+// descending for a reverse lookup, and the planner can drop matching sorts.
 func (*primaryIndex) Order(*sql.Context) sql.IndexOrder { return sql.IndexOrderAsc }
-func (*primaryIndex) Reversible(*sql.Context) bool      { return false }
+func (*primaryIndex) Reversible(*sql.Context) bool      { return true }
 
 func canSupportRanges(ranges []sql.Range, nullable bool) bool {
 	for _, candidate := range ranges {
@@ -1785,7 +1788,7 @@ func (*secondaryIndex) CanSupport(_ *sql.Context, ranges ...sql.Range) bool {
 }
 
 func (*secondaryIndex) Order(*sql.Context) sql.IndexOrder { return sql.IndexOrderAsc }
-func (*secondaryIndex) Reversible(*sql.Context) bool      { return false }
+func (*secondaryIndex) Reversible(*sql.Context) bool      { return true }
 
 type editor struct {
 	table  *table

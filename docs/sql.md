@@ -49,8 +49,7 @@ These types are not supported, and the error is `unsupported SQL type <type>`:
 Index-using queries:
 - **Point lookups** use the primary key or a secondary index.
 - **Ranges** (`<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `IS [NOT] NULL`) use an index when the predicate fixes a prefix of the index columns and ranges over at most one following column. Other shapes still return correct results, from a full scan with a filter.
-- **Ascending order.** `ORDER BY <index columns> [ASC] … LIMIT n` is served in index order without sorting, and stops after `n` rows.
-- **Descending order.** `ORDER BY … DESC` sorts the matching rows (rdb-acd36d).
+- **Ordered scans.** `ORDER BY <index columns> [ASC|DESC] … LIMIT n` is served in index order, scanning backwards for `DESC`, without sorting, and stops after `n` rows. In a descending scan of a secondary index, NULLs come last, and rows with equal index values come in descending primary-key order.
 - **Secondary lookups** fetch each row by primary key; indexes are never covering.
 
 ### Changing tables

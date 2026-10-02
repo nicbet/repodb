@@ -50,6 +50,22 @@ func checkPending(t *testing.T, label string, p PendingRows, model pendingModel)
 			t.Fatalf("%s: Get(%q) = %q/%v/%v, want %q/%v", label, key, edit.Value, edit.Delete, ok, want.Value, want.Delete)
 		}
 	}
+	var reversed []TypedRowEdit
+	for it := p.IterReverse(nil, nil); ; {
+		edit, ok := it.Next()
+		if !ok {
+			break
+		}
+		reversed = append(reversed, edit)
+	}
+	for i := range reversed {
+		if !bytes.Equal(reversed[i].Key, got[len(got)-1-i].Key) {
+			t.Fatalf("%s: reverse edit %d = %q, want %q", label, i, reversed[i].Key, got[len(got)-1-i].Key)
+		}
+	}
+	if len(reversed) != len(got) {
+		t.Fatalf("%s: reverse iterated %d edits, want %d", label, len(reversed), len(got))
+	}
 	if _, ok := p.Get([]byte("absent")); ok {
 		t.Fatalf("%s: Get found an absent key", label)
 	}
@@ -118,5 +134,16 @@ func TestPendingRowsIterInterval(t *testing.T) {
 	}
 	if got, want := fmt.Sprint(keys), "[k10:true k11:false k12:false]"; got != want {
 		t.Fatalf("interval = %s, want %s", got, want)
+	}
+	keys = nil
+	for it := p.IterReverse([]byte("k10"), []byte("k13")); ; {
+		edit, ok := it.Next()
+		if !ok {
+			break
+		}
+		keys = append(keys, fmt.Sprintf("%s:%v", edit.Key, edit.Delete))
+	}
+	if got, want := fmt.Sprint(keys), "[k12:false k11:false k10:true]"; got != want {
+		t.Fatalf("reverse interval = %s, want %s", got, want)
 	}
 }
