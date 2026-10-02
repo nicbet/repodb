@@ -272,3 +272,41 @@ func FuzzDecodeRow(f *testing.F) {
 		}
 	})
 }
+
+func TestDecodeRowProjectedMatchesDecodeRow(t *testing.T) {
+	schema, row := wideRow(t)
+	data, err := encodeRow(schema, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := decodeRow(schema, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := make([]int, len(schema))
+	for i := range all {
+		all[i] = i
+	}
+	projections := [][]int{{}, all}
+	for i := range schema {
+		projections = append(projections, []int{i}, []int{len(schema) - 1 - i, i})
+	}
+	for _, ordinals := range projections {
+		p := newRowProjection(len(schema), ordinals)
+		if (p == nil) != (len(ordinals) == len(schema) && ordinals[0] == 0) {
+			t.Fatalf("projection %v: nil = %v", ordinals, p == nil)
+		}
+		got, err := decodeRowProjected(schema, data, p)
+		if err != nil {
+			t.Fatalf("projection %v: %v", ordinals, err)
+		}
+		if len(got) != len(ordinals) {
+			t.Fatalf("projection %v: %d cells", ordinals, len(got))
+		}
+		for j, ordinal := range ordinals {
+			if !sameCell(full[ordinal], got[j]) {
+				t.Fatalf("projection %v: cell %d = %v, want %v", ordinals, j, got[j], full[ordinal])
+			}
+		}
+	}
+}

@@ -5,7 +5,7 @@ package prolly
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -16,9 +16,11 @@ import (
 
 var ErrNotFound = errors.New("key not found")
 
+// Entry is one key and value. Entries returned by a tree alias its stored
+// node bytes, which are shared and must not be modified.
 type Entry struct {
-	Key   []byte `json:"key"`
-	Value []byte `json:"value"`
+	Key   []byte
+	Value []byte
 }
 
 // Edit replaces or deletes one key. Apply requires edits in strictly increasing
@@ -29,15 +31,18 @@ type Edit struct {
 	Delete bool
 }
 
+// link points at a child node: its largest key, the number of leaf entries
+// below it and its hash.
 type link struct {
-	MaxKey []byte       `json:"max_key"`
-	Hash   storage.Hash `json:"hash"`
+	MaxKey []byte
+	Count  uint64
+	Hash   storage.Hash
 }
 
 type node struct {
-	Level    uint8   `json:"level"`
-	Entries  []Entry `json:"entries,omitempty"`
-	Children []link  `json:"children,omitempty"`
+	Level    uint8
+	Entries  []Entry
+	Children []link
 }
 
 type Options struct {
@@ -55,13 +60,13 @@ type Tree struct {
 }
 
 // Iterator lazily walks a tree in key order. At most one node per tree level is
-// retained, so callers do not need to materialize the complete entry set.
+// retained, so callers do not need to materialize the complete entry set. The
+// current leaf is parsed in place, one entry per Next.
 type Iterator struct {
 	ctx   context.Context
 	store storage.Store
 	stack []iteratorFrame
-	leaf  []Entry
-	index int
+	leaf  nodeReader
 	done  bool
 }
 
@@ -124,7 +129,7 @@ func Build(ctx context.Context, store storage.Store, entries []Entry, options Op
 		if err != nil {
 			return nil, err
 		}
-		links = append(links, link{MaxKey: clone(group[len(group)-1].Key), Hash: hash})
+		links = append(links, link{MaxKey: clone(group[len(group)-1].Key), Count: uint64(len(group)), Hash: hash})
 	}
 	if len(links) == 1 {
 		return &Tree{store: store, root: links[0].Hash, options: options}, nil
@@ -139,7 +144,7 @@ func Build(ctx context.Context, store storage.Store, entries []Entry, options Op
 			if err != nil {
 				return nil, err
 			}
-			next = append(next, link{MaxKey: clone(group[len(group)-1].MaxKey), Hash: hash})
+			next = append(next, link{MaxKey: clone(group[len(group)-1].MaxKey), Count: sumCounts(group), Hash: hash})
 		}
 		links = next
 		level++
@@ -225,7 +230,7 @@ func Apply(ctx context.Context, store storage.Store, tree *Tree, edits []Edit) (
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, link{Hash: hash})
+		result = append(result, link{Hash: hash, Count: 0})
 	}
 	return buildFromLeafLinks(ctx, store, result, tree.options)
 }
@@ -257,7 +262,7 @@ func (c *leafChunker) flush() error {
 	if err != nil {
 		return err
 	}
-	*c.links = append(*c.links, link{MaxKey: clone(group[len(group)-1].Key), Hash: hash})
+	*c.links = append(*c.links, link{MaxKey: clone(group[len(group)-1].Key), Count: uint64(len(group)), Hash: hash})
 	return nil
 }
 
@@ -271,7 +276,7 @@ func leafLinks(ctx context.Context, store storage.Store, root storage.Hash) ([]l
 		if len(n.Entries) != 0 {
 			max = clone(n.Entries[len(n.Entries)-1].Key)
 		}
-		return []link{{MaxKey: max, Hash: root}}, nil
+		return []link{{MaxKey: max, Count: uint64(len(n.Entries)), Hash: root}}, nil
 	}
 	if n.Level == 1 {
 		return append([]link(nil), n.Children...), nil
@@ -301,7 +306,7 @@ func buildFromLeafLinks(ctx context.Context, store storage.Store, leaves []link,
 			if err != nil {
 				return nil, err
 			}
-			next = append(next, link{MaxKey: clone(group[len(group)-1].MaxKey), Hash: hash})
+			next = append(next, link{MaxKey: clone(group[len(group)-1].MaxKey), Count: sumCounts(group), Hash: hash})
 		}
 		links = next
 		level++
@@ -379,7 +384,7 @@ func (b *SortedBuilder) flushLeaf() error {
 	if err != nil {
 		return err
 	}
-	return b.addLink(0, link{MaxKey: clone(group[len(group)-1].Key), Hash: hash})
+	return b.addLink(0, link{MaxKey: clone(group[len(group)-1].Key), Count: uint64(len(group)), Hash: hash})
 }
 
 func (b *SortedBuilder) addLink(level int, item link) error {
@@ -402,7 +407,7 @@ func (b *SortedBuilder) flushLinks(level int) error {
 	if err != nil {
 		return err
 	}
-	return b.addLink(level+1, link{MaxKey: clone(group[len(group)-1].MaxKey), Hash: hash})
+	return b.addLink(level+1, link{MaxKey: clone(group[len(group)-1].MaxKey), Count: sumCounts(group), Hash: hash})
 }
 
 func (b *SortedBuilder) hasLinksAbove(level int) bool {
@@ -436,8 +441,9 @@ func (t *Tree) IteratorFrom(ctx context.Context, startKey []byte) (*Iterator, er
 	return it, nil
 }
 
-// Next returns the next entry, or ok=false at end of input. Returned bytes are
-// owned by the caller and remain valid after subsequent calls.
+// Next returns the next entry, or ok=false at end of input. The returned bytes
+// are shared with the store: they stay valid after later calls but must not be
+// modified.
 func (it *Iterator) Next() (entry Entry, ok bool, err error) {
 	if it.done {
 		return Entry{}, false, nil
@@ -447,10 +453,19 @@ func (it *Iterator) Next() (entry Entry, ok bool, err error) {
 		return Entry{}, false, err
 	}
 	for {
-		if it.index < len(it.leaf) {
-			entry := it.leaf[it.index]
-			it.index++
+		if it.leaf.remaining > 0 {
+			entry, err := it.leaf.nextEntry()
+			if err != nil {
+				it.Close()
+				return Entry{}, false, err
+			}
 			return entry, true, nil
+		}
+		if it.leaf.data != nil {
+			if err := it.leaf.finish(); err != nil {
+				it.Close()
+				return Entry{}, false, err
+			}
 		}
 		if err := it.advance(); err != nil {
 			it.Close()
@@ -465,20 +480,33 @@ func (it *Iterator) Next() (entry Entry, ok bool, err error) {
 // Close releases iterator buffers. It is safe to call more than once.
 func (it *Iterator) Close() error {
 	it.stack = nil
-	it.leaf = nil
+	it.leaf = nodeReader{}
 	it.done = true
 	return nil
 }
 
+// openNode reads a node and positions a reader at its first item.
+func openNode(ctx context.Context, store storage.Store, hash storage.Hash) (nodeReader, error) {
+	data, err := store.Get(ctx, hash)
+	if err != nil {
+		return nodeReader{}, err
+	}
+	return newNodeReader(hash, data)
+}
+
 func (it *Iterator) descend(hash storage.Hash) error {
 	for {
-		n, err := readNode(it.ctx, it.store, hash)
+		r, err := openNode(it.ctx, it.store, hash)
 		if err != nil {
 			return err
 		}
-		if n.Level == 0 {
-			it.leaf, it.index = n.Entries, 0
+		if r.level == 0 {
+			it.leaf = r
 			return nil
+		}
+		n, err := r.decode()
+		if err != nil {
+			return err
 		}
 		if len(n.Children) == 0 {
 			return fmt.Errorf("invalid internal Prolly node %s", hash)
@@ -490,19 +518,30 @@ func (it *Iterator) descend(hash storage.Hash) error {
 
 func (it *Iterator) seekTo(hash storage.Hash, startKey []byte) error {
 	for {
-		n, err := readNode(it.ctx, it.store, hash)
+		r, err := openNode(it.ctx, it.store, hash)
 		if err != nil {
 			return err
 		}
-		if n.Level == 0 {
-			i := sort.Search(len(n.Entries), func(i int) bool {
-				return bytes.Compare(n.Entries[i].Key, startKey) >= 0
-			})
-			if i == len(n.Entries) {
-				return it.advance()
+		if r.level == 0 {
+			for r.remaining > 0 {
+				before := r
+				entry, err := r.nextEntry()
+				if err != nil {
+					return err
+				}
+				if bytes.Compare(entry.Key, startKey) >= 0 {
+					it.leaf = before
+					return nil
+				}
 			}
-			it.leaf, it.index = n.Entries, i
-			return nil
+			if err := r.finish(); err != nil {
+				return err
+			}
+			return it.advance()
+		}
+		n, err := r.decode()
+		if err != nil {
+			return err
 		}
 		if len(n.Children) == 0 {
 			return fmt.Errorf("invalid internal Prolly node %s", hash)
@@ -520,6 +559,7 @@ func (it *Iterator) seekTo(hash storage.Hash, startKey []byte) error {
 }
 
 func (it *Iterator) advance() error {
+	it.leaf = nodeReader{}
 	for len(it.stack) != 0 {
 		top := &it.stack[len(it.stack)-1]
 		if top.next < len(top.node.Children) {
@@ -530,14 +570,13 @@ func (it *Iterator) advance() error {
 		it.stack = it.stack[:len(it.stack)-1]
 	}
 	it.done = true
-	it.leaf = nil
 	return nil
 }
 
 // Entries returns every entry in key order.
 func (t *Tree) Entries(ctx context.Context) ([]Entry, error) {
 	var entries []Entry
-	if err := walk(ctx, t.store, t.root, nil, func(n node) {
+	if _, err := walk(ctx, t.store, t.root, nil, func(n node) {
 		if n.Level == 0 {
 			entries = append(entries, cloneEntries(n.Entries)...)
 		}
@@ -549,8 +588,8 @@ func (t *Tree) Entries(ctx context.Context) ([]Entry, error) {
 
 // Reachable validates the tree and returns every reachable object hash.
 func Reachable(ctx context.Context, store storage.Store, root storage.Hash) ([]storage.Hash, error) {
-	seen := make(map[storage.Hash]struct{})
-	if err := walk(ctx, store, root, seen, nil); err != nil {
+	seen := make(map[storage.Hash]uint64)
+	if _, err := walk(ctx, store, root, seen, nil); err != nil {
 		return nil, err
 	}
 	hashes := make([]storage.Hash, 0, len(seen))
@@ -561,69 +600,115 @@ func Reachable(ctx context.Context, store storage.Store, root storage.Hash) ([]s
 	return hashes, nil
 }
 
-func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[storage.Hash]struct{}, visit func(node)) error {
+// walk validates the subtree at hash and returns its number of leaf entries.
+// seen, when set, records the count of each visited node so shared subtrees
+// are walked once.
+func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[storage.Hash]uint64, visit func(node)) (uint64, error) {
 	if seen != nil {
-		if _, ok := seen[hash]; ok {
-			return nil
+		if count, ok := seen[hash]; ok {
+			return count, nil
 		}
-		seen[hash] = struct{}{}
 	}
 	n, err := readNode(ctx, store, hash)
 	if err != nil {
-		return fmt.Errorf("read Prolly node %s: %w", hash, err)
+		return 0, fmt.Errorf("read Prolly node %s: %w", hash, err)
 	}
+	var count uint64
 	if n.Level == 0 {
 		if len(n.Children) != 0 {
-			return fmt.Errorf("leaf Prolly node %s has children", hash)
+			return 0, fmt.Errorf("leaf Prolly node %s has children", hash)
 		}
 		for i := 1; i < len(n.Entries); i++ {
 			if bytes.Compare(n.Entries[i-1].Key, n.Entries[i].Key) >= 0 {
-				return fmt.Errorf("prolly node %s entries are not strictly ordered", hash)
+				return 0, fmt.Errorf("prolly node %s entries are not strictly ordered", hash)
 			}
 		}
+		count = uint64(len(n.Entries))
 	} else {
 		if len(n.Entries) != 0 || len(n.Children) == 0 {
-			return fmt.Errorf("invalid internal Prolly node %s", hash)
+			return 0, fmt.Errorf("invalid internal Prolly node %s", hash)
 		}
 		for i, child := range n.Children {
 			if !child.Hash.Valid() || (i > 0 && bytes.Compare(n.Children[i-1].MaxKey, child.MaxKey) >= 0) {
-				return fmt.Errorf("invalid child link in Prolly node %s", hash)
+				return 0, fmt.Errorf("invalid child link in Prolly node %s", hash)
 			}
-			if err := walk(ctx, store, child.Hash, seen, visit); err != nil {
-				return err
+			childCount, err := walk(ctx, store, child.Hash, seen, visit)
+			if err != nil {
+				return 0, err
 			}
+			if childCount != child.Count {
+				return 0, fmt.Errorf("child link in Prolly node %s counts %d entries, child has %d", hash, child.Count, childCount)
+			}
+			count += childCount
 		}
+	}
+	if seen != nil {
+		seen[hash] = count
 	}
 	if visit != nil {
 		visit(n)
 	}
-	return nil
+	return count, nil
 }
 
+// Get returns a copy of the value stored under key.
 func (t *Tree) Get(ctx context.Context, key []byte) ([]byte, error) {
 	hash := t.root
 	for {
-		n, err := readNode(ctx, t.store, hash)
+		r, err := openNode(ctx, t.store, hash)
 		if err != nil {
 			return nil, err
 		}
-		if n.Level == 0 {
-			i := sort.Search(len(n.Entries), func(i int) bool {
-				return bytes.Compare(n.Entries[i].Key, key) >= 0
-			})
-			if i == len(n.Entries) || !bytes.Equal(n.Entries[i].Key, key) {
-				return nil, ErrNotFound
+		if r.level == 0 {
+			for r.remaining > 0 {
+				entry, err := r.nextEntry()
+				if err != nil {
+					return nil, err
+				}
+				if c := bytes.Compare(entry.Key, key); c == 0 {
+					return clone(entry.Value), nil
+				} else if c > 0 {
+					break
+				}
 			}
-			return clone(n.Entries[i].Value), nil
-		}
-		i := sort.Search(len(n.Children), func(i int) bool {
-			return bytes.Compare(n.Children[i].MaxKey, key) >= 0
-		})
-		if i == len(n.Children) {
 			return nil, ErrNotFound
 		}
-		hash = n.Children[i].Hash
+		found := false
+		for r.remaining > 0 {
+			maxKey, _, raw, err := r.nextLinkRaw()
+			if err != nil {
+				return nil, err
+			}
+			if bytes.Compare(maxKey, key) >= 0 {
+				hash = storage.Hash(hex.EncodeToString(raw))
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, ErrNotFound
+		}
 	}
+}
+
+// Count returns the number of entries in the tree. It reads only the root.
+func (t *Tree) Count(ctx context.Context) (uint64, error) {
+	r, err := openNode(ctx, t.store, t.root)
+	if err != nil {
+		return 0, err
+	}
+	if r.level == 0 {
+		return uint64(r.remaining), nil
+	}
+	var total uint64
+	for r.remaining > 0 {
+		_, count, _, err := r.nextLinkRaw()
+		if err != nil {
+			return 0, err
+		}
+		total += count
+	}
+	return total, r.finish()
 }
 
 func (o Options) validate() error {
@@ -688,7 +773,7 @@ func chunk[T any](length int, options Options, boundaryHash func(int) uint64, sl
 }
 
 func writeNode(ctx context.Context, store storage.Store, n node) (storage.Hash, error) {
-	data, err := json.Marshal(n)
+	data, err := encodeNode(n)
 	if err != nil {
 		return "", err
 	}
@@ -700,11 +785,15 @@ func readNode(ctx context.Context, store storage.Store, hash storage.Hash) (node
 	if err != nil {
 		return node{}, err
 	}
-	var n node
-	if err := json.Unmarshal(data, &n); err != nil {
-		return node{}, fmt.Errorf("decode node %s: %w", hash, err)
+	return decodeNode(hash, data)
+}
+
+func sumCounts(links []link) uint64 {
+	var total uint64
+	for _, l := range links {
+		total += l.Count
 	}
-	return n, nil
+	return total
 }
 
 func cloneEntries(entries []Entry) []Entry {

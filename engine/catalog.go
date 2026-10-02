@@ -877,11 +877,73 @@ type table struct {
 	db    *database
 	name  string
 	state *tableState
+	// projectedNames is the column projection go-mysql-server pushed down, or
+	// nil; projection maps it onto the schema, nil when it is every column.
+	projectedNames []string
+	projection     *rowProjection
 }
 
-func (t *table) Name() string                   { return t.name }
-func (t *table) String() string                 { return t.name }
-func (t *table) Schema(*sql.Context) sql.Schema { return sourcedSchema(t.state.schema.Schema, t.name) }
+func (t *table) Name() string   { return t.name }
+func (t *table) String() string { return t.name }
+func (t *table) Schema(*sql.Context) sql.Schema {
+	schema := t.state.schema.Schema
+	if t.projection != nil {
+		projected := make(sql.Schema, len(t.projection.ordinals))
+		for i, ordinal := range t.projection.ordinals {
+			projected[i] = schema[ordinal]
+		}
+		schema = projected
+	}
+	return sourcedSchema(schema, t.name)
+}
+
+// WithProjections returns the table reading only the named columns, so scans
+// decode no other cells. go-mysql-server applies it only below read-only
+// nodes; writes always see full rows.
+func (t *table) WithProjections(_ *sql.Context, colNames []string) (sql.Table, error) {
+	ordinals := make([]int, len(colNames))
+	for i, name := range colNames {
+		ordinals[i] = t.state.schema.Schema.IndexOfColName(name)
+		if ordinals[i] < 0 {
+			return nil, fmt.Errorf("column %s not found", name)
+		}
+	}
+	projected := *t
+	projected.projectedNames = append([]string{}, colNames...)
+	projected.projection = newRowProjection(len(t.state.schema.Schema), ordinals)
+	return &projected, nil
+}
+
+func (t *table) Projections() []string { return t.projectedNames }
+
+// RowCount reports the table's row count without scanning. It is exact when
+// every row is materialized, or when the transaction sees no overlay edits:
+// the data tree's root records the number of entries below it. With overlay
+// edits it returns an estimate, so go-mysql-server does not answer COUNT(*)
+// from it. go-mysql-server calls it while planning every query.
+func (t *table) RowCount(ctx *sql.Context) (uint64, bool, error) {
+	s := t.state
+	if s.rows != nil {
+		return uint64(len(s.rows)), true, nil
+	}
+	var count uint64
+	if s.manifest.DataRoot.Valid() {
+		tree, err := prolly.Open(s.store, s.manifest.DataRoot)
+		if err != nil {
+			return 0, false, err
+		}
+		if count, err = tree.Count(ctx); err != nil {
+			return 0, false, err
+		}
+	}
+	if s.hasEdits() {
+		return count + uint64(len(s.edits)+s.pending.Len()), false, nil
+	}
+	return count, true, nil
+}
+
+// DataLength is not tracked.
+func (t *table) DataLength(*sql.Context) (uint64, error) { return 0, nil }
 func (t *table) PrimaryKeySchema(*sql.Context) sql.PrimaryKeySchema {
 	return sql.PrimaryKeySchema{Schema: sourcedSchema(t.state.schema.Schema, t.name), PkOrdinals: append([]int(nil), t.state.schema.PkOrdinals...)}
 }
@@ -1097,19 +1159,19 @@ func (t *table) partitionRows(ctx context.Context, partition sql.Partition) (sql
 				return nil, err
 			}
 			if exists {
-				rows = append(rows, row)
+				rows = append(rows, t.projection.project(row))
 			}
 		}
 		return sql.RowsToRowIter(rows...), nil
 	}
 	if rp, ok := partition.(rangePartition); ok {
 		if rp.index != nil {
-			return newIndexRowIter(ctx, t.state, rp.index, rp.intervals)
+			return newIndexRowIter(ctx, t.state, rp.index, rp.intervals, t.projection)
 		}
-		return newPrimaryRowIter(t.state, rp.intervals), nil
+		return newPrimaryRowIter(t.state, rp.intervals, t.projection), nil
 	}
 	// A full scan streams every row in primary-key order.
-	return newPrimaryRowIter(t.state, []keyInterval{{}}), nil
+	return newPrimaryRowIter(t.state, []keyInterval{{}}, t.projection), nil
 }
 func (t *table) Inserter(*sql.Context) sql.RowInserter { return &editor{table: t} }
 func (t *table) Updater(*sql.Context) sql.RowUpdater   { return &editor{table: t} }
@@ -2384,6 +2446,8 @@ var _ sql.TableCreator = (*database)(nil)
 var _ sql.TableDropper = (*database)(nil)
 var _ sql.PrimaryKeyTable = (*table)(nil)
 var _ sql.IndexAddressableTable = (*table)(nil)
+var _ sql.ProjectedTable = (*table)(nil)
+var _ sql.StatisticsTable = (*table)(nil)
 var _ sql.IndexedTable = (*table)(nil)
 var _ sql.Index = (*primaryIndex)(nil)
 var _ sql.Index = (*secondaryIndex)(nil)

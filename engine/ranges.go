@@ -367,8 +367,9 @@ func (m *mergedEntries) advanceTree() error {
 	return nil
 }
 
-// next returns the next key; fromOverlay reports whether the caller must
-// consult the overlay for it, otherwise value is the tree entry's value.
+// next advances to the next key. fromOverlay reports whether it is an overlay
+// key, returned in key, for the caller to look up; otherwise value is the tree
+// entry's value and key is empty.
 func (m *mergedEntries) next() (key string, value []byte, fromOverlay, ok bool, err error) {
 	overlayKey, hasOverlay := m.overlay.peek()
 	switch {
@@ -386,7 +387,9 @@ func (m *mergedEntries) next() (key string, value []byte, fromOverlay, ok bool, 
 		}
 		return key, nil, true, true, nil
 	default:
-		key, value = string(m.treeNext.Key), m.treeNext.Value
+		// Callers use the key only for overlay entries, so a tree entry's key
+		// is not converted.
+		value = m.treeNext.Value
 		if err := m.advanceTree(); err != nil {
 			return "", nil, false, false, err
 		}
@@ -403,18 +406,19 @@ func (m *mergedEntries) close() error {
 
 // primaryRowIter streams table rows in primary-key order over intervals.
 type primaryRowIter struct {
-	state     *tableState
-	intervals []keyInterval
-	next      int
-	cur       *mergedEntries
-	overlay   *rowOverlayCursor
+	state      *tableState
+	projection *rowProjection
+	intervals  []keyInterval
+	next       int
+	cur        *mergedEntries
+	overlay    *rowOverlayCursor
 	// When the transaction has materialized every row (state.rows), rows are
 	// served from it; keys holds the matching keys in order.
 	keys []string
 }
 
-func newPrimaryRowIter(state *tableState, intervals []keyInterval) *primaryRowIter {
-	it := &primaryRowIter{state: state, intervals: intervals}
+func newPrimaryRowIter(state *tableState, intervals []keyInterval, projection *rowProjection) *primaryRowIter {
+	it := &primaryRowIter{state: state, intervals: intervals, projection: projection}
 	if state.rows != nil {
 		for _, iv := range intervals {
 			it.keys = append(it.keys, sortedOverlayKeys(state.rows, iv)...)
@@ -431,7 +435,7 @@ func (it *primaryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 		key := it.keys[it.next]
 		it.next++
 		performanceCounters.rowsScanned.Add(1)
-		return cloneRow(it.state.rows[key]), nil
+		return it.row(it.state.rows[key]), nil
 	}
 	for {
 		if it.cur == nil {
@@ -447,7 +451,7 @@ func (it *primaryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			}
 			it.cur = cur
 		}
-		key, value, fromOverlay, ok, err := it.cur.next()
+		_, value, fromOverlay, ok, err := it.cur.next()
 		if err != nil {
 			return nil, err
 		}
@@ -464,19 +468,26 @@ func (it *primaryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 				continue
 			}
 			performanceCounters.rowsScanned.Add(1)
-			return cloneRow(edit.row), nil
+			return it.row(edit.row), nil
 		}
-		row, err := decodeRow(it.state.schema.Schema, value)
+		// Stored keys are not re-derived from rows here: ValidateSnapshot
+		// checks every stored row's key once per snapshot.
+		row, err := decodeRowProjected(it.state.schema.Schema, value, it.projection)
 		if err != nil {
 			return nil, err
 		}
 		performanceCounters.rowsDecoded.Add(1)
 		performanceCounters.rowsScanned.Add(1)
-		if encoded, err := encodeKey(it.state.schema, row); err != nil || string(encoded) != key {
-			return nil, errors.New("stored row key does not match row primary key")
-		}
 		return row, nil
 	}
+}
+
+// row returns a caller-owned copy of an in-memory row, projected.
+func (it *primaryRowIter) row(row sql.Row) sql.Row {
+	if it.projection != nil {
+		return it.projection.project(row)
+	}
+	return cloneRow(row)
 }
 
 func (it *primaryRowIter) Close(*sql.Context) error {
@@ -489,15 +500,16 @@ func (it *primaryRowIter) Close(*sql.Context) error {
 // indexRowIter streams rows in secondary-index order over intervals of the
 // index's key space, merging the index tree with its pending edits.
 type indexRowIter struct {
-	state     *tableState
-	def       *indexDisk
-	intervals []keyInterval
-	next      int
-	cur       *mergedEntries
-	overlay   map[string]prolly.Edit
+	state      *tableState
+	projection *rowProjection
+	def        *indexDisk
+	intervals  []keyInterval
+	next       int
+	cur        *mergedEntries
+	overlay    map[string]prolly.Edit
 }
 
-func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, intervals []keyInterval) (*indexRowIter, error) {
+func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, intervals []keyInterval, projection *rowProjection) (*indexRowIter, error) {
 	if err := state.ensureIndexEdits(ctx); err != nil {
 		return nil, err
 	}
@@ -505,7 +517,7 @@ func newIndexRowIter(ctx context.Context, state *tableState, def *indexDisk, int
 	for _, edit := range state.idxEdits[def.Name] {
 		overlay[string(edit.Key)] = edit // last edit per key wins
 	}
-	return &indexRowIter{state: state, def: def, intervals: intervals, overlay: overlay}, nil
+	return &indexRowIter{state: state, projection: projection, def: def, intervals: intervals, overlay: overlay}, nil
 }
 
 func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
@@ -546,7 +558,7 @@ func (it *indexRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			return nil, err
 		}
 		if exists {
-			return row, nil
+			return it.projection.project(row), nil
 		}
 	}
 }

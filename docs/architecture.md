@@ -12,7 +12,7 @@ This page describes how the pieces work today. Usage is in [cli.md](cli.md) and 
 | `common/repository` | Repositories and snapshots: manifests, object inventories, publication to Git with commit outcomes and recovery, locking, and the journal (`WorkingState`). |
 | `common/prolly` | Immutable, content-addressed Prolly trees: build, sorted streaming build, incremental `Apply`, seekable iterators, reachability. |
 | `common/git` | Runs the `git` executable: object and tree writes with explicit fsync settings, `cat-file --batch` reads, ref updates, fetch and push. |
-| `common/storage` | The content-addressed `Store` interface and SHA-256 hashes (`storage.Sum`), plus an in-memory store. |
+| `common/storage` | The content-addressed `Store` interface and SHA-256 hashes (`storage.Sum`), plus an in-memory store. `Get` returns the stored bytes themselves, shared with other readers, so callers never modify them. |
 | `common/robustio` | Rename and remove with retries for Windows sharing violations. |
 | `integration` | `Enable`, `Sync`, `Conflicts`, `Resolve`: remote configuration, transport, merge and conflict records. |
 | `server`, `client` | The MySQL wire server around an engine, and a Go client that decodes RepoDB commit errors. |
@@ -45,14 +45,14 @@ objects/sha256/ab/cdef…   # one blob per RepoDB object, named by its SHA-256
 ```
 
 `manifest.json` holds:
-- `format_version` (currently 3);
+- `format_version` (currently 5);
 - `default_database` (`repodb`);
 - `tables`, mapping each table name to its schema root, data root and one root per secondary index;
 - `objects`, the sorted, complete inventory of object hashes.
 
 **Identities.** RepoDB identifies objects by SHA-256 of their content. The Git blob ID is a separate identity, so a repository may use Git's SHA-1 or SHA-256 object format.
 
-**Commit parents.** A data commit's parent is the previous data head, and merges have two parents. SQL commits in native-git mode use the subject `RepoDB snapshot v4` (the storage format version); checkpoints use the given message.
+**Commit parents.** A data commit's parent is the previous data head, and merges have two parents. SQL commits in native-git mode use the subject `RepoDB snapshot v5` (the storage format version); checkpoints use the given message.
 
 **Opening a snapshot.** It must pass these checks before any use, or it fails with `repository.ErrCorrupt`:
 - the manifest decodes strictly and the format version matches;
@@ -75,7 +75,7 @@ Each table has three kinds of object:
 ### Prolly trees
 
 A Prolly tree is a B-tree-like structure whose node boundaries depend only on content:
-- Nodes are JSON, stored as content-addressed objects.
+- Nodes are binary, stored as content-addressed objects (see [Node encoding](#node-encoding)).
 - Entries are split into chunks by a per-entry boundary hash: the FNV-64 hash of the entry's **key**. A chunk ends after an entry once it has at least 32 entries and that entry's hash has its low 6 bits zero, or at 128 entries.
 - Interior levels chunk their child links the same way, hashing each link's maximum key.
 - The decision never looks at values, child hashes or earlier entries. So an update never moves a boundary, and an insert or delete moves at most the boundaries up to the next key-hash boundary.
@@ -83,6 +83,19 @@ A Prolly tree is a B-tree-like structure whose node boundaries depend only on co
 The same set of entries always produces the same root, whatever order of edits built it. That property makes whole-table comparison cheap (equal roots mean equal tables) and lets unchanged subtrees be shared between commits.
 
 Writes use `prolly.Apply`, which rewrites only the chunks an edit touches: for an update, one leaf and its path to the root. Merge uses a streaming sorted builder. Reads use iterators that can seek to a key and keep one node per level in memory.
+
+### Node encoding
+
+A node (`common/prolly/codec.go`) is:
+
+```text
+'P' | codec version (1) | level (u8) | uvarint item count | items
+```
+
+- A **leaf** item (level 0) is a uvarint key length, the key, a uvarint value length and the value.
+- An **interior** item is a uvarint max-key length, the child's maximum key, a uvarint count of the leaf entries below the child, and the child's 32-byte SHA-256.
+
+Nodes are read in place: iterators parse a leaf one entry at a time, and the keys and values they return point into the stored bytes rather than copies. The counts make a tree's size a read of its root (`Tree.Count`). Validation (`prolly.Reachable`) checks every link's count against its subtree, along with key order and bounds; a decoder rejects truncated nodes and trailing bytes.
 
 ### Key encoding
 
@@ -134,6 +147,9 @@ So engines in other processes, and the server, observe each other's commits.
 - Point lookups on the primary key read the data tree directly.
 - Ranges and secondary-index lookups iterate over key intervals, merging the tree with the transaction's and the journal's pending edits. Secondary-index lookups then fetch rows by primary key.
 - Full scans stream the data tree in key order and decode only the rows they return. A `LIMIT` stops the iteration early.
+- Every access path decodes only the columns the query uses: go-mysql-server pushes the needed columns down (`sql.ProjectedTable`), and the row decoder skips the other cells. A scan that needs no column, such as the counted side of a join, decodes no rows.
+- Stored keys are not re-derived from rows during reads: snapshot validation checks every stored row's key once per snapshot.
+- `SELECT COUNT(*) FROM t` reads the row count from the data tree's root when the transaction sees no pending edits (`sql.StatisticsTable`); otherwise it counts while scanning.
 - Iteration is forward-only, so `ORDER BY … DESC` sorts (rdb-acd36d).
 
 ## Writes and persistence modes

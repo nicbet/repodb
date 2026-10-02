@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	FormatVersion = 4
+	FormatVersion = 5
 	DataRef       = "refs/repodb/data"
 )
 
@@ -476,7 +476,7 @@ func (w *Writer) Get(ctx context.Context, hash storage.Hash) ([]byte, error) {
 	data, exists := w.objects[hash]
 	w.mu.RUnlock()
 	if exists {
-		return append([]byte(nil), data...), nil
+		return data, nil
 	}
 	if w.base == nil {
 		return nil, storage.ErrNotFound
@@ -933,7 +933,7 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 	cached, ok := s.snapshot.cache.data[hash]
 	s.snapshot.cache.mu.RUnlock()
 	if ok {
-		return append([]byte(nil), cached...), nil
+		return cached, nil
 	}
 	data, err := s.snapshot.repo.git.ReadTreeFile(ctx, s.snapshot.repo.Root, s.snapshot.Commit, objectPath(hash))
 	if err != nil {
@@ -943,7 +943,7 @@ func (s *snapshotStore) Get(ctx context.Context, hash storage.Hash) ([]byte, err
 		return nil, fmt.Errorf("object %s failed integrity check", hash)
 	}
 	s.snapshot.cache.mu.Lock()
-	s.snapshot.cache.data[hash] = append([]byte(nil), data...)
+	s.snapshot.cache.data[hash] = data
 	s.snapshot.cache.mu.Unlock()
 	return data, nil
 }

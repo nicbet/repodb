@@ -23,7 +23,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const snapshotValidationVersion = 1
+const snapshotValidationVersion = 2
 
 var validatedSnapshots = struct {
 	sync.Mutex

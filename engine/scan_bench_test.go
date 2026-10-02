@@ -7,9 +7,9 @@ import (
 	"github.com/nicbet/repodb/engine"
 )
 
-// BenchmarkSQLAutocommitScans measures range, ordered-limit and full-scan
-// queries in their own implicit transactions over a 50k-row journal table,
-// the shapes that order-preserving keys let the planner push into the tree.
+// BenchmarkSQLAutocommitScans measures range, ordered-limit, full-scan, join
+// and count queries in their own implicit transactions over a checkpointed
+// 50k-row journal table. The join is the scorecard's join_aggregate.
 func BenchmarkSQLAutocommitScans(b *testing.B) {
 	eng, repo := sqlBenchmarkEngineWithRepository(b, 50_000, 32, 1)
 	if err := eng.Close(); err != nil {
@@ -20,12 +20,24 @@ func BenchmarkSQLAutocommitScans(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer eng.Close()
+	setup, _ := eng.NewSession()
+	for _, q := range []string{"CREATE TABLE authors (id BIGINT PRIMARY KEY, name TEXT NOT NULL)", "INSERT INTO authors VALUES (1, 'author')"} {
+		if err := setup.Exec(context.Background(), q); err != nil {
+			b.Fatal(err)
+		}
+	}
+	setup.Close()
+	if _, err := eng.Checkpoint(context.Background(), "authors"); err != nil {
+		b.Fatal(err)
+	}
 	for _, q := range []struct{ name, sql string }{
 		{"range100", "SELECT id, value FROM bench WHERE id BETWEEN 25000 AND 25099"},
 		{"limit20", "SELECT id, value FROM bench ORDER BY id LIMIT 20"},
 		{"after-limit20", "SELECT id, value FROM bench WHERE id > 49000 ORDER BY id LIMIT 20"},
 		{"range10k", "SELECT id, value FROM bench WHERE id BETWEEN 20000 AND 29999"},
 		{"fullscan", "SELECT id, value FROM bench"},
+		{"join", "SELECT a.name, COUNT(*) FROM bench b JOIN authors a ON a.id = 1 GROUP BY a.name"},
+		{"count", "SELECT COUNT(*) FROM bench"},
 	} {
 		b.Run(q.name, func(b *testing.B) {
 			session, _ := eng.NewSession()

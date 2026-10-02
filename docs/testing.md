@@ -30,7 +30,9 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - the streaming builder matching a bulk build;
   - history independence: `Apply` of any edit sequence gives the same root as a fresh build, from 0 to 10k entries and for distant edits;
   - edit locality: in a 10k-entry tree, an update writes at most one node per level, and an insert or delete a small constant;
-  - seeking iterators at exact keys, between keys, past the end, and on empty trees.
+  - seeking iterators at exact keys, between keys, past the end, and on empty trees;
+  - the node encoding: round trips, rejection of every truncation, trailing bytes, foreign headers and codec versions, and appends to decoded entries never touching the node bytes;
+  - subtree counts matching the entries after `Build`, the sorted builder and `Apply`, and `Reachable` rejecting a wrong count.
 - **`common/git`.** Durability auditing: which Git commands flush objects and refs, under `fsync` and `batch` methods. Also that pushing the data ref skips the host repository's `pre-push` hook.
 - **`common/robustio`.** The retry loop: success after transient failures, stopping on permanent errors, and the timeout.
 
@@ -79,6 +81,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - journal commits surviving a `SIGKILL` at every durability level, and the engine passing its durability option to the journal.
 - **Cross-engine visibility** (`cross_engine_test.go`). Readers see other engines' writes in every mode, including external `git update-ref` and `pack-refs` changes, without a restart.
 - **Range queries** (`range_test.go`). Indexed range and `ORDER BY … LIMIT` results are compared with a forced full scan. The comparison runs over native-git, journal with pending edits, and open transactions, and over signed-integer, decimal, collated-string and datetime keys, using seeded random data. Tests also cover integer extremes, and that plans use `IndexedTableAccess` without a sort.
+- **Projections and counts** (`projection_test.go`, `rowcodec_test.go`). Reads of a subset of columns match the same columns of full rows over full scans, ranges, secondary-index and point lookups, in native-git, journal with pending edits and open transactions; plans show the projected columns, and no columns for the counted side of a join. The projected row decoder matches the full decoder for every type. `COUNT(*)` uses the stored row count when nothing is pending and stays exact inside transactions and over pending journal edits.
 - **Journal index overlay** (`journal_index_test.go`). Inserts, updates and deletes are visible through persisted indexes, with a random-operation model test (150 steps, checkpoints and reopens, one or two engines).
 - **Merge** (`merge_performance_test.go`). A merge spawns no Git processes, unchanged table roots are reused, secondary indexes are rebuilt, and point lookups do bounded work.
 - **Codecs.** `rowcodec_test.go` covers every type at its extremes, canonical bytes, compact integers, and rejection of truncated or trailing bytes. `keycodec_test.go` checks that encoded key order equals SQL order for each key type (random and edge values), composite key order, and rejection of non-key values.

@@ -535,3 +535,52 @@ func sortSearchKey(entries []prolly.Entry, key []byte) int {
 	}
 	return lo
 }
+
+func TestCountMatchesEntries(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemory()
+	for _, count := range []int{0, 1, 128, 129, 10_000} {
+		entries := make([]prolly.Entry, count)
+		for i := range entries {
+			entries[i] = prolly.Entry{Key: []byte(fmt.Sprintf("key-%05d", i)), Value: []byte("v")}
+		}
+		built, err := prolly.Build(ctx, store, entries, prolly.DefaultOptions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		builder, err := prolly.NewSortedBuilder(ctx, store, prolly.DefaultOptions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if err := builder.Add(entry); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sorted, err := builder.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Delete every third key and insert as many new ones.
+		var edits []prolly.Edit
+		for i := 0; i < count; i += 3 {
+			edits = append(edits, prolly.Edit{Key: []byte(fmt.Sprintf("key-%05d", i)), Delete: true}, prolly.Edit{Key: []byte(fmt.Sprintf("key-%05d+", i)), Value: []byte("n")})
+		}
+		applied, err := prolly.Apply(ctx, store, built, edits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, tree := range map[string]*prolly.Tree{"build": built, "sorted": sorted, "apply": applied} {
+			got, err := tree.Count(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != uint64(count) {
+				t.Fatalf("%d entries, %s: Count = %d", count, name, got)
+			}
+			if _, err := prolly.Reachable(ctx, store, tree.Root()); err != nil {
+				t.Fatalf("%d entries, %s: %v", count, name, err)
+			}
+		}
+	}
+}

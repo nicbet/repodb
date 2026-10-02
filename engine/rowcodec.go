@@ -219,6 +219,102 @@ func decodeRow(schema sql.Schema, data []byte) (sql.Row, error) {
 	return row, nil
 }
 
+// rowProjection selects and orders a subset of a table's columns.
+type rowProjection struct {
+	ordinals []int // table column ordinals, in output order
+	slot     []int // per table column: its first output position, or -1
+	last     int   // highest projected ordinal, or -1
+	repeats  bool  // some column is projected more than once
+}
+
+// newRowProjection returns nil when ordinals select every column in order.
+func newRowProjection(width int, ordinals []int) *rowProjection {
+	if len(ordinals) == width {
+		identity := true
+		for i, ordinal := range ordinals {
+			identity = identity && ordinal == i
+		}
+		if identity {
+			return nil
+		}
+	}
+	p := &rowProjection{ordinals: ordinals, slot: make([]int, width), last: -1}
+	for i := range p.slot {
+		p.slot[i] = -1
+	}
+	for i, ordinal := range ordinals {
+		if p.slot[ordinal] >= 0 {
+			p.repeats = true
+			continue
+		}
+		p.slot[ordinal] = i
+		p.last = max(p.last, ordinal)
+	}
+	return p
+}
+
+// project returns the projected columns of a full row. A nil projection
+// returns row itself.
+func (p *rowProjection) project(row sql.Row) sql.Row {
+	if p == nil || row == nil {
+		return row
+	}
+	out := make(sql.Row, len(p.ordinals))
+	for i, ordinal := range p.ordinals {
+		out[i] = row[ordinal]
+	}
+	return out
+}
+
+// decodeRowProjected decodes only the projected columns of a stored row,
+// skipping the cells of the others and stopping after the last one needed.
+// With a nil projection it is decodeRow. A projection drops decodeRow's width
+// and trailing-bytes checks for the cells it skips; ValidateSnapshot decodes
+// every stored row in full.
+func decodeRowProjected(schema sql.Schema, data []byte, p *rowProjection) (sql.Row, error) {
+	if p == nil {
+		return decodeRow(schema, data)
+	}
+	out := make(sql.Row, len(p.ordinals))
+	if p.last < 0 {
+		return out, nil
+	}
+	width, n := binary.Uvarint(data)
+	if n <= 0 {
+		return nil, errTruncatedRow
+	}
+	if width != uint64(len(schema)) {
+		return nil, errors.New("stored row width does not match schema")
+	}
+	pos := n + (len(schema)+7)/8
+	if pos > len(data) {
+		return nil, errTruncatedRow
+	}
+	d := rowDecoder{data: data, pos: pos}
+	nulls := data[n:pos]
+	for i := 0; i <= p.last; i++ {
+		if nulls[i/8]&(1<<(i%8)) != 0 {
+			continue
+		}
+		col := schema[i]
+		var err error
+		if slot := p.slot[i]; slot >= 0 {
+			out[slot], err = d.cell(col.Type)
+		} else {
+			err = d.skip(col.Type)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("column %s: %w", col.Name, err)
+		}
+	}
+	if p.repeats {
+		for i, ordinal := range p.ordinals {
+			out[i] = out[p.slot[ordinal]]
+		}
+	}
+	return out, nil
+}
+
 type rowDecoder struct {
 	data []byte
 	pos  int
@@ -368,6 +464,39 @@ func (d *rowDecoder) cell(typ sql.Type) (any, error) {
 	default:
 		return d.string()
 	}
+}
+
+// skip passes over one cell without decoding it.
+func (d *rowDecoder) skip(typ sql.Type) error {
+	var err error
+	switch typ.Type() {
+	case querypb.Type_INT8, querypb.Type_INT16, querypb.Type_INT24, querypb.Type_INT32, querypb.Type_INT64, querypb.Type_TIME:
+		_, err = d.varint()
+	case querypb.Type_UINT8, querypb.Type_UINT16, querypb.Type_UINT24, querypb.Type_UINT32, querypb.Type_UINT64, querypb.Type_ENUM:
+		_, err = d.uvarint()
+	case querypb.Type_FLOAT32:
+		_, err = d.fixed(4)
+	case querypb.Type_FLOAT64, querypb.Type_DATE, querypb.Type_DATETIME, querypb.Type_TIMESTAMP:
+		_, err = d.fixed(8)
+	case querypb.Type_DECIMAL:
+		var tag []byte
+		if tag, err = d.fixed(1); err != nil {
+			return err
+		}
+		switch tag[0] {
+		case decimalSmall:
+			_, err = d.varint()
+		case decimalBig:
+			if _, err = d.fixed(1); err == nil {
+				_, _, err = d.span()
+			}
+		default:
+			err = fmt.Errorf("unknown stored decimal form %d", tag[0])
+		}
+	default: // JSON, strings and binary are length-prefixed
+		_, _, err = d.span()
+	}
+	return err
 }
 
 func (d *rowDecoder) decimal(scale int32) (*apd.Decimal, error) {

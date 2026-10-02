@@ -21,7 +21,7 @@ func (m *Memory) Get(_ context.Context, hash Hash) ([]byte, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return append([]byte(nil), data...), nil
+	return data, nil
 }
 
 func (m *Memory) Put(_ context.Context, data []byte) (Hash, error) {
