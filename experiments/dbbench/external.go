@@ -137,10 +137,17 @@ func runExternal(r *report, dsn string) error {
 		failures = append(failures, fmt.Errorf("read server version: %w", err))
 	}
 	r.Server = version
-	for _, rows := range r.Config.Rows {
-		if err := runExternalSize(r, dsn, rows); err != nil {
-			failures = append(failures, fmt.Errorf("rows=%d: %w", rows, err))
+	if r.Config.runs("core") {
+		for _, rows := range r.Config.Rows {
+			if err := runExternalSize(r, dsn, rows); err != nil {
+				failures = append(failures, fmt.Errorf("rows=%d: %w", rows, err))
+			}
 		}
+	}
+	if err := runWorkloadGroups(r, func(group string, rows int) backend {
+		return &externalBackend{dir: r.Root, e: &externalDB{dsn: dsn, dbName: fmt.Sprintf("repodb_bench_%s_%d_%d", group, rows, time.Now().UnixNano()%100000)}}
+	}); err != nil {
+		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
 }
@@ -379,9 +386,9 @@ func printExternalUsage() {
 	fmt.Fprintln(os.Stderr, `External baseline mode:
   dbbench -mode external -dsn 'user:pass@tcp(host:port)/' [flags]
 
-Runs the portable SQL workloads (reads, writes, concurrency) against an
-external MySQL-compatible server. Git-specific operations (sync, merge,
-conflict, reopen) are skipped.
+Runs the portable SQL workloads (reads, writes, concurrency, and the append
+and mutable groups) against an external MySQL-compatible server.
+Git-specific operations (sync, merge, conflict, reopen, peers) are skipped.
 
 The DSN format follows the go-sql-driver/mysql standard:
   user:password@tcp(host:port)/

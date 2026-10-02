@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,13 +32,17 @@ import (
 )
 
 type config struct {
-	Mode     string `json:"mode"`
-	Rows     []int  `json:"rows"`
-	Requests int    `json:"requests_per_client"`
-	Clients  []int  `json:"clients"`
+	Mode         string   `json:"mode"`
+	Workloads    []string `json:"workloads"`
+	Rows         []int    `json:"rows"`
+	WorkloadRows []int    `json:"workload_rows"`
+	GrowthRounds int      `json:"growth_rounds"`
+	Requests     int      `json:"requests_per_client"`
+	Clients      []int    `json:"clients"`
 }
 
 type measurement struct {
+	Group             string    `json:"group,omitempty"`
 	Rows              int       `json:"rows"`
 	Name              string    `json:"name"`
 	Clients           int       `json:"clients"`
@@ -71,6 +78,7 @@ type report struct {
 	GitGC       string        `json:"git_gc,omitempty"`
 	Durability  string        `json:"durability,omitempty"`
 	Results     []measurement `json:"results"`
+	Series      []growthPoint `json:"series,omitempty"`
 	PeakRSS     *int64        `json:"process_peak_rss_bytes,omitempty"`
 	Failure     string        `json:"failure,omitempty"`
 }
@@ -85,7 +93,10 @@ func main() {
 	mode := flag.String("mode", "native-git", "persistence: native-git, journal, or external")
 	durabilityFlag := flag.String("durability", string(repository.DurabilityNormal), "journal commit durability: normal, full or off")
 	dsn := flag.String("dsn", "", "MySQL DSN for external mode (e.g. root@tcp(127.0.0.1:3306)/)")
-	rows := flag.String("rows", "1000,10000,50000", "fixture sizes")
+	rows := flag.String("rows", "1000,10000,50000", "core fixture sizes")
+	workloads := flag.String("workloads", "core,append,mutable", "workload groups to run")
+	workloadRows := flag.String("workload-rows", "1000,10000,100000", "append and mutable fixture sizes")
+	growthRounds := flag.Int("growth-rounds", 10, "append and mutable growth-phase rounds")
 	clients := flag.String("clients", "1,4,16", "concurrent clients")
 	requests := flag.Int("requests", 30, "requests per client per repeated workload")
 	output := flag.String("output", "dbbench.json", "complete JSON report")
@@ -93,6 +104,8 @@ func main() {
 	revision := flag.String("revision", "", "source revision to record instead of `git rev-parse HEAD` (bench-docker passes the host's)")
 	workingTree := flag.String("working-tree-status", "", "source `git status --porcelain` to record instead of detecting it (bench-docker passes the host's)")
 	runtimeName := flag.String("runtime", "host", "where the harness runs, recorded in the report: host or docker")
+	cpuProfile := flag.String("cpuprofile", "", "diagnostic: write a CPU profile of the whole run, samples labelled by workload")
+	pprofAddr := flag.String("pprof", "", "diagnostic: serve net/http/pprof (with mutex and block profiling) on this address")
 	verify := flag.String("verify-repo", "", "internal: fresh-process reopen check")
 	verifyRows := flag.Int("verify-rows", 0, "internal: expected recovered row count")
 	verifyValue := flag.String("verify-value", "", "internal: expected recovered last write")
@@ -126,12 +139,17 @@ func main() {
 		}
 		return
 	}
-	c := config{Mode: *mode, Rows: integers(*rows), Clients: integers(*clients), Requests: *requests}
+	groups, err := parseWorkloads(*workloads)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	c := config{Mode: *mode, Workloads: groups, Rows: integers(*rows), WorkloadRows: integers(*workloadRows), GrowthRounds: *growthRounds, Clients: integers(*clients), Requests: *requests}
 	if *mode == "external" && *dsn == "" {
 		printExternalUsage()
 		os.Exit(2)
 	}
-	if len(c.Rows) == 0 || len(c.Clients) == 0 || c.Requests < 1 || (c.Mode != "native-git" && c.Mode != "journal" && c.Mode != "external") {
+	if len(c.Rows) == 0 || len(c.WorkloadRows) == 0 || len(c.Clients) == 0 || c.Requests < 1 || c.GrowthRounds < 1 || (c.Mode != "native-git" && c.Mode != "journal" && c.Mode != "external") {
 		fmt.Fprintln(os.Stderr, "invalid mode, positive row/client list, or request count")
 		os.Exit(2)
 	}
@@ -140,6 +158,29 @@ func main() {
 			fmt.Fprintln(os.Stderr, "rows must be at least 100")
 			os.Exit(2)
 		}
+	}
+	for _, n := range c.WorkloadRows {
+		if n < 1000 {
+			fmt.Fprintln(os.Stderr, "workload-rows must be at least 1000")
+			os.Exit(2)
+		}
+	}
+	if *pprofAddr != "" {
+		runtime.SetMutexProfileFraction(10)
+		runtime.SetBlockProfileRate(int(time.Millisecond))
+		go func() { fmt.Fprintln(os.Stderr, http.ListenAndServe(*pprofAddr, nil)) }()
+	}
+	stopProfile := func() {}
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err == nil {
+			err = pprof.StartCPUProfile(f)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		stopProfile = func() { pprof.StopCPUProfile(); _ = f.Close() }
 	}
 	root, err := os.MkdirTemp(*parent, "repodb-scorecard-")
 	if err != nil {
@@ -165,6 +206,7 @@ func main() {
 	if err != nil {
 		r.Failure = err.Error()
 	}
+	stopProfile()
 	if peak, ok := peakRSS(); ok {
 		r.PeakRSS = &peak
 	}
@@ -192,7 +234,7 @@ type source struct {
 }
 
 func newReport(c config, root string, src source) report {
-	r := report{Version: 1, Started: time.Now().UTC(), Config: c, Go: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH, Git: commandOutput("git", "--version"), Root: root, Runtime: src.runtime}
+	r := report{Version: 2, Started: time.Now().UTC(), Config: c, Go: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH, Git: commandOutput("git", "--version"), Root: root, Runtime: src.runtime}
 	if src.revisionSet {
 		r.Revision = src.revision
 	} else {
@@ -377,7 +419,7 @@ func (r *report) measure(root string, rows int, name string, clients, n int, all
 	startGate := make(chan struct{})
 	for worker := 0; worker < clients; worker++ {
 		wg.Add(1)
-		go func(worker int) {
+		go pprof.Do(ctx, pprof.Labels("workload", name, "clients", strconv.Itoa(clients)), func(context.Context) {
 			defer wg.Done()
 			<-startGate
 			for i := 0; i < n; i++ {
@@ -399,7 +441,7 @@ func (r *report) measure(root string, rows int, name string, clients, n int, all
 					break
 				}
 			}
-		}(worker)
+		})
 	}
 	start := time.Now()
 	close(startGate)
@@ -433,10 +475,18 @@ func (r *report) measure(root string, rows int, name string, clients, n int, all
 
 func run(r *report) error {
 	var failures []error
-	for _, rows := range r.Config.Rows {
-		if err := runSize(r, rows); err != nil {
-			failures = append(failures, fmt.Errorf("rows=%d: %w", rows, err))
+	if r.Config.runs("core") {
+		for _, rows := range r.Config.Rows {
+			if err := runSize(r, rows); err != nil {
+				failures = append(failures, fmt.Errorf("rows=%d: %w", rows, err))
+			}
 		}
+	}
+	options := engine.Options{Persistence: engine.PersistenceMode(r.Config.Mode), Durability: durability}
+	if err := runWorkloadGroups(r, func(group string, rows int) backend {
+		return newRepoBackend(r.Root, group, rows, options)
+	}); err != nil {
+		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
 }
@@ -927,16 +977,33 @@ func printReport(r report) {
 		fmt.Printf("server %s\n", r.Server)
 	}
 	fmt.Println("Latency is per successful request, milliseconds. Conflicts are rejected attempts; no retries. Small samples do not establish stable tails.")
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "Rows\tWorkload\tClients\tOK\tConflict\tError\tStatus\tOps/s\tp50\tp95\tp99\tMax\tGrowth KiB")
-	for _, m := range r.Results {
-		status := "PASS"
-		if len(m.Errors) > 0 || m.VerificationError != "" || m.Success == 0 {
-			status = "FAIL"
+	for _, group := range workloadGroups {
+		key := group
+		if group == "core" {
+			key = ""
 		}
-		fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%d\t%d\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.1f\n", m.Rows, m.Name, m.Clients, m.Success, m.Conflicts, len(m.Errors), status, m.Ops, m.P50, m.P95, m.P99, m.Max, float64(m.Growth)/1024)
+		var rows []measurement
+		for _, m := range r.Results {
+			if m.Group == key {
+				rows = append(rows, m)
+			}
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		fmt.Printf("\n== %s ==\n", group)
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "Rows\tWorkload\tClients\tOK\tConflict\tError\tStatus\tOps/s\tp50\tp95\tp99\tMax\tGrowth KiB")
+		for _, m := range rows {
+			status := "PASS"
+			if len(m.Errors) > 0 || m.VerificationError != "" || m.Success == 0 {
+				status = "FAIL"
+			}
+			fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%d\t%d\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.1f\n", m.Rows, m.Name, m.Clients, m.Success, m.Conflicts, len(m.Errors), status, m.Ops, m.P50, m.P95, m.P99, m.Max, float64(m.Growth)/1024)
+		}
+		_ = w.Flush()
 	}
-	_ = w.Flush()
+	printSeries(r.Series)
 	printed := false
 	for _, m := range r.Results {
 		reason := m.VerificationError
@@ -963,4 +1030,47 @@ func printReport(r report) {
 	if r.Failure != "" {
 		fmt.Printf("FAILED: %s\n", r.Failure)
 	}
+}
+
+// printSeries prints the first, middle and last growth round of each group
+// and size; the JSON report keeps every round.
+func printSeries(series []growthPoint) {
+	if len(series) == 0 {
+		return
+	}
+	fmt.Println("\n== growth (first, middle, last round; all rounds in JSON) ==")
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "Group\tRows\tRound\tTable rows\tWrites\tWrite p50\tWrite p95\tSync ms\tFixture MiB\tΔ KiB\tJournal KiB before/after\tHeap MiB")
+	opt := func(v *float64) string {
+		if v == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%.1f", *v)
+	}
+	bytes := func(v *int64, unit float64) string {
+		if v == nil {
+			return "-"
+		}
+		return fmt.Sprintf("%.1f", float64(*v)/unit)
+	}
+	for start := 0; start < len(series); {
+		end := start
+		for end < len(series) && series[end].Group == series[start].Group && series[end].Rows == series[start].Rows {
+			end++
+		}
+		run := series[start:end]
+		rounds := []int{0}
+		if mid := (len(run) - 1) / 2; mid > 0 {
+			rounds = append(rounds, mid)
+		}
+		if last := len(run) - 1; last > rounds[len(rounds)-1] {
+			rounds = append(rounds, last)
+		}
+		for _, i := range rounds {
+			p := run[i]
+			fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%.2f\t%.2f\t%s\t%s\t%s\t%s/%s\t%.1f\n", p.Group, p.Rows, p.Round, p.TableRows, p.WriteRequests, p.WriteP50, p.WriteP95, opt(p.SyncMS), bytes(p.FixtureBytes, 1<<20), bytes(p.FixtureDelta, 1<<10), bytes(p.JournalBefore, 1<<10), bytes(p.JournalAfter, 1<<10), float64(p.Heap)/(1<<20))
+		}
+		start = end
+	}
+	_ = w.Flush()
 }
