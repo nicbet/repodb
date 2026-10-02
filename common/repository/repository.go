@@ -626,6 +626,17 @@ func (w *Writer) CommitWithOutcomeMessage(ctx context.Context, manifest Manifest
 		release()
 		publicationMetrics.lockHold.Add(uint64(time.Since(lockAcquired)))
 	}()
+	// Under the lock the head can only be what it is now. If another writer
+	// already moved it past this writer's base, the update-ref
+	// compare-and-swap below is bound to fail: reject now, before writing any
+	// Git object, so a stale writer doesn't hold the lock for a doomed
+	// publication while others queue behind it. The CAS stays authoritative;
+	// a failed head read just falls through to it.
+	if w.expected != "" {
+		if head, headErr := w.repo.Head(ctx); headErr == nil && head != w.expected {
+			return result, ErrConflict
+		}
+	}
 
 	entries := make([]repodbgit.TreeEntry, 0, len(available)+1)
 	missing := make([]storage.Hash, 0, len(manifest.Objects))

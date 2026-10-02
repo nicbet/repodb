@@ -150,7 +150,7 @@ A transaction collects its row and schema edits in memory. A failing statement u
    3. advances `refs/repodb/data` with `git update-ref <new> <expected-old>`.
 4. It reloads and verifies the published snapshot.
 
-If the ref no longer points at the transaction's base, the update fails with `repository.ErrConflict` and nothing becomes visible. An interruption before the ref update leaves only unreachable objects, which `git gc` removes.
+If the ref no longer points at the transaction's base, the update fails with `repository.ErrConflict` and nothing becomes visible. The base is also checked as soon as the locks are held, so a writer that has already lost the race is rejected before it writes any Git object and doesn't keep later writers waiting. An interruption before the ref update leaves only unreachable objects, which `git gc` removes.
 
 ### Journal
 

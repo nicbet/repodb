@@ -36,8 +36,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 
 ### Repository and publication (`common/repository`)
 
-- **Snapshot round trip.** A snapshot survives cache deletion, `git gc --prune=now`, reopening, a push to a bare remote, and a clone and fetch, while the source worktree's `HEAD` and status stay untouched.
-- **Optimistic publication.** A stale writer is rejected with `ErrConflict`. Of two concurrent writers, exactly one succeeds. A cancelled lock wait is a definite rejection.
+- **Snapshot round trip.** A snapshot survives `git gc --prune=now`, reopening, a push to a bare remote, and a clone and fetch, while the source worktree's `HEAD` and status stay untouched.
+- **Optimistic publication.** A stale writer is rejected with `ErrConflict`, before it writes any Git object. Of two concurrent writers, exactly one succeeds. A cancelled lock wait is a definite rejection.
 - **Commit outcomes.** Faults injected before, during and after the ref update give `rejected`, `unknown` and `committed`, and `RecoverCommit` resolves each.
 - **Multiple processes:**
   - two writer processes in linked worktrees give one success and one conflict;

@@ -610,3 +610,36 @@ func git(t *testing.T, dir string, args ...string) string {
 	}
 	return strings.TrimSpace(stdout.String())
 }
+
+// A writer whose base is no longer the head is rejected as soon as it holds
+// the publication lock, before it writes any Git object, so stale writers
+// don't hold up the queue with doomed publications.
+func TestStaleWriterIsRejectedBeforeWritingObjects(t *testing.T) {
+	ctx := context.Background()
+	root := initRepository(t)
+	repo, err := repository.Init(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := repo.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := repo.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerRoot, _ := first.Put(ctx, []byte("winner"))
+	if _, err := first.Commit(ctx, repository.Manifest{Tables: map[string]repository.Table{"issues": {DataRoot: winnerRoot}}}); err != nil {
+		t.Fatal(err)
+	}
+	objectsBefore := git(t, root, "count-objects", "-v")
+	loserRoot, _ := stale.Put(ctx, []byte("loser object that must never reach Git"))
+	result, err := stale.CommitWithOutcome(ctx, repository.Manifest{Tables: map[string]repository.Table{"issues": {DataRoot: loserRoot}}})
+	if !errors.Is(err, repository.ErrConflict) || result.Outcome != repository.OutcomeRejected {
+		t.Fatalf("stale commit = %#v, %v; want rejected ErrConflict", result, err)
+	}
+	if objectsAfter := git(t, root, "count-objects", "-v"); objectsAfter != objectsBefore {
+		t.Fatalf("stale writer wrote Git objects:\nbefore:\n%s\nafter:\n%s", objectsBefore, objectsAfter)
+	}
+}
