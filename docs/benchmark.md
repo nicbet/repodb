@@ -89,8 +89,10 @@ nearest-rank individual successful requests, not averages from separate runs.
 Thirty observations do not establish stable p99 latency. Use larger request counts
 and multiple fresh sequential invocations for reference measurements; keep all raw
 reports. Use identical hardware, filesystem, power state, and flags, and record CPU,
-mount/durability settings and other system load alongside the JSON. No durability
-settings are relaxed by this harness. Filesystem caches are uncontrolled; fresh
+mount/durability settings and other system load alongside the JSON. RepoDB's journal
+commit durability is the harness's `-durability` flag (default `normal`, the
+product default) and is recorded in the report as `durability`; compare runs
+only at the same level. Git's durability settings are never relaxed. Filesystem caches are uncontrolled; fresh
 process reopen is not a cold-filesystem or power-loss test.
 
 **Git housekeeping.** Left to its defaults, Git starts `maintenance run --auto`

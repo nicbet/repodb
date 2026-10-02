@@ -18,6 +18,8 @@ type Config struct {
 	Address     string
 	Repository  *repository.Repository
 	Persistence engine.PersistenceMode
+	// Durability of journal commits; see engine.Options.Durability.
+	Durability repository.Durability
 }
 
 type Server struct {
@@ -37,7 +39,7 @@ func New(config Config) (*Server, error) {
 		config.Address = "127.0.0.1:3306"
 	}
 
-	persistent, err := engine.NewWithOptions(config.Repository, engine.Options{Persistence: config.Persistence})
+	persistent, err := engine.NewWithOptions(config.Repository, engine.Options{Persistence: config.Persistence, Durability: config.Durability})
 	if err != nil {
 		return nil, fmt.Errorf("open persistent SQL engine: %w", err)
 	}

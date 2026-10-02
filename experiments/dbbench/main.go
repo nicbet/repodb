@@ -68,6 +68,7 @@ type report struct {
 	Server      string        `json:"server_version,omitempty"`
 	Root        string        `json:"fixture_root"`
 	GitGC       string        `json:"git_gc,omitempty"`
+	Durability  string        `json:"durability,omitempty"`
 	Results     []measurement `json:"results"`
 	PeakRSS     *int64        `json:"process_peak_rss_bytes,omitempty"`
 	Failure     string        `json:"failure,omitempty"`
@@ -75,8 +76,13 @@ type report struct {
 
 var ctx = context.Background()
 
+// durability is the journal commit durability for every engine the harness
+// opens (-durability).
+var durability = repository.DurabilityNormal
+
 func main() {
 	mode := flag.String("mode", "native-git", "persistence: native-git, journal, or external")
+	durabilityFlag := flag.String("durability", string(repository.DurabilityNormal), "journal commit durability: normal, full or off")
 	dsn := flag.String("dsn", "", "MySQL DSN for external mode (e.g. root@tcp(127.0.0.1:3306)/)")
 	rows := flag.String("rows", "1000,10000,50000", "fixture sizes")
 	clients := flag.String("clients", "1,4,16", "concurrent clients")
@@ -87,8 +93,14 @@ func main() {
 	verifyRows := flag.Int("verify-rows", 0, "internal: expected recovered row count")
 	verifyValue := flag.String("verify-value", "", "internal: expected recovered last write")
 	flag.Parse()
+	level, err := repository.ParseDurability(*durabilityFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	durability = level
 	if *verify != "" {
-		e, err := engine.OpenWithOptions(ctx, *verify, engine.Options{Persistence: engine.PersistenceMode(*mode)})
+		e, err := engine.OpenWithOptions(ctx, *verify, engine.Options{Persistence: engine.PersistenceMode(*mode), Durability: durability})
 		if err == nil {
 			var s *engine.Session
 			s, err = e.NewSession()
@@ -135,6 +147,7 @@ func main() {
 		err = runExternal(&r, *dsn)
 	} else {
 		r.GitGC = gitGCPolicy
+		r.Durability = string(durability)
 		err = run(&r)
 	}
 	if err != nil {
@@ -404,7 +417,7 @@ func runSize(r *report, rows int) error {
 	if err := configureFixture(remote); err != nil {
 		return err
 	}
-	d := &database{path: filepath.Join(root, "local"), options: engine.Options{Persistence: engine.PersistenceMode(r.Config.Mode)}}
+	d := &database{path: filepath.Join(root, "local"), options: engine.Options{Persistence: engine.PersistenceMode(r.Config.Mode), Durability: durability}}
 	if err := newRepo(d.path, remote); err != nil {
 		return err
 	}
@@ -575,7 +588,7 @@ func runSize(r *report, rows int) error {
 		if err != nil {
 			return err
 		}
-		cmd := exec.CommandContext(ctx, exe, "-verify-repo", d.path, "-mode", r.Config.Mode, "-verify-rows", strconv.Itoa(rows), "-verify-value", fmt.Sprintf("wire-%d", n-1))
+		cmd := exec.CommandContext(ctx, exe, "-verify-repo", d.path, "-mode", r.Config.Mode, "-durability", string(durability), "-verify-rows", strconv.Itoa(rows), "-verify-value", fmt.Sprintf("wire-%d", n-1))
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("reopen: %w: %s", err, out)
@@ -676,7 +689,7 @@ func concurrency(r *report, root string, rows int, d *database) error {
 }
 
 func wire(r *report, root string, rows int, d *database) error {
-	srv, err := server.New(server.Config{Address: "127.0.0.1:0", Repository: d.e.Repository(), Persistence: d.options.Persistence})
+	srv, err := server.New(server.Config{Address: "127.0.0.1:0", Repository: d.e.Repository(), Persistence: d.options.Persistence, Durability: d.options.Durability})
 	if err != nil {
 		return err
 	}

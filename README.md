@@ -70,7 +70,7 @@ After `enable`, all sync commands default to the configured remote. Pass `--remo
 | Command                       | Description                                                                |
 | ----------------------------- | -------------------------------------------------------------------------- |
 | `repodb init [path]`          | Initialize a RepoDB data namespace in a Git repository                     |
-| `repodb start`                | Start a MySQL-compatible server (`--addr`, `--persistence journal\|native-git`) |
+| `repodb start`                | Start a MySQL-compatible server (`--addr`, `--persistence`, `--durability`) |
 | `repodb sql '<statement>'`    | Execute a SQL statement against a running server (`--addr`, `--database`)  |
 | `repodb status`               | Show the data head, format version, object/table counts, and working state |
 | `repodb diff`                 | Show uncommitted data changes (table-level change list)                    |
@@ -184,7 +184,7 @@ Go application          MySQL client
 ```
 
 - **One engine, two entry points.** Embedded sessions and MySQL connections share the same catalog, table adapters, and transaction implementation.
-- **Journal persistence.** SQL commits append their row edits to a local journal with one `fsync`. Checkpoint materializes Prolly trees and publishes a Git data commit. It is the default for the library, the CLI and the server. Native-Git (audit) mode makes every transaction a Git data commit, for workloads that need each one in Git history.
+- **Journal persistence.** SQL commits append their row edits to a local journal and flush it (by default surviving process and OS crashes; `full` durability also survives power loss). Checkpoint materializes Prolly trees and publishes a Git data commit. It is the default for the library, the CLI and the server. Native-Git (audit) mode makes every transaction a Git data commit, for workloads that need each one in Git history.
 - **Snapshot isolation.** Transactions read a pinned snapshot plus their own writes. Stale writers receive a conflict instead of overwriting newer data.
 - **Explicit synchronization.** Remote data is fetched into separate tracking refs. Sync validates, fast-forwards, or three-way-merges. Conflicts remain inspectable across restarts.
 

@@ -51,6 +51,8 @@ type WorkingState struct {
 	mu      sync.Mutex
 	cache   *workingCache
 	metrics workingMetricCounters
+	// durability is how hard each committed transaction is flushed.
+	durability Durability
 	// dirtyScan caches journalDirtyLocked's position in the journal.
 	dirtyScan journalDirtyScan
 
@@ -176,11 +178,45 @@ type journalWriteMetrics struct {
 	encodeNanos, encodedBytes, appendNanos, flushNanos uint64
 }
 
+// WorkingOptions configures OpenWorkingStateWithOptions.
+type WorkingOptions struct {
+	// Durability of journal commits; the zero value is DurabilityNormal.
+	Durability Durability
+}
+
+// OpenWorkingState opens the repository's journal with default options.
 func OpenWorkingState(repo *Repository) (*WorkingState, error) {
+	return OpenWorkingStateWithOptions(repo, WorkingOptions{})
+}
+
+// OpenWorkingStateWithOptions opens the repository's journal.
+func OpenWorkingStateWithOptions(repo *Repository, options WorkingOptions) (*WorkingState, error) {
 	if repo == nil {
 		return nil, errors.New("repository is required")
 	}
-	return &WorkingState{repo: repo}, nil
+	if _, err := ParseDurability(string(options.Durability)); err != nil {
+		return nil, err
+	}
+	return &WorkingState{repo: repo, durability: options.Durability.orDefault()}, nil
+}
+
+// Durability reports the journal's commit durability.
+func (w *WorkingState) Durability() Durability { return w.durability.orDefault() }
+
+// flushJournalFully forces everything appended to the journal so far to
+// stable storage, whatever the commit durability. A checkpoint calls it before
+// publishing: the Git commit it publishes contains the journal's transactions,
+// and must not survive a power loss that the journal records don't.
+func (w *WorkingState) flushJournalFully() error {
+	file, err := os.OpenFile(w.JournalPath(), os.O_WRONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return flushFile(file, DurabilityFull)
 }
 
 type journalDirtyScan struct {
@@ -684,6 +720,9 @@ func (w *WorkingState) Checkpoint(ctx context.Context, message string) (CommitRe
 	if err := writer.RetainOnly(view.snapshot.Manifest.Objects); err != nil {
 		return CommitResult{Outcome: OutcomeRejected}, err
 	}
+	if err := w.flushJournalFully(); err != nil {
+		return CommitResult{Outcome: OutcomeRejected}, err
+	}
 	result, err := writer.CommitWithOutcomeMessage(ctx, view.snapshot.Manifest, message)
 	if err != nil && result.Outcome != OutcomeCommitted {
 		return result, err
@@ -732,6 +771,9 @@ func (w *WorkingState) CheckpointPrepared(ctx context.Context, message string, w
 		return CommitResult{Outcome: OutcomeCommitted, Commit: view.snapshot.Commit, Snapshot: view.snapshot}, nil
 	}
 	writer.workingLockHeld = true
+	if err := w.flushJournalFully(); err != nil {
+		return CommitResult{Outcome: OutcomeRejected}, err
+	}
 	result, err := writer.CommitWithOutcomeMessage(ctx, manifest, message)
 	if err != nil && result.Outcome != OutcomeCommitted {
 		return result, err
@@ -1133,12 +1175,17 @@ func (w *WorkingState) appendRecords(records ...journalRecord) (journalWriteMetr
 	return metrics, err
 }
 
-// groupSync batches concurrent fsync calls so multiple transactions share one
-// hardware flush. The first waiter becomes the leader, collects followers that
-// arrive before the sync completes, calls Sync once, and broadcasts the result.
-// Followers whose writes landed before the leader's Sync are covered by it;
-// followers arriving after Sync starts become the next batch's leader.
+// groupSync flushes the journal at the configured durability (not at all for
+// DurabilityOff), batching concurrent callers so they share one flush. The
+// first waiter becomes the leader, collects followers that arrive before the
+// flush completes, flushes once, and broadcasts the result. Followers whose
+// writes landed before the leader's flush are covered by it; followers
+// arriving after it starts become the next batch's leader.
 func (w *WorkingState) groupSync(file *os.File) error {
+	level := w.durability.orDefault()
+	if level == DurabilityOff {
+		return nil
+	}
 	ch := make(chan error, 1)
 	w.groupMu.Lock()
 	w.groupQueue = append(w.groupQueue, groupCommitEntry{result: ch})
@@ -1153,7 +1200,7 @@ func (w *WorkingState) groupSync(file *os.File) error {
 	batch := w.groupQueue
 	w.groupQueue = nil
 	w.groupMu.Unlock()
-	err := file.Sync()
+	err := flushFile(file, level)
 	for _, entry := range batch {
 		entry.result <- err
 	}

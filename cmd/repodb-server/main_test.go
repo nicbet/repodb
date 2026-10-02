@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
 )
 
@@ -19,5 +20,18 @@ func TestPersistenceDefaultsToJournal(t *testing.T) {
 		if err != nil || opts.persistence != tc.want {
 			t.Errorf("parseOptions(%v) = %v, %v; want %s", tc.args, opts.persistence, err, tc.want)
 		}
+	}
+}
+
+func TestDurabilityDefaultsToNormal(t *testing.T) {
+	opts, err := parseOptions(nil)
+	if err != nil || opts.durability != repository.DurabilityNormal {
+		t.Fatalf("default durability = %q, %v", opts.durability, err)
+	}
+	if opts, err := parseOptions([]string{"-durability", "full"}); err != nil || opts.durability != repository.DurabilityFull {
+		t.Fatalf("-durability full = %q, %v", opts.durability, err)
+	}
+	if _, err := parseOptions([]string{"-durability", "fast"}); err == nil {
+		t.Fatal("parseOptions accepted -durability fast")
 	}
 }

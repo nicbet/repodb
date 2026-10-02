@@ -156,3 +156,22 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 	}
 	return string(output)
 }
+
+func TestStartDurabilityFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want repository.Durability
+	}{
+		{nil, repository.DurabilityNormal},
+		{[]string{"-durability", "full"}, repository.DurabilityFull},
+		{[]string{"-durability", "off"}, repository.DurabilityOff},
+	} {
+		opts, err := parseStartOptions(tc.args)
+		if err != nil || opts.durability != tc.want {
+			t.Errorf("parseStartOptions(%v) = %q, %v; want %q", tc.args, opts.durability, err, tc.want)
+		}
+	}
+	if _, err := parseStartOptions([]string{"-durability", "fast"}); err == nil {
+		t.Error("parseStartOptions accepted -durability fast")
+	}
+}

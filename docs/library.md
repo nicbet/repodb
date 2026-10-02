@@ -55,7 +55,7 @@ func main() {
 }
 ```
 
-`engine.Open` uses **journal** persistence: each committed transaction is appended to a local journal with one `fsync`, and reaches Git history when you call `Checkpoint`. To publish a Git data commit per transaction, choose native-git:
+`engine.Open` uses **journal** persistence: each committed transaction is appended to a local journal and flushed at `Options.Durability` (`repository.DurabilityNormal` by default; `DurabilityFull` also survives power loss, `DurabilityOff` only process crashes; see [architecture.md](architecture.md#durability-and-recovery)). It reaches Git history when you call `Checkpoint`. To publish a Git data commit per transaction, choose native-git:
 
 ```go
 eng, err := engine.OpenWithOptions(ctx, ".", engine.Options{
@@ -140,7 +140,7 @@ Most commit errors mean nothing was written. Two error types carry an explicit o
 - **`*repository.CommitError`** (native-git publication) has `Outcome` (`OutcomeRejected`, `OutcomeCommitted`, `OutcomeUnknown`) and `Commit`, the candidate commit ID.
   - `OutcomeCommitted` with an error means the data commit was published but a later check failed. Don't treat it as a rollback.
   - `OutcomeUnknown` (wrapping `repository.ErrCommitUnknown`) means RepoDB could not tell. Resolve it with `Repository.RecoverCommit(ctx, candidate)` or SQL `repodb_recover_commit('<candidate>')`.
-- **`*repository.WorkingCommitError`** (journal append) has `Outcome` and `TransactionID`. Resolve an unknown outcome with `WorkingState.RecoverTransaction(ctx, transactionID)`, preferably before the next checkpoint. Each checkpoint compacts the journal; transactions more than one checkpoint old come back as `unknown` with `repository.ErrWorkingHistoryTruncated`.
+- **`*repository.WorkingCommitError`** (journal append) has `Outcome` and `TransactionID`. Resolve an unknown outcome with `WorkingState.RecoverTransaction(ctx, transactionID)`, preferably before the next checkpoint. Each checkpoint compacts the journal; transactions more than one checkpoint old come back as `unknown` with `repository.ErrWorkingHistoryTruncated`. It reports what reached the journal on disk: under `DurabilityNormal` or `DurabilityOff`, a commit acknowledged just before a power loss (or, for `off`, an OS crash) may be missing afterwards.
 
 ```go
 var commitErr *repository.CommitError
@@ -235,7 +235,7 @@ if err := srv.Serve(ctx); err != nil { // returns when ctx is cancelled
 ```
 
 - **Lifecycle.** `Start` serves in the calling goroutine until `Close`, and `Serve(ctx)` wraps `Start` and `Close` around a context.
-- **Defaults.** `Config.Persistence` defaults to journal, like the library and `repodb start`. The server exposes one database, named by the repository's manifest (`repodb`).
+- **Defaults.** `Config.Persistence` defaults to journal and `Config.Durability` to normal, like the library and `repodb start`. The server exposes one database, named by the repository's manifest (`repodb`).
 - **Security.** The server has no authentication or TLS. See [sql.md](sql.md#server-access).
 
 ## Client

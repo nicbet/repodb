@@ -58,6 +58,10 @@ const (
 
 type Options struct {
 	Persistence PersistenceMode
+	// Durability of journal commits (journal persistence only); the zero
+	// value is repository.DurabilityNormal. Native-git commits are Git
+	// commits and always fully flushed.
+	Durability repository.Durability
 }
 
 type Result struct {
@@ -109,7 +113,7 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 		}
 		snapshot, err = repo.Current(context.Background())
 	case PersistenceJournal:
-		working, err = repository.OpenWorkingState(repo)
+		working, err = repository.OpenWorkingStateWithOptions(repo, repository.WorkingOptions{Durability: options.Durability})
 		if err == nil {
 			snapshot, err = working.Current(context.Background())
 		}

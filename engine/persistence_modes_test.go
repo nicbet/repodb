@@ -1,12 +1,18 @@
 package engine_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/nicbet/repodb/common/repository"
 	"github.com/nicbet/repodb/engine"
@@ -110,4 +116,104 @@ func copyTree(src, dst string) error {
 		}
 		return os.WriteFile(target, data, info.Mode().Perm())
 	})
+}
+
+// Acknowledged journal commits survive the process being killed, at every
+// durability level: even without a flush, the OS still holds the data.
+func TestJournalCommitsSurviveProcessKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses SIGKILL")
+	}
+	for _, level := range []repository.Durability{repository.DurabilityFull, repository.DurabilityNormal, repository.DurabilityOff} {
+		t.Run(string(level), func(t *testing.T) {
+			ctx := context.Background()
+			root := initJournalRepo(t, ctx)
+			cmd := exec.Command(os.Args[0], "-test.run", "^TestJournalKillHelper$")
+			cmd.Env = append(os.Environ(), "REPODB_KILL_HELPER_ROOT="+root, "REPODB_KILL_HELPER_DURABILITY="+string(level))
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			acknowledged := make(chan bool, 1)
+			go func() {
+				scanner := bufio.NewScanner(stdout)
+				for scanner.Scan() {
+					if scanner.Text() == "committed" {
+						acknowledged <- true
+						return
+					}
+				}
+				acknowledged <- false
+			}()
+			select {
+			case ok := <-acknowledged:
+				if !ok {
+					_ = cmd.Process.Kill()
+					t.Fatal("helper exited before committing")
+				}
+			case <-time.After(30 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("helper did not commit in time")
+			}
+			if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+				t.Fatal(err)
+			}
+			_ = cmd.Wait()
+			_, s := openJournalEngine(t, ctx, root)
+			if got := countRows(t, ctx, s, "t"); got != 20 {
+				t.Fatalf("rows after kill at %s durability = %d, want 20", level, got)
+			}
+		})
+	}
+}
+
+// TestJournalKillHelper runs in a subprocess for
+// TestJournalCommitsSurviveProcessKill: it commits 20 rows, reports it, and
+// waits to be killed without closing anything.
+func TestJournalKillHelper(t *testing.T) {
+	root := os.Getenv("REPODB_KILL_HELPER_ROOT")
+	if root == "" {
+		t.Skip("subprocess helper")
+	}
+	ctx := context.Background()
+	eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal, Durability: repository.Durability(os.Getenv("REPODB_KILL_HELPER_DURABILITY"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := eng.NewSession()
+	if err := s.Exec(ctx, "CREATE TABLE t (id BIGINT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(1); i <= 20; i++ {
+		if err := s.Exec(ctx, "INSERT INTO t VALUES (?)", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fmt.Println("committed")
+	time.Sleep(time.Minute)
+}
+
+func TestEngineDurabilityOption(t *testing.T) {
+	ctx := context.Background()
+	root := initJournalRepo(t, ctx)
+	for _, level := range []repository.Durability{"", repository.DurabilityFull, repository.DurabilityOff} {
+		eng, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal, Durability: level})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := level
+		if want == "" {
+			want = repository.DurabilityNormal
+		}
+		if got := eng.WorkingState().Durability(); got != want {
+			t.Errorf("journal durability = %q, want %q", got, want)
+		}
+		eng.Close()
+	}
+	if _, err := engine.OpenWithOptions(ctx, root, engine.Options{Persistence: engine.PersistenceJournal, Durability: "fast"}); err == nil {
+		t.Error("engine accepted an unknown durability")
+	}
 }

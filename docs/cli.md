@@ -33,9 +33,9 @@ Every SQL write is durable once it returns. The two modes differ in when a write
 
 | | `native-git` | `journal` |
 | --- | --- | --- |
-| A committed SQL transaction… | publishes a Git data commit immediately | appends to a local journal with one `fsync` |
+| A committed SQL transaction… | publishes a Git data commit immediately | appends to a local journal and flushes it (`--durability`) |
 | Git history | one data commit per transaction | one data commit per checkpoint (`repodb commit`) |
-| Write latency | Git object, tree, commit and ref work per transaction (see [benchmarks/latest.md](benchmarks/latest.md)) | one journal append and `fsync` |
+| Write latency | Git object, tree, commit and ref work per transaction (see [benchmarks/latest.md](benchmarks/latest.md)) | one journal append and flush |
 | Before `repodb sync` | nothing to do | checkpoint the journal first |
 | Backup | the Git repository | the Git repository **and** the journal, copied at one point |
 | Default | no: opt in with `--persistence native-git` | yes: `repodb start`, `repodb-server` and the Go library (`engine.Open`) |
@@ -45,6 +45,13 @@ Journal is the default and much faster per write. Native-git is **audit mode**: 
 The modes share one repository, and switching needs no migration:
 - **native-git → journal:** open in journal mode; a repository without a journal is clean.
 - **journal → native-git:** a native-git engine refuses to open while the journal has uncheckpointed changes, so run `repodb commit` first.
+
+**Durability.** `--durability` sets how hard each journal commit is flushed:
+- `normal` (the default) survives process and OS crashes;
+- `full` also survives power loss, at about 5 ms per commit on macOS (elsewhere `normal` and `full` are the same flush);
+- `off` survives process crashes only.
+
+No level can corrupt the journal; weaker levels can only lose the newest commits. Checkpoints are always fully flushed. Native-git commits are Git commits and ignore the setting. Details are in [architecture.md](architecture.md#durability-and-recovery).
 
 ## Setting up a repository
 
@@ -70,6 +77,7 @@ Starts the MySQL-compatible server and runs until interrupted (Ctrl-C or `SIGTER
 | `--addr` | `127.0.0.1:3306` | listen address |
 | `--repo` | `.` | a path inside the Git repository |
 | `--persistence` | `journal` | `journal`, or `native-git` for audit mode |
+| `--durability` | `normal` | journal commit durability: `normal`, `full` or `off` (see [Persistence modes](#persistence-modes)) |
 
 ```sh
 repodb start
@@ -80,7 +88,7 @@ The database is named `repodb`. The server performs no authentication and has no
 
 ### `repodb-server`
 
-Takes the same `--addr`, `--repo` and `--persistence` flags. The server exposes one database, named by the repository's manifest (`repodb`).
+Takes the same `--addr`, `--repo`, `--persistence` and `--durability` flags. The server exposes one database, named by the repository's manifest (`repodb`).
 
 ### `repodb sql <statement>`
 

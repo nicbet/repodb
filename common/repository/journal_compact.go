@@ -99,7 +99,7 @@ func writeSynced(path string, data []byte) error {
 		file.Close()
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	if err := flushFile(file, DurabilityFull); err != nil {
 		file.Close()
 		return err
 	}

@@ -39,6 +39,7 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
 - **Snapshot round trip.** A snapshot survives `git gc --prune=now`, reopening, a push to a bare remote, and a clone and fetch, while the source worktree's `HEAD` and status stay untouched.
 - **Optimistic publication.** A stale writer is rejected with `ErrConflict`, before it writes any Git object. Of two concurrent writers, exactly one succeeds. A cancelled lock wait is a definite rejection.
 - **Commit outcomes.** Faults injected before, during and after the ref update give `rejected`, `unknown` and `committed`, and `RecoverCommit` resolves each.
+- **Journal durability.** Each level makes the expected flush per commit (none for `off`), a checkpoint fully flushes the journal before the head moves, and each level's real flush call succeeds on the platform (`durability_internal_test.go`).
 - **Multiple processes:**
   - two writer processes in linked worktrees give one success and one conflict;
   - a writer killed inside publication leaves the old snapshot intact and releases the lock;
@@ -74,7 +75,8 @@ The full suite takes about a minute and a half. `engine` is the slowest package,
   - journal commits, checkpoints and native-git commits racing without deadlock or a stranded journal;
   - a rejected `COMMIT` ends the transaction, and the retry succeeds (native-git and journal);
   - `Diff` listing row-only inserts, updates and deletes, new tables, and pending edits after a reopen;
-  - switching between native-git and journal in both directions, and a stopped copy of the repository keeping uncheckpointed rows (`persistence_modes_test.go`).
+  - switching between native-git and journal in both directions, and a stopped copy of the repository keeping uncheckpointed rows (`persistence_modes_test.go`);
+  - journal commits surviving a `SIGKILL` at every durability level, and the engine passing its durability option to the journal.
 - **Cross-engine visibility** (`cross_engine_test.go`). Readers see other engines' writes in every mode, including external `git update-ref` and `pack-refs` changes, without a restart.
 - **Range queries** (`range_test.go`). Indexed range and `ORDER BY … LIMIT` results are compared with a forced full scan. The comparison runs over native-git, journal with pending edits, and open transactions, and over signed-integer, decimal, collated-string and datetime keys, using seeded random data. Tests also cover integer extremes, and that plans use `IndexedTableAccess` without a sort.
 - **Journal index overlay** (`journal_index_test.go`). Inserts, updates and deletes are visible through persisted indexes, with a random-operation model test (150 steps, checkpoints and reopens, one or two engines).

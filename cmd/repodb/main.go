@@ -219,11 +219,11 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		srv, err := repodbserver.New(repodbserver.Config{Address: opts.address, Repository: repo, Persistence: opts.persistence})
+		srv, err := repodbserver.New(repodbserver.Config{Address: opts.address, Repository: repo, Persistence: opts.persistence, Durability: opts.durability})
 		if err != nil {
 			return err
 		}
-		fmt.Printf("RepoDB listening on %s (repository %s, %s persistence)\n", srv.Address(), repo.Root, opts.persistence)
+		fmt.Printf("RepoDB listening on %s (repository %s, %s persistence, %s durability)\n", srv.Address(), repo.Root, opts.persistence, opts.durability)
 		return srv.Serve(ctx)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -240,6 +240,7 @@ func conflictValue(present bool, value []byte) string {
 type startOptions struct {
 	address, repoPath string
 	persistence       engine.PersistenceMode
+	durability        repository.Durability
 }
 
 func parseStartOptions(args []string) (startOptions, error) {
@@ -247,10 +248,15 @@ func parseStartOptions(args []string) (startOptions, error) {
 	address := set.String("addr", "127.0.0.1:3306", "MySQL listen address")
 	repoPath := set.String("repo", ".", "path inside the Git worktree")
 	persistence := set.String("persistence", string(engine.PersistenceJournal), "persistence mode: journal (default) or native-git (audit mode: every transaction is a Git commit)")
+	durability := set.String("durability", string(repository.DurabilityNormal), "journal commit durability: normal (default; survives process and OS crashes), full (also survives power loss) or off (survives process crashes)")
 	if err := set.Parse(args); err != nil {
 		return startOptions{}, err
 	}
-	return startOptions{address: *address, repoPath: *repoPath, persistence: engine.PersistenceMode(*persistence)}, nil
+	level, err := repository.ParseDurability(*durability)
+	if err != nil {
+		return startOptions{}, err
+	}
+	return startOptions{address: *address, repoPath: *repoPath, persistence: engine.PersistenceMode(*persistence), durability: level}, nil
 }
 
 // promptCheckpointIfDirty asks whether to commit a dirty journal before

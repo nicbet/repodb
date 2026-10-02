@@ -160,7 +160,7 @@ The journal is an append-only file of framed records:
 "RDBJ" | payload length (u32 BE) | CRC-32C (u32 BE) | JSON payload
 ```
 
-**Commit.** Under `working.lock`, a committing transaction checks that its base (the journal generation and the committed data head) is still current, or fails with `ErrConflict`. It then appends a `typed-prepare` record and a `commit` record, and `fsync`s before returning success. The prepare record carries the transaction's typed edits:
+**Commit.** Under `working.lock`, a committing transaction checks that its base (the journal generation and the committed data head) is still current, or fails with `ErrConflict`. It then appends a `typed-prepare` record and a `commit` record, and flushes the journal at the engine's durability level (see [Durability and recovery](#durability-and-recovery)) before returning success. The prepare record carries the transaction's typed edits:
 - per table, a new schema object or a drop;
 - the changed rows as encoded key and value, or delete.
 
@@ -191,7 +191,7 @@ If the process dies after publishing but before the record, the next open sees t
 
 ### Concurrency limits
 
-Commits are optimistic and repository-wide: any commit since a transaction's snapshot rejects that transaction, whichever rows it touched. Within one repository, commits are serialized by `working.lock` (journal) or by `working.lock` and `publish.lock` (native-git), and each journal commit does its own `fsync`. Together these bound concurrent write throughput. Per-key conflict detection, group commit and automatic retry are tracked in rdb-df092b.
+Commits are optimistic and repository-wide: any commit since a transaction's snapshot rejects that transaction, whichever rows it touched. Within one repository, commits are serialized by `working.lock` (journal) or by `working.lock` and `publish.lock` (native-git), and each journal commit does its own flush. Together these bound concurrent write throughput. Per-key conflict detection, group commit and automatic retry are tracked in rdb-df092b.
 
 ## Sync and merge
 
@@ -223,6 +223,18 @@ Row conflicts are compared on whole encoded rows, so fields are never merged. Un
 `Enable` adds the fetch refspec and `repodb.remote`. It adopts the remote history when there is no local data, and initializes an empty history when neither side has data.
 
 ## Durability and recovery
+
+**Journal commit durability.** Each engine flushes its journal commits at one of three levels (`engine.Options.Durability`, `--durability`):
+
+| Level | macOS | Linux | Windows | An acknowledged commit survives |
+| --- | --- | --- | --- | --- |
+| `full` | `F_FULLFSYNC` | `fdatasync` | `FlushFileBuffers` | power loss |
+| `normal` (default) | `F_BARRIERFSYNC` | `fdatasync` | `FlushFileBuffers` | process and OS crashes; a power loss may lose the newest commits |
+| `off` | no flush | no flush | no flush | process crashes; an OS crash or power loss may lose commits the OS had not written back yet |
+
+On Linux and Windows, `normal` is the same full flush as `full`. On macOS, `F_FULLFSYNC` forces the drive's cache to stable media and costs about 5 ms per commit; `F_BARRIERFSYNC` hands the data to the drive in order without forcing its cache, for about 0.25 ms. MySQL, PostgreSQL and SQLite also don't force the drive cache by default on macOS.
+
+No level can corrupt the journal. It is append-only, every record is length-prefixed and checksummed, and replay truncates a partial final record. Flushes keep records in order, so a crash can only cut off the newest commits, never leave a gap. Whatever the level, a checkpoint fully flushes the journal before publishing its Git commit, and compaction fully flushes the new file. A published checkpoint therefore never outlives, in a power loss, the journal records it contains.
 
 **Git durability settings.** Git runs with `-c core.fsync=committed,reference -c core.fsyncMethod=fsync` for object, tree, commit and ref writes. RepoDB reports success only after the compare-and-swap ref update has returned and the new snapshot verified. These guarantees assume the filesystem and storage honor `fsync` and atomic ref replacement.
 
