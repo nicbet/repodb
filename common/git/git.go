@@ -401,10 +401,10 @@ func (CLI) ListTreeObjects(ctx context.Context, root, commit string) (map[string
 }
 
 // ReadObjects reads a set of blobs through the long-lived object reader.
-func (CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (map[string][]byte, error) {
-	results, err := readerFor(root).read(ctx, objectIDs)
+func (c CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (map[string][]byte, error) {
+	results, err := c.ReadObjectResults(ctx, root, objectIDs)
 	if err != nil {
-		return nil, fmt.Errorf("batch read Git objects: %w", err)
+		return nil, err
 	}
 	objects := make(map[string][]byte, len(objectIDs))
 	for i, result := range results {
@@ -417,6 +417,40 @@ func (CLI) ReadObjects(ctx context.Context, root string, objectIDs []string) (ma
 		objects[result.OID] = result.Data
 	}
 	return objects, nil
+}
+
+// ObjectResult is one object read by ReadObjectResults. Missing is set when
+// Git cannot resolve the request; otherwise Type names the object's type.
+type ObjectResult struct {
+	OID     string
+	Type    string
+	Data    []byte
+	Missing bool
+}
+
+// ReadObjectResults reads a set of objects through the long-lived object
+// reader and returns one result per request, in request order, so a missing
+// object doesn't hide the others.
+func (CLI) ReadObjectResults(ctx context.Context, root string, objectIDs []string) ([]ObjectResult, error) {
+	results, err := readerFor(root).read(ctx, objectIDs)
+	if err != nil {
+		return nil, fmt.Errorf("batch read Git objects: %w", err)
+	}
+	objects := make([]ObjectResult, len(results))
+	for i, result := range results {
+		objects[i] = ObjectResult(result)
+	}
+	return objects, nil
+}
+
+// RevList returns the commits reachable from rev, newest first, following
+// every parent.
+func (CLI) RevList(ctx context.Context, root, rev string) ([]string, error) {
+	out, err := run(ctx, root, nil, nil, "rev-list", rev, "--")
+	if err != nil {
+		return nil, fmt.Errorf("list commits of %s: %w", rev, err)
+	}
+	return strings.Fields(out), nil
 }
 
 func durableArgs(ctx context.Context, args ...string) []string {

@@ -175,6 +175,31 @@ With nothing to checkpoint, it returns the current data head and creates no comm
 
 It is `nil` in native-git mode. Use `repository.OpenWorkingState(repo)` to inspect a repository's journal without an engine.
 
+## Checking integrity
+
+`engine.Check` is what `repodb check` runs. It verifies every object and table of committed data without trusting anything checked earlier in the process (see [cli.md](cli.md#repodb-check)):
+
+```go
+repo, err := repository.Open(ctx, ".")
+if err != nil {
+	log.Fatal(err)
+}
+report, err := engine.Check(ctx, repo, engine.CheckOptions{All: true}) // or Revision: "<rev>"; zero value: the data head
+if err != nil {
+	log.Fatal(err) // the check couldn't run: unknown revision, Git failure, cancelled context
+}
+for _, commit := range report.Commits {
+	for _, problem := range commit.Problems {
+		log.Printf("%s: %s", commit.Commit, problem)
+	}
+}
+if report.Problems() != 0 {
+	log.Fatalf("%d problem(s) in %d commit(s)", report.Problems(), report.FailedCommits())
+}
+```
+
+Corruption goes in the report, not the error: each `CommitCheck` lists `Problems` and harmless `Warnings`, such as unreferenced objects. Lower-level building blocks are in `repository`. `Repository.LoadSnapshotUncached` opens a commit without the snapshot memo, and `Snapshot.VerifyObjects` reads and checks every listed object, returning a `repository.ObjectProblem` for each failure.
+
 ## Synchronization
 
 The `integration` package implements the sync workflow described in [cli.md](cli.md#synchronizing-with-a-remote). Each function takes a path inside the repository and a remote name:

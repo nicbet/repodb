@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -30,7 +31,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: repodb <init|status|diff|commit|enable|sync|conflicts|resolve|start|sql>")
+		return errors.New("usage: repodb <init|status|diff|commit|check|enable|sync|conflicts|resolve|start|sql>")
 	}
 	switch args[0] {
 	case "init":
@@ -106,6 +107,26 @@ func run(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("RepoDB data commit: %s\n", result.Commit)
 		return nil
+	case "check":
+		set := flag.NewFlagSet("check", flag.ContinueOnError)
+		repoPath := set.String("repo", ".", "path inside the Git worktree")
+		revision := set.String("revision", "", "data commit to check (default: the data head)")
+		all := set.Bool("all", false, "check every commit in the data history")
+		if err := set.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *all && *revision != "" {
+			return errors.New("check takes --revision or --all, not both")
+		}
+		repo, err := repository.Open(ctx, *repoPath)
+		if err != nil {
+			return err
+		}
+		report, err := engine.Check(ctx, repo, engine.CheckOptions{Revision: *revision, All: *all})
+		if err != nil {
+			return err
+		}
+		return printCheckReport(os.Stdout, report)
 	case "snapshot":
 		return errors.New("snapshot is obsolete; RepoDB transactions publish data commits automatically")
 	case "sql":
@@ -228,6 +249,29 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// printCheckReport prints one line per problem and warning, an ok line for
+// each commit without problems, and a summary. It returns an error if any
+// commit has problems.
+func printCheckReport(out io.Writer, report engine.CheckReport) error {
+	for _, commit := range report.Commits {
+		for _, problem := range commit.Problems {
+			fmt.Fprintf(out, "%s\t%s\n", commit.Commit, problem)
+		}
+		for _, warning := range commit.Warnings {
+			fmt.Fprintf(out, "%s\twarning: %s\n", commit.Commit, warning)
+		}
+		if len(commit.Problems) == 0 {
+			fmt.Fprintf(out, "ok %s\n", commit.Commit)
+		}
+	}
+	if problems := report.Problems(); problems != 0 {
+		fmt.Fprintf(out, "checked %d commit(s): %d problem(s) in %d commit(s)\n", len(report.Commits), problems, report.FailedCommits())
+		return fmt.Errorf("check failed: %d problem(s) in %d commit(s)", problems, report.FailedCommits())
+	}
+	fmt.Fprintf(out, "checked %d commit(s): no problems\n", len(report.Commits))
+	return nil
 }
 
 func conflictValue(present bool, value []byte) string {

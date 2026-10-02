@@ -3,13 +3,13 @@ package engine
 // SetMaxValidatedNodeLinks sets the validated-node cache bound and returns a
 // function restoring it.
 func SetMaxValidatedNodeLinks(limit int) (restore func()) {
-	validatedNodes.Lock()
+	processValidation.nodesMu.Lock()
 	previous := maxValidatedNodeLinks
 	maxValidatedNodeLinks = limit
-	validatedNodes.Unlock()
+	processValidation.nodesMu.Unlock()
 	return func() {
-		validatedNodes.Lock()
+		processValidation.nodesMu.Lock()
 		maxValidatedNodeLinks = previous
-		validatedNodes.Unlock()
+		processValidation.nodesMu.Unlock()
 	}
 }

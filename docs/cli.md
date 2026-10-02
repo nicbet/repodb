@@ -2,7 +2,7 @@
 
 RepoDB ships two programs:
 
-- `repodb`: initializes a repository, runs the MySQL-compatible server, checkpoints journal changes, and synchronizes data with a Git remote.
+- `repodb`: initializes a repository, runs the MySQL-compatible server, checkpoints journal changes, synchronizes data with a Git remote, and checks stored data for corruption.
 - `repodb-server`: a server-only binary with the same flags as `repodb start`.
 
 Both work on the Git repository that contains the current directory, or the one named by `--repo` where a command accepts it. RepoDB data lives on its own ref, `refs/repodb/data`. It never changes your branches, index or working tree. See [architecture.md](architecture.md) for how the data is stored.
@@ -209,11 +209,48 @@ The primary key is a row's identity across clones. If two clones insert differen
 
 There is no atomic link between a source commit and a data commit. Push your code and run `repodb sync`, as separate steps.
 
+## Checking integrity
+
+### `repodb check`
+
+Verifies committed RepoDB data completely. Ordinary opens check an object only when something reads it, so corruption in data nobody reads goes unnoticed (see [architecture.md](architecture.md#snapshots)). For each data commit it checks, `check`:
+
+1. repeats the checks of an ordinary open: the manifest, and that the tree holds exactly the listed objects;
+2. reads every listed object and checks that it hashes to its name;
+3. validates every table: schemas, every row's encoding and primary key, and the structure of every data and index tree.
+
+It trusts nothing checked before it started, and keeps going after a problem so that one run reports all of them. A commit whose tree doesn't match its manifest gets one problem and no further checks.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--revision <rev>` | the data head | check this data commit; any Git revision that names one |
+| `--all` | off | check every commit in the data history, following both parents of merges |
+| `--repo` | `.` | path inside the Git worktree |
+
+`--revision` and `--all` can't be combined. With `--all`, an object listed by several commits is read once, and a table unchanged between commits is validated once.
+
+Output is one line per finding, then `ok <commit>` for each commit without problems, then a summary:
+
+```
+3f2a…	object 9c1e…: content does not match its name
+3f2a…	object 0b7d…: missing Git object e41f…
+3f2a…	validate SQL table orders: …
+5d90…	warning: unreferenced object 77aa…
+ok 5d90…
+checked 2 commit(s): 3 problem(s) in 1 commit(s)
+```
+
+A warning names an object the commit lists but no table reaches; it is harmless and doesn't fail the check. Any problem makes `repodb check` exit with status 1 (`repodb: check failed: …`). Run it after restoring a backup, after a disk or filesystem fault, or periodically.
+
+`check` reads committed data only. It doesn't open the journal, so uncheckpointed changes aren't checked; the journal verifies its own frame checksums when it is replayed. It doesn't run `git fsck` either: it checks RepoDB's content addressing on top of the bytes Git returns.
+
 ## Backup and recovery
 
 - **Journal mode (the default)**: uncheckpointed changes exist only in `<git-common-dir>/repodb/working/v1/journal`; a copy of the Git repository alone restores only the last checkpoint. Back up in one of two ways:
   1. run `repodb commit -m <message>`, then back up the Git repository as for native-git mode; or
   2. stop RepoDB and copy the whole repository, including `.git`, which contains the journal.
+
+  After restoring, `repodb check --all` verifies the restored data history.
 
   Each checkpoint compacts the journal down to the work since the checkpoint, so it stays small. Online backup is tracked in rdb-f33cb0.
 - **Native-git mode (audit mode)**: the Git repository holds every committed transaction. A mirror clone (`git clone --mirror`, which includes `refs/repodb/data`), or a copy of `.git` taken while RepoDB is stopped, is a complete backup. A plain `git clone` does not include RepoDB data.

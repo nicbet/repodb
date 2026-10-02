@@ -915,6 +915,17 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 	if snapshot := r.memoizedSnapshot(commit); snapshot != nil {
 		return snapshot, nil
 	}
+	snapshot, err := r.readSnapshot(ctx, commit)
+	if err != nil {
+		return nil, err
+	}
+	r.rememberSnapshot(snapshot)
+	return r.snapshotFromCore(commit, snapshot.core), nil
+}
+
+// readSnapshot reads commit's manifest and tree and checks its inventory,
+// without consulting or updating snapshotMemo.
+func (r *Repository) readSnapshot(ctx context.Context, commit string) (*Snapshot, error) {
 	data, err := r.git.ReadTreeFile(ctx, r.Root, commit, "manifest.json")
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
@@ -971,8 +982,7 @@ func (r *Repository) loadSnapshot(ctx context.Context, commit string) (*Snapshot
 	}
 	// Object bytes are read and checked against their names on first use
 	// (readObjects), so opening a snapshot costs only its inventory.
-	r.rememberSnapshot(snapshot)
-	return r.snapshotFromCore(commit, snapshot.core), nil
+	return snapshot, nil
 }
 
 // readObjects reads the listed objects that are not cached yet by Git object

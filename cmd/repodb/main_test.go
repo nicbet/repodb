@@ -175,3 +175,44 @@ func TestStartDurabilityFlag(t *testing.T) {
 		t.Error("parseStartOptions accepted -durability fast")
 	}
 }
+
+func TestCheckReportsAndFailsOnProblems(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if output, err := exec.Command("git", "-C", root, "init", "--quiet", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := run(ctx, []string{"check", "-repo", root}); !errors.Is(err, repository.ErrNotInitialized) {
+		t.Fatalf("check before init = %v, want ErrNotInitialized", err)
+	}
+	if err := run(ctx, []string{"init", root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"check", "-repo", root}); err != nil {
+		t.Fatalf("check of a healthy repository: %v", err)
+	}
+	if err := run(ctx, []string{"check", "-repo", root, "-all", "-revision", repository.DataRef}); err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Fatalf("check --all --revision = %v", err)
+	}
+
+	var out strings.Builder
+	err := printCheckReport(&out, engine.CheckReport{Commits: []engine.CommitCheck{
+		{Commit: "c2", Warnings: []string{"unreferenced object h"}},
+		{Commit: "c1", Problems: []string{"object h1: content does not match its name", "validate SQL table t: broken"}},
+	}})
+	if err == nil || err.Error() != "check failed: 2 problem(s) in 1 commit(s)" {
+		t.Fatalf("printCheckReport err = %v", err)
+	}
+	want := "c2\twarning: unreferenced object h\n" +
+		"ok c2\n" +
+		"c1\tobject h1: content does not match its name\n" +
+		"c1\tvalidate SQL table t: broken\n" +
+		"checked 2 commit(s): 2 problem(s) in 1 commit(s)\n"
+	if out.String() != want {
+		t.Fatalf("output:\n%s\nwant:\n%s", out.String(), want)
+	}
+	out.Reset()
+	if err := printCheckReport(&out, engine.CheckReport{Commits: []engine.CommitCheck{{Commit: "c1"}}}); err != nil || out.String() != "ok c1\nchecked 1 commit(s): no problems\n" {
+		t.Fatalf("clean report = %q, %v", out.String(), err)
+	}
+}

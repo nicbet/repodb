@@ -28,27 +28,55 @@ import (
 
 const snapshotValidationVersion = 6
 
-// validatedTables caches table validation by content: repository and the
-// table's schema, data and index roots. The roots name the content, so a
-// table validated under one commit or journal generation stays valid under
-// any other with the same roots. Each entry records the table's reachable
-// objects with the Git object IDs they were read from, and a hit counts only
-// for a snapshot that provides those same objects (repository.Snapshot.
-// Provides): an object present only in a journal, or stored under another
-// Git object, never vouches for a snapshot that lacks it.
-var validatedTables = struct {
-	sync.Mutex
-	entries map[string]*list.Element
-	order   *list.List
-	objects int
-}{entries: make(map[string]*list.Element), order: list.New()}
+// validationCache remembers validated tables and Prolly subtrees.
+//
+// Tables are cached by content: repository and the table's schema, data and
+// index roots. The roots name the content, so a table validated under one
+// commit or journal generation stays valid under any other with the same
+// roots. Each entry records the table's reachable objects with the Git object
+// IDs they were read from, and a hit counts only for a snapshot that provides
+// those same objects (repository.Snapshot.Provides): an object present only in
+// a journal, or stored under another Git object, never vouches for a snapshot
+// that lacks it.
+//
+// Nodes are Prolly nodes whose subtrees passed validation, so a table whose
+// roots changed is validated only where its trees changed. A data tree's
+// nodes are keyed by the table's schema root, because rows valid under one
+// schema may not be under another; index trees need only structural checks
+// and share one scope. Like tables, each entry records the Git object ID the
+// node was read under, and a subtree counts for a snapshot only if that
+// snapshot provides all of its nodes.
+//
+// processValidation serves every engine and sync in the process; a check
+// (Check) uses a private instance, so it trusts nothing validated before it.
+type validationCache struct {
+	tablesMu     sync.Mutex
+	tables       map[string]*list.Element
+	tableOrder   *list.List
+	tableObjects int
 
-// The cache is bounded by entries and by the objects they record; the newest
-// entry is always kept.
+	nodesMu   sync.Mutex
+	nodes     map[string]*list.Element
+	nodeOrder *list.List
+	nodeSize  int
+}
+
+func newValidationCache() *validationCache {
+	return &validationCache{tables: make(map[string]*list.Element), tableOrder: list.New(), nodes: make(map[string]*list.Element), nodeOrder: list.New()}
+}
+
+var processValidation = newValidationCache()
+
+// The table cache is bounded by entries and by the objects they record; the
+// newest entry is always kept.
 const (
 	maxValidatedTables  = 1024
 	maxValidatedObjects = 1 << 20
 )
+
+// maxValidatedNodeLinks bounds each node cache by nodes plus child links.
+// Read it under the cache's nodesMu.
+var maxValidatedNodeLinks = 1 << 20
 
 type validationCacheEntry struct {
 	key     string
@@ -69,60 +97,42 @@ func tableValidationKey(snapshot *repository.Snapshot, table repository.Table) s
 	return key.String()
 }
 
-// lookupValidatedTable returns the table's validated objects if snapshot
-// provides all of them.
-func lookupValidatedTable(snapshot *repository.Snapshot, key string) ([]repository.ObjectRef, bool) {
-	validatedTables.Lock()
-	element := validatedTables.entries[key]
+// lookupTable returns the table's validated objects if snapshot provides all
+// of them.
+func (c *validationCache) lookupTable(snapshot *repository.Snapshot, key string) ([]repository.ObjectRef, bool) {
+	c.tablesMu.Lock()
+	element := c.tables[key]
 	if element == nil {
-		validatedTables.Unlock()
+		c.tablesMu.Unlock()
 		return nil, false
 	}
-	validatedTables.order.MoveToFront(element)
+	c.tableOrder.MoveToFront(element)
 	objects := element.Value.(validationCacheEntry).objects
-	validatedTables.Unlock()
+	c.tablesMu.Unlock()
 	if !snapshot.Provides(objects) {
 		return nil, false
 	}
 	return objects, true
 }
 
-// rememberValidatedTable records (or replaces) the objects a table was
-// validated with.
-func rememberValidatedTable(key string, objects []repository.ObjectRef) {
-	validatedTables.Lock()
-	defer validatedTables.Unlock()
-	if element := validatedTables.entries[key]; element != nil {
-		validatedTables.objects -= len(element.Value.(validationCacheEntry).objects)
-		validatedTables.order.Remove(element)
+// rememberTable records (or replaces) the objects a table was validated with.
+func (c *validationCache) rememberTable(key string, objects []repository.ObjectRef) {
+	c.tablesMu.Lock()
+	defer c.tablesMu.Unlock()
+	if element := c.tables[key]; element != nil {
+		c.tableObjects -= len(element.Value.(validationCacheEntry).objects)
+		c.tableOrder.Remove(element)
 	}
-	validatedTables.entries[key] = validatedTables.order.PushFront(validationCacheEntry{key: key, objects: objects})
-	validatedTables.objects += len(objects)
-	for validatedTables.order.Len() > 1 && (validatedTables.order.Len() > maxValidatedTables || validatedTables.objects > maxValidatedObjects) {
-		oldest := validatedTables.order.Back()
+	c.tables[key] = c.tableOrder.PushFront(validationCacheEntry{key: key, objects: objects})
+	c.tableObjects += len(objects)
+	for c.tableOrder.Len() > 1 && (c.tableOrder.Len() > maxValidatedTables || c.tableObjects > maxValidatedObjects) {
+		oldest := c.tableOrder.Back()
 		entry := oldest.Value.(validationCacheEntry)
-		delete(validatedTables.entries, entry.key)
-		validatedTables.objects -= len(entry.objects)
-		validatedTables.order.Remove(oldest)
+		delete(c.tables, entry.key)
+		c.tableObjects -= len(entry.objects)
+		c.tableOrder.Remove(oldest)
 	}
 }
-
-// validatedNodes caches Prolly nodes whose subtrees passed validation, so a
-// table whose roots changed is validated only where its trees changed. A data
-// tree's nodes are keyed by the table's schema root, because rows valid under
-// one schema may not be under another; index trees need only structural
-// checks and share one scope. Like validatedTables, each entry records the Git
-// object ID the node was read under, and a subtree counts for a snapshot only
-// if that snapshot provides all of its nodes.
-var validatedNodes = struct {
-	sync.Mutex
-	entries map[string]*list.Element
-	order   *list.List
-	size    int
-}{entries: make(map[string]*list.Element), order: list.New()}
-
-// maxValidatedNodeLinks bounds the node cache by nodes plus child links.
-var maxValidatedNodeLinks = 1 << 20
 
 const indexValidationScope = "index"
 
@@ -137,12 +147,13 @@ func (e validatedNodeEntry) size() int { return 1 + len(e.node.Children) }
 // snapshotNodeCache is the prolly.NodeCache of one tree scope as seen by one
 // snapshot.
 type snapshotNodeCache struct {
+	cache    *validationCache
 	snapshot *repository.Snapshot
 	prefix   string
 }
 
-func newSnapshotNodeCache(snapshot *repository.Snapshot, scope string) snapshotNodeCache {
-	return snapshotNodeCache{snapshot: snapshot, prefix: fmt.Sprintf("%s\x00%d\x00%s\x00", snapshot.RepositoryIdentity(), snapshotValidationVersion, scope)}
+func (c *validationCache) nodeCache(snapshot *repository.Snapshot, scope string) snapshotNodeCache {
+	return snapshotNodeCache{cache: c, snapshot: snapshot, prefix: fmt.Sprintf("%s\x00%d\x00%s\x00", snapshot.RepositoryIdentity(), snapshotValidationVersion, scope)}
 }
 
 // Subtree expands the cached subtree in memory; it misses if any node was
@@ -150,22 +161,22 @@ func newSnapshotNodeCache(snapshot *repository.Snapshot, scope string) snapshotN
 func (c snapshotNodeCache) Subtree(hash storage.Hash) ([]prolly.NodeCount, bool) {
 	var nodes []prolly.NodeCount
 	var refs []repository.ObjectRef
-	validatedNodes.Lock()
+	c.cache.nodesMu.Lock()
 	for stack := []storage.Hash{hash}; len(stack) != 0; {
 		next := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		element := validatedNodes.entries[c.prefix+string(next)]
+		element := c.cache.nodes[c.prefix+string(next)]
 		if element == nil {
-			validatedNodes.Unlock()
+			c.cache.nodesMu.Unlock()
 			return nil, false
 		}
-		validatedNodes.order.MoveToFront(element)
+		c.cache.nodeOrder.MoveToFront(element)
 		entry := element.Value.(validatedNodeEntry)
 		nodes = append(nodes, prolly.NodeCount{Hash: next, Count: entry.node.Count})
 		refs = append(refs, entry.ref)
 		stack = append(stack, entry.node.Children...)
 	}
-	validatedNodes.Unlock()
+	c.cache.nodesMu.Unlock()
 	if !c.snapshot.Provides(refs) {
 		return nil, false
 	}
@@ -176,20 +187,21 @@ func (c snapshotNodeCache) Subtree(hash storage.Hash) ([]prolly.NodeCount, bool)
 func (c snapshotNodeCache) Remember(hash storage.Hash, node prolly.ValidatedNode) {
 	performanceCounters.nodesValidated.Add(1)
 	entry := validatedNodeEntry{key: c.prefix + string(hash), ref: c.snapshot.ObjectRefs([]storage.Hash{hash})[0], node: node}
-	validatedNodes.Lock()
-	defer validatedNodes.Unlock()
-	if element := validatedNodes.entries[entry.key]; element != nil {
-		validatedNodes.size -= element.Value.(validatedNodeEntry).size()
-		validatedNodes.order.Remove(element)
+	cache := c.cache
+	cache.nodesMu.Lock()
+	defer cache.nodesMu.Unlock()
+	if element := cache.nodes[entry.key]; element != nil {
+		cache.nodeSize -= element.Value.(validatedNodeEntry).size()
+		cache.nodeOrder.Remove(element)
 	}
-	validatedNodes.entries[entry.key] = validatedNodes.order.PushFront(entry)
-	validatedNodes.size += entry.size()
-	for validatedNodes.order.Len() > 1 && validatedNodes.size > maxValidatedNodeLinks {
-		oldest := validatedNodes.order.Back()
+	cache.nodes[entry.key] = cache.nodeOrder.PushFront(entry)
+	cache.nodeSize += entry.size()
+	for cache.nodeOrder.Len() > 1 && cache.nodeSize > maxValidatedNodeLinks {
+		oldest := cache.nodeOrder.Back()
 		evicted := oldest.Value.(validatedNodeEntry)
-		delete(validatedNodes.entries, evicted.key)
-		validatedNodes.size -= evicted.size()
-		validatedNodes.order.Remove(oldest)
+		delete(cache.nodes, evicted.key)
+		cache.nodeSize -= evicted.size()
+		cache.nodeOrder.Remove(oldest)
 	}
 }
 
@@ -295,30 +307,39 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 // ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
 // and primary-key encoding before integration publishes a fetched snapshot.
 // A table already validated with the same roots is skipped when this snapshot
-// provides the same objects (see validatedTables); within a changed table,
-// subtrees validated before are skipped the same way (see validatedNodes).
+// provides the same objects; within a changed table, subtrees validated before
+// are skipped the same way (see validationCache).
 func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error {
 	if snapshot == nil {
 		return errors.New("snapshot is required")
 	}
 	for name, table := range snapshot.Manifest.Tables {
-		key := tableValidationKey(snapshot, table)
-		if _, ok := lookupValidatedTable(snapshot, key); ok {
-			continue
-		}
-		objects, err := validateTable(ctx, snapshot, name, table)
-		if err != nil {
+		if _, err := processValidation.validateTable(ctx, snapshot, name, table); err != nil {
 			return err
 		}
-		rememberValidatedTable(key, snapshot.ObjectRefs(objects))
 	}
 	return nil
 }
 
-// validateTable decodes and key-checks every row not covered by
-// validatedNodes, streaming the data tree leaf by leaf, and returns the
-// table's reachable objects.
-func validateTable(ctx context.Context, snapshot *repository.Snapshot, name string, table repository.Table) ([]storage.Hash, error) {
+// validateTable validates one table unless the cache vouches for it, and
+// returns the table's reachable objects.
+func (c *validationCache) validateTable(ctx context.Context, snapshot *repository.Snapshot, name string, table repository.Table) ([]storage.Hash, error) {
+	key := tableValidationKey(snapshot, table)
+	if refs, ok := c.lookupTable(snapshot, key); ok {
+		return refHashes(refs), nil
+	}
+	objects, err := c.walkTable(ctx, snapshot, name, table)
+	if err != nil {
+		return nil, err
+	}
+	c.rememberTable(key, snapshot.ObjectRefs(objects))
+	return objects, nil
+}
+
+// walkTable decodes and key-checks every row not covered by the node cache,
+// streaming the data tree leaf by leaf, and returns the table's reachable
+// objects.
+func (c *validationCache) walkTable(ctx context.Context, snapshot *repository.Snapshot, name string, table repository.Table) ([]storage.Hash, error) {
 	store := snapshot.Store()
 	if !table.DataRoot.Valid() {
 		if table.SchemaRoot.Valid() {
@@ -336,14 +357,14 @@ func validateTable(ctx context.Context, snapshot *repository.Snapshot, name stri
 	if err != nil {
 		return nil, fmt.Errorf("validate SQL table %s: %w", name, err)
 	}
-	hashes, err := prolly.Validate(ctx, store, table.DataRoot, newSnapshotNodeCache(snapshot, string(table.SchemaRoot)), func(entries []prolly.Entry) error {
+	hashes, err := prolly.Validate(ctx, store, table.DataRoot, c.nodeCache(snapshot, string(table.SchemaRoot)), func(entries []prolly.Entry) error {
 		return validateRows(state, entries)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("validate SQL table %s: %w", name, err)
 	}
 	objects := append([]storage.Hash{table.SchemaRoot}, hashes...)
-	indexes := newSnapshotNodeCache(snapshot, indexValidationScope)
+	indexes := c.nodeCache(snapshot, indexValidationScope)
 	for _, idxRoot := range table.Indexes {
 		idxHashes, err := prolly.Validate(ctx, store, idxRoot, indexes, nil)
 		if err != nil {
@@ -375,15 +396,19 @@ func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]stora
 	if !ok {
 		return nil, false
 	}
-	refs, ok := lookupValidatedTable(snapshot, tableValidationKey(snapshot, manifestTable))
+	refs, ok := processValidation.lookupTable(snapshot, tableValidationKey(snapshot, manifestTable))
 	if !ok {
 		return nil, false
 	}
-	objects := make([]storage.Hash, len(refs))
+	return refHashes(refs), true
+}
+
+func refHashes(refs []repository.ObjectRef) []storage.Hash {
+	hashes := make([]storage.Hash, len(refs))
 	for i, ref := range refs {
-		objects[i] = ref.Hash
+		hashes[i] = ref.Hash
 	}
-	return objects, true
+	return hashes
 }
 
 func (e *Engine) Repository() *repository.Repository     { return e.repo }
