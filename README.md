@@ -6,7 +6,7 @@ RepoDB is an embedded SQL database for Go that stores and synchronizes applicati
 
 Build agent tools, issue trackers, and dashboards whose data travels with a repository. Write data locally, work offline, and synchronize across clones. SQL transactions are durable immediately; data history is checkpointed to Git when you choose. Source files, index, and code branches are never touched.
 
-**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. RepoDB is aimed at local-first, version-controlled relational workloads with a documented [SQL subset](docs/sql.md). At the sizes measured so far (up to 50k rows) it serves point and indexed-range reads in well under a millisecond, full scans in tens of milliseconds, 100-row write batches in under 10 ms (journal mode), and cross-clone merges in 2–3 s. Concurrent writers are the main limitation: write transactions conflict whenever another commits first. Broader compatibility, write concurrency and scaling are on the roadmap. See the [latest benchmark results](docs/benchmarks/latest.md) for measured latency against MySQL 8 and Dolt.
+**Early development:** persistent SQL, synchronization, and three-way merging are implemented and benchmarked. RepoDB is aimed at local-first, version-controlled relational workloads with a documented [SQL subset](docs/sql.md). At the sizes measured so far (up to 50k rows) it serves point and indexed-range reads in well under a millisecond, full scans in tens of milliseconds, single-row writes in about half a millisecond and 100-row batches in about 3 ms (journal mode), and cross-clone merges in about 1 s. Concurrent writers are the main limitation: write transactions conflict whenever another commits first. Broader compatibility, write concurrency and scaling are on the roadmap. See the [latest benchmark results](docs/benchmarks/latest.md) for measured latency against MySQL 8 and Dolt.
 
 ## Quickstart
 
@@ -125,21 +125,23 @@ go install -tags gms_pure_go github.com/nicbet/repodb/cmd/repodb-server@latest
 
 ## Performance
 
-Measured 2026-10-02 at `87dd885` on an Apple M1 Max: p50 at 50k rows, with RepoDB embedded and MySQL and Dolt over loopback TCP. See [latest results](docs/benchmarks/latest.md) for all sizes, concurrency, sync, and the environment.
+Measured 2026-10-02 at `636af3d`, p50 at 50k rows, with **every system in a Linux container on the same Docker VM** (an Apple M1 Max host) at its default durability: RepoDB embedded in the benchmark harness, MySQL and Dolt reached over TCP between containers. See [latest results](docs/benchmarks/latest.md) for all sizes, concurrency, sync and the environment, and the [setup](docs/benchmark.md#setup) for exactly what is compared.
 
-Journal mode, the default, serves point and range reads in well under a millisecond; single-row writes take ~5 ms (one `fsync`). Batch writes of 100 rows beat MySQL and Dolt because the journal appends one record regardless of batch size.
+Journal-mode writes are on par with MySQL for single rows and about 3× faster for 100-row batches, because the journal appends one record per transaction. Point, range and short read transactions are sub-millisecond; MySQL is faster on point reads, and much faster on full scans and joins, which RepoDB still serves by decoding the whole table.
 
 | Workload (50k rows) | MySQL 8.4 | Dolt 2.3 | RepoDB Journal |
 | ------------------- | --------: | -------: | -------------: |
-| Point read          |   0.22 ms |  0.38 ms |        0.09 ms |
-| Range (100 rows)    |   0.38 ms |  0.49 ms |        0.13 ms |
-| Full scan           |     27 ms |    38 ms |          35 ms |
-| Read tx (10 reads)  |    6.2 ms |   7.0 ms |        0.60 ms |
-| Update x1           |    1.1 ms |   1.5 ms |         5.1 ms |
-| Update x100         |     44 ms |    73 ms |         7.3 ms |
-| Insert              |   0.71 ms |  0.92 ms |         5.0 ms |
+| Point read          |   0.04 ms |  0.14 ms |        0.07 ms |
+| Range (100 rows)    |   0.15 ms |  0.26 ms |        0.11 ms |
+| Read tx (10 reads)  |   0.94 ms |   2.1 ms |        0.71 ms |
+| Full scan           |     13 ms |    20 ms |          34 ms |
+| Join + aggregate    |    2.6 ms |    12 ms |          45 ms |
+| Update x1           |   0.57 ms |   1.0 ms |        0.48 ms |
+| Insert              |   0.55 ms |  0.75 ms |        0.56 ms |
+| Delete              |   0.51 ms |  0.72 ms |        0.56 ms |
+| Update x100         |    8.4 ms |    25 ms |         3.0 ms |
 
-Full scans and joins still grow with table size, and a descending `ORDER BY … LIMIT` sorts the whole table until reverse index scans land. A write transaction is rejected rather than queued when another commits first, even if the two wrote different rows, so concurrent writers see conflicts that MySQL would not report. Journal-mode merge syncs take about 3 s at 50k rows. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
+A descending `ORDER BY … LIMIT` sorts the whole table until reverse index scans land. A write transaction is rejected rather than queued when another commits first, even if the two wrote different rows, so concurrent writers see conflicts that MySQL would not report. Journal-mode merge syncs take about 1 s at 50k rows. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
 
 See the [latest results](docs/benchmarks/latest.md) for concurrency, sync latency, and the native-Git comparison, and the [methodology](docs/benchmark.md) for how they are measured.
 
