@@ -2359,13 +2359,8 @@ func (s *tableState) ensureIndexEdits(ctx context.Context) error {
 }
 
 // overlayIndexEdits adds, for each persisted index tree, the edits implied by
-// the pending row overlay: the base row's entry is removed and the overlay
-// row's entry added. Without them, rows from earlier journal transactions are
-// invisible to index lookups and unique checks.
-//
-// Each index's removals come before its additions: a unique value can move
-// from one row to another, and its new row's entry must win whatever the rows'
-// key order (rdb-9afb3c).
+// the pending row overlay. Without them, rows from earlier journal
+// transactions are invisible to index lookups and unique checks.
 func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk, built map[string][]prolly.Edit) error {
 	var base *prolly.Tree
 	if s.manifest.DataRoot.Valid() {
@@ -2375,32 +2370,53 @@ func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk,
 		}
 		base = tree
 	}
-	type keyedEdit struct {
-		key  string
-		edit rowEdit
-	}
-	var overlay []keyedEdit
+	var overlay []keyedRowEdit
 	if err := s.forEachEdit(func(key string, edit rowEdit) error {
-		overlay = append(overlay, keyedEdit{key, edit})
+		overlay = append(overlay, keyedRowEdit{[]byte(key), edit})
 		return nil
 	}); err != nil {
 		return err
 	}
-	sort.Slice(overlay, func(i, j int) bool { return overlay[i].key < overlay[j].key })
+	sort.Slice(overlay, func(i, j int) bool { return bytes.Compare(overlay[i].pk, overlay[j].pk) < 0 })
+	derived, err := deriveIndexEdits(ctx, s.schema, indexes, base, overlay)
+	if err != nil {
+		return err
+	}
+	for name, edits := range derived {
+		built[name] = append(built[name], edits...)
+	}
+	return nil
+}
+
+// keyedRowEdit is a row edit with its encoded primary key.
+type keyedRowEdit struct {
+	pk   []byte
+	edit rowEdit
+}
+
+// deriveIndexEdits returns, per index, the edits implied by row edits against
+// the base data tree (nil when there is none): the base row's entry is removed
+// and the edited row's entry added. Rows whose index key is unchanged produce
+// no edit. rows must be in primary-key order.
+//
+// Each index's removals come before its additions: a unique value can move
+// from one row to another, and its new row's entry must win whatever the rows'
+// key order (rdb-9afb3c).
+func deriveIndexEdits(ctx context.Context, schema sql.PrimaryKeySchema, indexes []indexDisk, base *prolly.Tree, rows []keyedRowEdit) (map[string][]prolly.Edit, error) {
+	removed := make(map[string][]prolly.Edit, len(indexes))
 	added := make(map[string][]prolly.Edit, len(indexes))
-	for _, item := range overlay {
-		edit := item.edit
-		pk := []byte(item.key)
+	for _, item := range rows {
+		edit, pk := item.edit, item.pk
 		var baseRow sql.Row
 		if base != nil {
 			value, err := base.Get(ctx, pk)
 			switch {
 			case errors.Is(err, prolly.ErrNotFound):
 			case err != nil:
-				return err
+				return nil, err
 			default:
-				if baseRow, err = decodeRow(s.schema.Schema, value); err != nil {
-					return err
+				if baseRow, err = decodeRow(schema.Schema, value); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -2408,20 +2424,20 @@ func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk,
 			var oldKey, newKey []byte
 			var err error
 			if baseRow != nil {
-				if oldKey, _, err = encodeIndexKey(s.schema, baseRow, idx.Columns, pk, idx.Unique); err != nil {
-					return err
+				if oldKey, _, err = encodeIndexKey(schema, baseRow, idx.Columns, pk, idx.Unique); err != nil {
+					return nil, err
 				}
 			}
 			if !edit.delete {
-				if newKey, _, err = encodeIndexKey(s.schema, edit.row, idx.Columns, pk, idx.Unique); err != nil {
-					return err
+				if newKey, _, err = encodeIndexKey(schema, edit.row, idx.Columns, pk, idx.Unique); err != nil {
+					return nil, err
 				}
 			}
 			if oldKey != nil && newKey != nil && bytes.Equal(oldKey, newKey) {
 				continue
 			}
 			if oldKey != nil {
-				built[idx.Name] = append(built[idx.Name], prolly.Edit{Key: oldKey, Delete: true})
+				removed[idx.Name] = append(removed[idx.Name], prolly.Edit{Key: oldKey, Delete: true})
 			}
 			if newKey != nil {
 				added[idx.Name] = append(added[idx.Name], prolly.Edit{Key: newKey, Value: pk})
@@ -2429,9 +2445,9 @@ func (s *tableState) overlayIndexEdits(ctx context.Context, indexes []indexDisk,
 		}
 	}
 	for name, edits := range added {
-		built[name] = append(built[name], edits...)
+		removed[name] = append(removed[name], edits...)
 	}
-	return nil
+	return removed, nil
 }
 
 // lookupIndexKey checks if an index key exists in the index's pending edits

@@ -400,7 +400,7 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 				if err != nil {
 					return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
 				}
-				if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, dataTree); err != nil {
+				if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, dataTree, nil); err != nil {
 					return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
 				} else if idxRoots != nil {
 					tbl.Indexes = idxRoots
@@ -455,7 +455,11 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 				reachable[hash] = struct{}{}
 			}
 			tbl := repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
-			if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, tree); err != nil {
+			var delta *indexDelta
+			if basePresent {
+				delta = &indexDelta{store: base.Store(), base: baseTable, data: baseTree, edits: rowEdits}
+			}
+			if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, tree, delta); err != nil {
 				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
 			} else if idxRoots != nil {
 				tbl.Indexes = idxRoots
@@ -483,7 +487,7 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 				reachable[hash] = struct{}{}
 			}
 			tbl := repository.Table{SchemaRoot: table.SchemaRoot, DataRoot: tree.Root()}
-			if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, tree); err != nil {
+			if idxRoots, idxHashes, err := checkpointIndexTrees(ctx, writer, table, tree, nil); err != nil {
 				return repository.CommitResult{Outcome: repository.OutcomeRejected}, err
 			} else if idxRoots != nil {
 				tbl.Indexes = idxRoots
@@ -505,8 +509,10 @@ func (e *Engine) checkpointTypedEdits(ctx context.Context, message string, snaps
 }
 
 // checkpointIndexTrees reads the schema from the store, and if the table
-// has index definitions, rebuilds index trees from the data tree.
-func checkpointIndexTrees(ctx context.Context, store storage.Store, table repository.Table, dataTree *prolly.Tree) (map[string]storage.Hash, []storage.Hash, error) {
+// has index definitions, builds its index trees for dataTree. With a usable
+// delta it applies the pending edits to the base index trees; otherwise it
+// rebuilds them from the whole data tree.
+func checkpointIndexTrees(ctx context.Context, store storage.Store, table repository.Table, dataTree *prolly.Tree, delta *indexDelta) (map[string]storage.Hash, []storage.Hash, error) {
 	if !table.SchemaRoot.Valid() {
 		return nil, nil, nil
 	}
@@ -521,7 +527,12 @@ func checkpointIndexTrees(ctx context.Context, store storage.Store, table reposi
 	if len(indexes) == 0 {
 		return nil, nil, nil
 	}
-	idxRoots, err := rebuildIndexesFromTree(ctx, store, schema, indexes, dataTree)
+	var idxRoots map[string]storage.Hash
+	if delta.usable(table, indexes) {
+		idxRoots, err = applyIndexEdits(ctx, store, schema, indexes, dataTree, delta)
+	} else {
+		idxRoots, err = rebuildIndexesFromTree(ctx, store, schema, indexes, dataTree)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -534,6 +545,98 @@ func checkpointIndexTrees(ctx context.Context, store storage.Store, table reposi
 		allHashes = append(allHashes, hashes...)
 	}
 	return idxRoots, allHashes, nil
+}
+
+// indexDelta is a table's base snapshot state plus the pending row edits a
+// checkpoint applies to it.
+type indexDelta struct {
+	store storage.Store
+	base  repository.Table
+	data  *prolly.Tree
+	edits repository.PendingRows
+}
+
+// usable reports whether the base index trees can be updated in place: the
+// schema and data root are the ones the edits were made against, and every
+// index has a persisted tree.
+func (d *indexDelta) usable(table repository.Table, indexes []indexDisk) bool {
+	if d == nil || d.data == nil || d.base.SchemaRoot != table.SchemaRoot || d.base.DataRoot != table.DataRoot {
+		return false
+	}
+	for _, idx := range indexes {
+		if !d.base.Indexes[idx.Name].Valid() {
+			return false
+		}
+	}
+	return true
+}
+
+// applyIndexEdits updates each base index tree with the index edits implied by
+// the delta's row edits. Its roots equal rebuildIndexesFromTree's for dataTree,
+// the base data tree with those row edits applied.
+func applyIndexEdits(ctx context.Context, writer storage.Store, schema sql.PrimaryKeySchema, indexes []indexDisk, dataTree *prolly.Tree, delta *indexDelta) (map[string]storage.Hash, error) {
+	count, err := dataTree.Count(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, nil // as rebuildIndexesFromTree: an empty table has no index trees
+	}
+	rows := make([]keyedRowEdit, 0, delta.edits.Len())
+	for it := delta.edits.Iter(nil, nil); ; {
+		re, ok := it.Next()
+		if !ok {
+			break
+		}
+		item := keyedRowEdit{pk: append([]byte(nil), re.Key...), edit: rowEdit{delete: re.Delete}}
+		if !re.Delete {
+			if item.edit.row, err = decodeRow(schema.Schema, re.Value); err != nil {
+				return nil, fmt.Errorf("decode pending edit: %w", err)
+			}
+		}
+		rows = append(rows, item)
+	}
+	derived, err := deriveIndexEdits(ctx, schema, indexes, delta.data, rows)
+	if err != nil {
+		return nil, err
+	}
+	roots := make(map[string]storage.Hash, len(indexes))
+	for _, idx := range indexes {
+		edits, err := orderIndexEdits(idx, derived[idx.Name])
+		if err != nil {
+			return nil, err
+		}
+		baseTree, err := prolly.Open(delta.store, delta.base.Indexes[idx.Name])
+		if err != nil {
+			return nil, err
+		}
+		tree, err := prolly.Apply(ctx, writer, baseTree, edits)
+		if err != nil {
+			return nil, err
+		}
+		roots[idx.Name] = tree.Root()
+	}
+	return roots, nil
+}
+
+// orderIndexEdits sorts derived index edits into the strictly ordered form
+// prolly.Apply takes. For a repeated key the later edit wins, so an addition
+// overrides the removal before it (a unique value moving between rows); two
+// additions of one key mean the data holds a duplicate unique value.
+func orderIndexEdits(idx indexDisk, edits []prolly.Edit) ([]prolly.Edit, error) {
+	sort.SliceStable(edits, func(i, j int) bool { return bytes.Compare(edits[i].Key, edits[j].Key) < 0 })
+	out := edits[:0]
+	for _, edit := range edits {
+		if n := len(out); n > 0 && bytes.Equal(out[n-1].Key, edit.Key) {
+			if !out[n-1].Delete && !edit.Delete {
+				return nil, fmt.Errorf("unique index %s: checkpoint produced duplicate key", idx.Name)
+			}
+			out[n-1] = edit
+			continue
+		}
+		out = append(out, edit)
+	}
+	return out, nil
 }
 
 func (e *Engine) Close() error {
