@@ -585,11 +585,13 @@ func (it *Iterator) advance() error {
 // Entries returns every entry in key order.
 func (t *Tree) Entries(ctx context.Context) ([]Entry, error) {
 	var entries []Entry
-	if _, err := walk(ctx, t.store, t.root, nil, func(n node) {
+	w := walker{store: t.store, visit: func(n node) error {
 		if n.Level == 0 {
 			entries = append(entries, cloneEntries(n.Entries)...)
 		}
-	}); err != nil {
+		return nil
+	}}
+	if _, err := w.walk(ctx, t.root); err != nil {
 		return nil, err
 	}
 	return entries, nil
@@ -597,28 +599,90 @@ func (t *Tree) Entries(ctx context.Context) ([]Entry, error) {
 
 // Reachable validates the tree and returns every reachable object hash.
 func Reachable(ctx context.Context, store storage.Store, root storage.Hash) ([]storage.Hash, error) {
-	seen := make(map[storage.Hash]uint64)
-	if _, err := walk(ctx, store, root, seen, nil); err != nil {
-		return nil, err
+	return Validate(ctx, store, root, nil, nil)
+}
+
+// ValidatedNode describes a node whose whole subtree passed validation.
+type ValidatedNode struct {
+	Count    uint64         // leaf entries in the subtree
+	Children []storage.Hash // direct children; nil for a leaf
+}
+
+// NodeCount is a node of a cached subtree and its subtree's entry count.
+type NodeCount struct {
+	Hash  storage.Hash
+	Count uint64
+}
+
+// NodeCache remembers validated subtrees so Validate can skip them.
+type NodeCache interface {
+	// Subtree returns every node of the validated subtree rooted at hash,
+	// root first, or false if any node of it is unknown or unusable.
+	Subtree(hash storage.Hash) ([]NodeCount, bool)
+	// Remember records a node once its whole subtree has been validated.
+	Remember(hash storage.Hash, node ValidatedNode)
+}
+
+// Validate validates the tree and returns every reachable object hash, like
+// Reachable. Subtrees that cache vouches for are neither read nor passed to
+// leaf; every node validated here is remembered in cache. leaf, when set,
+// receives each validated leaf's entries, which it must not retain; an error
+// from it fails validation. cache may be nil.
+func Validate(ctx context.Context, store storage.Store, root storage.Hash, cache NodeCache, leaf func([]Entry) error) ([]storage.Hash, error) {
+	w := walker{store: store, seen: make(map[storage.Hash]uint64), cache: cache}
+	if leaf != nil {
+		w.visit = func(n node) error {
+			if n.Level == 0 {
+				return leaf(n.Entries)
+			}
+			return nil
+		}
 	}
-	hashes := make([]storage.Hash, 0, len(seen))
-	for hash := range seen {
+	if _, ok := w.fromCache(root); !ok {
+		if _, err := w.walk(ctx, root); err != nil {
+			return nil, err
+		}
+	}
+	hashes := make([]storage.Hash, 0, len(w.seen))
+	for hash := range w.seen {
 		hashes = append(hashes, hash)
 	}
 	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
 	return hashes, nil
 }
 
+// walker validates subtrees. seen, when set, records the count of each
+// visited node so shared subtrees are walked once; cache requires seen.
+type walker struct {
+	store storage.Store
+	seen  map[storage.Hash]uint64
+	cache NodeCache
+	visit func(node) error
+}
+
+// fromCache records hash's subtree in seen if the cache vouches for it.
+func (w *walker) fromCache(hash storage.Hash) (uint64, bool) {
+	if w.cache == nil {
+		return 0, false
+	}
+	nodes, ok := w.cache.Subtree(hash)
+	if !ok {
+		return 0, false
+	}
+	for _, n := range nodes {
+		w.seen[n.Hash] = n.Count
+	}
+	return nodes[0].Count, true
+}
+
 // walk validates the subtree at hash and returns its number of leaf entries.
-// seen, when set, records the count of each visited node so shared subtrees
-// are walked once.
-func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[storage.Hash]uint64, visit func(node)) (uint64, error) {
-	if seen != nil {
-		if count, ok := seen[hash]; ok {
+func (w *walker) walk(ctx context.Context, hash storage.Hash) (uint64, error) {
+	if w.seen != nil {
+		if count, ok := w.seen[hash]; ok {
 			return count, nil
 		}
 	}
-	n, err := readNode(ctx, store, hash)
+	n, err := readNode(ctx, w.store, hash)
 	if err != nil {
 		return 0, fmt.Errorf("read Prolly node %s: %w", hash, err)
 	}
@@ -637,12 +701,18 @@ func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[
 		if len(n.Entries) != 0 || len(n.Children) == 0 {
 			return 0, fmt.Errorf("invalid internal Prolly node %s", hash)
 		}
-		prefetchChildren(ctx, store, n, seen)
+		// Resolve cached children first so only the rest are prefetched.
+		for _, child := range n.Children {
+			if _, visited := w.seen[child.Hash]; !visited {
+				w.fromCache(child.Hash)
+			}
+		}
+		prefetchChildren(ctx, w.store, n, w.seen)
 		for i, child := range n.Children {
 			if !child.Hash.Valid() || (i > 0 && bytes.Compare(n.Children[i-1].MaxKey, child.MaxKey) >= 0) {
 				return 0, fmt.Errorf("invalid child link in Prolly node %s", hash)
 			}
-			childCount, err := walk(ctx, store, child.Hash, seen, visit)
+			childCount, err := w.walk(ctx, child.Hash)
 			if err != nil {
 				return 0, err
 			}
@@ -652,11 +722,23 @@ func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[
 			count += childCount
 		}
 	}
-	if seen != nil {
-		seen[hash] = count
+	if w.visit != nil {
+		if err := w.visit(n); err != nil {
+			return 0, err
+		}
 	}
-	if visit != nil {
-		visit(n)
+	if w.seen != nil {
+		w.seen[hash] = count
+	}
+	if w.cache != nil {
+		validated := ValidatedNode{Count: count}
+		if n.Level != 0 {
+			validated.Children = make([]storage.Hash, len(n.Children))
+			for i, child := range n.Children {
+				validated.Children[i] = child.Hash
+			}
+		}
+		w.cache.Remember(hash, validated)
 	}
 	return count, nil
 }

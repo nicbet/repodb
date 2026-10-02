@@ -19,6 +19,11 @@ type PerformanceCounters struct {
 	// TablesValidated counts tables fully validated (rows decoded and trees
 	// walked) by ValidateSnapshot; cache hits do not count.
 	TablesValidated uint64
+	// NodesValidated counts Prolly nodes validated by ValidateSnapshot;
+	// NodesReused counts nodes it skipped because a cached subtree vouched
+	// for them.
+	NodesValidated uint64
+	NodesReused    uint64
 }
 
 var performanceCounters struct {
@@ -34,6 +39,8 @@ var performanceCounters struct {
 	metadataCacheHits   atomic.Uint64
 	metadataCacheMisses atomic.Uint64
 	tablesValidated     atomic.Uint64
+	nodesValidated      atomic.Uint64
+	nodesReused         atomic.Uint64
 }
 
 func ResetPerformanceCounters() {
@@ -49,6 +56,8 @@ func ResetPerformanceCounters() {
 	performanceCounters.metadataCacheHits.Store(0)
 	performanceCounters.metadataCacheMisses.Store(0)
 	performanceCounters.tablesValidated.Store(0)
+	performanceCounters.nodesValidated.Store(0)
+	performanceCounters.nodesReused.Store(0)
 }
 
 func ReadPerformanceCounters() PerformanceCounters {
@@ -65,5 +74,7 @@ func ReadPerformanceCounters() PerformanceCounters {
 		MetadataCacheHits:   performanceCounters.metadataCacheHits.Load(),
 		MetadataCacheMisses: performanceCounters.metadataCacheMisses.Load(),
 		TablesValidated:     performanceCounters.tablesValidated.Load(),
+		NodesValidated:      performanceCounters.nodesValidated.Load(),
+		NodesReused:         performanceCounters.nodesReused.Load(),
 	}
 }

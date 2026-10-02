@@ -26,7 +26,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const snapshotValidationVersion = 5
+const snapshotValidationVersion = 6
 
 // validatedTables caches table validation by content: repository and the
 // table's schema, data and index roots. The roots name the content, so a
@@ -104,6 +104,92 @@ func rememberValidatedTable(key string, objects []repository.ObjectRef) {
 		delete(validatedTables.entries, entry.key)
 		validatedTables.objects -= len(entry.objects)
 		validatedTables.order.Remove(oldest)
+	}
+}
+
+// validatedNodes caches Prolly nodes whose subtrees passed validation, so a
+// table whose roots changed is validated only where its trees changed. A data
+// tree's nodes are keyed by the table's schema root, because rows valid under
+// one schema may not be under another; index trees need only structural
+// checks and share one scope. Like validatedTables, each entry records the Git
+// object ID the node was read under, and a subtree counts for a snapshot only
+// if that snapshot provides all of its nodes.
+var validatedNodes = struct {
+	sync.Mutex
+	entries map[string]*list.Element
+	order   *list.List
+	size    int
+}{entries: make(map[string]*list.Element), order: list.New()}
+
+// maxValidatedNodeLinks bounds the node cache by nodes plus child links.
+var maxValidatedNodeLinks = 1 << 20
+
+const indexValidationScope = "index"
+
+type validatedNodeEntry struct {
+	key  string
+	ref  repository.ObjectRef
+	node prolly.ValidatedNode
+}
+
+func (e validatedNodeEntry) size() int { return 1 + len(e.node.Children) }
+
+// snapshotNodeCache is the prolly.NodeCache of one tree scope as seen by one
+// snapshot.
+type snapshotNodeCache struct {
+	snapshot *repository.Snapshot
+	prefix   string
+}
+
+func newSnapshotNodeCache(snapshot *repository.Snapshot, scope string) snapshotNodeCache {
+	return snapshotNodeCache{snapshot: snapshot, prefix: fmt.Sprintf("%s\x00%d\x00%s\x00", snapshot.RepositoryIdentity(), snapshotValidationVersion, scope)}
+}
+
+// Subtree expands the cached subtree in memory; it misses if any node was
+// evicted or the snapshot does not provide it.
+func (c snapshotNodeCache) Subtree(hash storage.Hash) ([]prolly.NodeCount, bool) {
+	var nodes []prolly.NodeCount
+	var refs []repository.ObjectRef
+	validatedNodes.Lock()
+	for stack := []storage.Hash{hash}; len(stack) != 0; {
+		next := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		element := validatedNodes.entries[c.prefix+string(next)]
+		if element == nil {
+			validatedNodes.Unlock()
+			return nil, false
+		}
+		validatedNodes.order.MoveToFront(element)
+		entry := element.Value.(validatedNodeEntry)
+		nodes = append(nodes, prolly.NodeCount{Hash: next, Count: entry.node.Count})
+		refs = append(refs, entry.ref)
+		stack = append(stack, entry.node.Children...)
+	}
+	validatedNodes.Unlock()
+	if !c.snapshot.Provides(refs) {
+		return nil, false
+	}
+	performanceCounters.nodesReused.Add(uint64(len(nodes)))
+	return nodes, true
+}
+
+func (c snapshotNodeCache) Remember(hash storage.Hash, node prolly.ValidatedNode) {
+	performanceCounters.nodesValidated.Add(1)
+	entry := validatedNodeEntry{key: c.prefix + string(hash), ref: c.snapshot.ObjectRefs([]storage.Hash{hash})[0], node: node}
+	validatedNodes.Lock()
+	defer validatedNodes.Unlock()
+	if element := validatedNodes.entries[entry.key]; element != nil {
+		validatedNodes.size -= element.Value.(validatedNodeEntry).size()
+		validatedNodes.order.Remove(element)
+	}
+	validatedNodes.entries[entry.key] = validatedNodes.order.PushFront(entry)
+	validatedNodes.size += entry.size()
+	for validatedNodes.order.Len() > 1 && validatedNodes.size > maxValidatedNodeLinks {
+		oldest := validatedNodes.order.Back()
+		evicted := oldest.Value.(validatedNodeEntry)
+		delete(validatedNodes.entries, evicted.key)
+		validatedNodes.size -= evicted.size()
+		validatedNodes.order.Remove(oldest)
 	}
 }
 
@@ -209,7 +295,8 @@ func NewWithOptions(repo *repository.Repository, options Options) (*Engine, erro
 // ValidateSnapshot verifies every persisted schema, Prolly descendant, row,
 // and primary-key encoding before integration publishes a fetched snapshot.
 // A table already validated with the same roots is skipped when this snapshot
-// provides the same objects (see validatedTables).
+// provides the same objects (see validatedTables); within a changed table,
+// subtrees validated before are skipped the same way (see validatedNodes).
 func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error {
 	if snapshot == nil {
 		return errors.New("snapshot is required")
@@ -219,7 +306,7 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 		if _, ok := lookupValidatedTable(snapshot, key); ok {
 			continue
 		}
-		objects, err := validateTable(ctx, snapshot.Store(), name, table)
+		objects, err := validateTable(ctx, snapshot, name, table)
 		if err != nil {
 			return err
 		}
@@ -228,9 +315,11 @@ func ValidateSnapshot(ctx context.Context, snapshot *repository.Snapshot) error 
 	return nil
 }
 
-// validateTable decodes and key-checks every row, streaming the data tree,
-// and returns the table's reachable objects.
-func validateTable(ctx context.Context, store storage.Store, name string, table repository.Table) ([]storage.Hash, error) {
+// validateTable decodes and key-checks every row not covered by
+// validatedNodes, streaming the data tree leaf by leaf, and returns the
+// table's reachable objects.
+func validateTable(ctx context.Context, snapshot *repository.Snapshot, name string, table repository.Table) ([]storage.Hash, error) {
+	store := snapshot.Store()
 	if !table.DataRoot.Valid() {
 		if table.SchemaRoot.Valid() {
 			// Snapshots read objects lazily, so read the schema here to
@@ -243,46 +332,31 @@ func validateTable(ctx context.Context, store storage.Store, name string, table 
 		return nil, nil
 	}
 	performanceCounters.tablesValidated.Add(1)
-	if err := validateTableRows(ctx, store, table); err != nil {
+	state, err := loadTableMetadata(ctx, store, table)
+	if err != nil {
 		return nil, fmt.Errorf("validate SQL table %s: %w", name, err)
 	}
-	hashes, err := prolly.Reachable(ctx, store, table.DataRoot)
+	hashes, err := prolly.Validate(ctx, store, table.DataRoot, newSnapshotNodeCache(snapshot, string(table.SchemaRoot)), func(entries []prolly.Entry) error {
+		return validateRows(state, entries)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("validate SQL table %s reachability: %w", name, err)
+		return nil, fmt.Errorf("validate SQL table %s: %w", name, err)
 	}
 	objects := append([]storage.Hash{table.SchemaRoot}, hashes...)
+	indexes := newSnapshotNodeCache(snapshot, indexValidationScope)
 	for _, idxRoot := range table.Indexes {
-		idxHashes, err := prolly.Reachable(ctx, store, idxRoot)
+		idxHashes, err := prolly.Validate(ctx, store, idxRoot, indexes, nil)
 		if err != nil {
-			return nil, fmt.Errorf("validate SQL table %s index reachability: %w", name, err)
+			return nil, fmt.Errorf("validate SQL table %s index: %w", name, err)
 		}
 		objects = append(objects, idxHashes...)
 	}
 	return objects, nil
 }
 
-func validateTableRows(ctx context.Context, store storage.Store, table repository.Table) error {
-	state, err := loadTableMetadata(ctx, store, table)
-	if err != nil {
-		return err
-	}
-	tree, err := prolly.Open(store, table.DataRoot)
-	if err != nil {
-		return err
-	}
-	it, err := tree.Iterator(ctx)
-	if err != nil {
-		return err
-	}
-	defer it.Close()
-	for {
-		entry, ok, err := it.Next()
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return nil
-		}
+// validateRows decodes each entry of a data leaf and checks its key.
+func validateRows(state *tableState, entries []prolly.Entry) error {
+	for _, entry := range entries {
 		performanceCounters.rowsDecoded.Add(1)
 		row, err := decodeRow(state.schema.Schema, entry.Value)
 		if err != nil {
@@ -293,6 +367,7 @@ func validateTableRows(ctx context.Context, store storage.Store, table repositor
 			return errors.New("stored row key does not match row primary key")
 		}
 	}
+	return nil
 }
 
 func validatedTableObjects(snapshot *repository.Snapshot, table string) ([]storage.Hash, bool) {
