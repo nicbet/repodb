@@ -141,7 +141,7 @@ Journal-mode writes are on par with MySQL for single rows and about 3× faster f
 | Delete              |   0.51 ms |  0.72 ms |        0.56 ms |
 | Update x100         |    8.4 ms |    25 ms |         3.0 ms |
 
-A descending `ORDER BY … LIMIT` sorts the whole table until reverse index scans land. A write transaction is rejected rather than queued when another commits first, even if the two wrote different rows, so concurrent writers see conflicts that MySQL would not report. Journal-mode merge syncs take about 1 s at 50k rows. Neither MySQL nor Dolt provides Git-native version history or cross-clone synchronization.
+A descending `ORDER BY … LIMIT` sorts the whole table until reverse index scans land. A write transaction is rejected rather than queued when another commits first, even if the two wrote different rows, so concurrent writers see conflicts that MySQL would not report. Journal-mode merge syncs take about 1 s at 50k rows. Dolt also versions, clones, pushes and merges its data, including to Git remotes, but the harness runs sync and merge workloads only against RepoDB, so the sync results have no baseline.
 
 See the [latest results](docs/benchmarks/latest.md) for concurrency, sync latency, and the native-Git comparison, and the [methodology](docs/benchmark.md) for how they are measured.
 
