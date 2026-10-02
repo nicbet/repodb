@@ -95,7 +95,7 @@ A node (`common/prolly/codec.go`) is:
 - A **leaf** item (level 0) is a uvarint key length, the key, a uvarint value length and the value.
 - An **interior** item is a uvarint max-key length, the child's maximum key, a uvarint count of the leaf entries below the child, and the child's 32-byte SHA-256.
 
-Nodes are read in place: iterators parse a leaf one entry at a time, and the keys and values they return point into the stored bytes rather than copies. The counts make a tree's size a read of its root (`Tree.Count`). Validation (`prolly.Reachable`) checks every link's count against its subtree, along with key order and bounds; a decoder rejects truncated nodes and trailing bytes.
+Nodes are read in place: iterators parse a leaf one entry at a time, and the keys and values they return point into the stored bytes rather than copies. Point reads (`Tree.Get`) binary-search each node on the path. Entries are length-prefixed, so a node can't be searched directly. Instead, the first read of a node parses it once (rejecting malformed framing and trailing bytes) and caches its item start offsets, keyed by node hash. Nodes are immutable, so the cached offsets are valid in every store and snapshot. The cache is process-wide and bounded (16 shards of 4,096 nodes, arbitrary eviction). Only the offsets are cached, because the store already holds the node bytes. The counts make a tree's size a read of its root (`Tree.Count`). Validation (`prolly.Reachable`) checks every link's count against its subtree, along with key order and bounds; a decoder rejects truncated nodes and trailing bytes.
 
 ### Key encoding
 

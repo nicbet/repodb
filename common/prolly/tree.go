@@ -654,7 +654,8 @@ func walk(ctx context.Context, store storage.Store, hash storage.Hash, seen map[
 	return count, nil
 }
 
-// Get returns a copy of the value stored under key.
+// Get returns a copy of the value stored under key. Each node on the path is
+// binary-searched through its cached item offsets.
 func (t *Tree) Get(ctx context.Context, key []byte) ([]byte, error) {
 	hash := t.root
 	for {
@@ -662,35 +663,29 @@ func (t *Tree) Get(ctx context.Context, key []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if r.level == 0 {
-			for r.remaining > 0 {
-				entry, err := r.nextEntry()
-				if err != nil {
-					return nil, err
-				}
-				if c := bytes.Compare(entry.Key, key); c == 0 {
-					return clone(entry.Value), nil
-				} else if c > 0 {
-					break
-				}
-			}
+		i, item, err := r.search(key)
+		if err != nil {
+			return nil, err
+		}
+		// A fresh reader's remaining is the node's item count.
+		if i == r.remaining {
 			return nil, ErrNotFound
 		}
-		found := false
-		for r.remaining > 0 {
-			maxKey, _, raw, err := r.nextLinkRaw()
+		if r.level == 0 {
+			entry, err := item.nextEntry()
 			if err != nil {
 				return nil, err
 			}
-			if bytes.Compare(maxKey, key) >= 0 {
-				hash = storage.Hash(hex.EncodeToString(raw))
-				found = true
-				break
+			if !bytes.Equal(entry.Key, key) {
+				return nil, ErrNotFound
 			}
+			return clone(entry.Value), nil
 		}
-		if !found {
-			return nil, ErrNotFound
+		_, _, raw, err := item.nextLinkRaw()
+		if err != nil {
+			return nil, err
 		}
+		hash = storage.Hash(hex.EncodeToString(raw))
 	}
 }
 
